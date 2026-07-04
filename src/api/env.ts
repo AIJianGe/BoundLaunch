@@ -9,7 +9,13 @@
  */
 
 import { invoke } from "./index";
-import type { EnvInfo, PythonEnvStatus, CompatibilityResult, DependencyInfo } from "./types";
+import type {
+  EnvInfo,
+  PythonEnvStatus,
+  CompatibilityResult,
+  DependencyInfo,
+  ReadinessCheckResult,
+} from "./types";
 
 // ============================================================================
 // EnvironmentInspector
@@ -37,6 +43,19 @@ export function envListDependencies(): Promise<DependencyInfo[]> {
 /** 强制清除环境信息缓存（下次 env_inspect 重新检测） */
 export function envInvalidateCache(): Promise<void> {
   return invoke<void>("env_invalidate_cache");
+}
+
+/**
+ * 环境就绪性检查（启动 ComfyUI 前调用）
+ *
+ * 返回 `ReadinessCheckResult`：
+ * - `ready = true`：环境就绪，可直接调 `process_start`
+ * - `ready = false`：缺失步骤在 `missing_steps` 中（按顺序），前端可依次引导/自动补齐
+ *
+ * 不修改任何状态（不克隆、不安装），仅做只读检测。
+ */
+export function envReadinessCheck(): Promise<ReadinessCheckResult> {
+  return invoke<ReadinessCheckResult>("env_readiness_check");
 }
 
 // ============================================================================

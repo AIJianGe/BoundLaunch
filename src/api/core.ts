@@ -27,9 +27,27 @@ export function coreClone(repoUrl?: string): Promise<void> {
   return invoke<void>("core_clone", repoUrl ? { repoUrl } : undefined);
 }
 
-/** 列出远程 tag（用于版本切换） */
-export function coreListTags(): Promise<GitTag[]> {
-  return invoke<GitTag[]>("core_list_tags");
+/**
+ * 确保 ComfyUI 仓库已克隆
+ *
+ * 行为：
+ * - 若 `comfyui_root/.git` 已存在 → 直接返回
+ * - 若目录不存在或为空 → 自动 clone 默认仓库
+ * - 若目录非空且无 `.git` → 返回错误（前端提示用户处理）
+ *
+ * 用法：OnboardingPage / LaunchPage 在需要 ComfyUI 源码时调用。
+ */
+export function coreEnsureCloned(): Promise<void> {
+  return invoke<void>("core_ensure_cloned");
+}
+
+/**
+ * 列出远程 tag（用于版本切换）
+ *
+ * @param force 是否强制刷新（跳过内存缓存）；默认 false（用缓存）
+ */
+export function coreListTags(force: boolean = false): Promise<GitTag[]> {
+  return invoke<GitTag[]>("core_list_tags", { force });
 }
 
 /**

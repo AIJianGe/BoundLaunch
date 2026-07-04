@@ -21,6 +21,7 @@ import {
   envProbeTorch,
   envListDependencies,
   envInvalidateCache,
+  envReadinessCheck,
   envStatus,
   envCreateVenv,
   envInstallTorch,
@@ -29,14 +30,22 @@ import {
   envRebuildVenv,
 } from "@/api/env";
 import { listen, type UnlistenFn } from "@/api";
-import type { EnvInfo, DependencyInfo, PythonEnvStatus, CompatibilityResult } from "@/api/types";
+import type {
+  EnvInfo,
+  DependencyInfo,
+  PythonEnvStatus,
+  CompatibilityResult,
+  ReadinessCheckResult,
+} from "@/api/types";
 
 export const useEnvStore = defineStore("env", () => {
   // ========== State ==========
   const envInfo = ref<EnvInfo | null>(null);
   const pythonEnvStatus = ref<PythonEnvStatus | null>(null);
   const dependencies = ref<DependencyInfo[]>([]);
+  const readiness = ref<ReadinessCheckResult | null>(null);
   const loading = ref(false);
+  const checkingReadiness = ref(false);
   const error = ref<string | null>(null);
   const lastUpdated = ref<string | null>(null);
 
@@ -49,6 +58,8 @@ export const useEnvStore = defineStore("env", () => {
   const comfyuiCloned = computed(() => envInfo.value?.comfyui_cloned ?? false);
   const venvExists = computed(() => pythonEnvStatus.value?.venv_exists ?? false);
   const uvAvailable = computed(() => pythonEnvStatus.value?.uv_installed ?? false);
+  /** 是否就绪（readiness.ready === true），false 时按钮变 "一键安装" */
+  const isReady = computed(() => readiness.value?.ready ?? false);
 
   // ========== Actions ==========
 
@@ -66,11 +77,25 @@ export const useEnvStore = defineStore("env", () => {
       pythonEnvStatus.value = status;
       dependencies.value = deps;
       lastUpdated.value = info.last_updated;
+      // 顺便做一次 readiness 检查（不抛错）
+      checkReadiness().catch((e) =>
+        console.warn("[env] readiness check failed:", e),
+      );
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e);
       throw e;
     } finally {
       loading.value = false;
+    }
+  }
+
+  /** 检查环境就绪性（不修改任何后端状态） */
+  async function checkReadiness() {
+    checkingReadiness.value = true;
+    try {
+      readiness.value = await envReadinessCheck();
+    } finally {
+      checkingReadiness.value = false;
     }
   }
 
@@ -162,7 +187,9 @@ export const useEnvStore = defineStore("env", () => {
     envInfo,
     pythonEnvStatus,
     dependencies,
+    readiness,
     loading,
+    checkingReadiness,
     error,
     lastUpdated,
     // getters
@@ -172,8 +199,10 @@ export const useEnvStore = defineStore("env", () => {
     comfyuiCloned,
     venvExists,
     uvAvailable,
+    isReady,
     // actions
     refresh,
+    checkReadiness,
     invalidateCache,
     probeTorch,
     createVenv,

@@ -68,6 +68,8 @@ pub enum ConfigError {
 pub enum EnvError {
     #[error("Python 安装失败: {0}")]
     PythonInstallFailed(String),
+    #[error("uv 不存在或不可执行: {0}\n提示: 请安装 uv (https://docs.astral.sh/uv/) 或在设置中指定 uv 路径")]
+    UvNotFound(String),
     #[error("venv 创建失败: {0}")]
     VenvCreateFailed(String),
     #[error("torch 安装失败: {0}")]
@@ -96,6 +98,9 @@ pub enum CoreError {
     NetworkError(String),
     #[error("目录已存在: {0}")]
     AlreadyExists(std::path::PathBuf),
+    /// 目标目录存在且非空，但不是 git 仓库（无法 clone）
+    #[error("目录已存在但不是 git 仓库: {0}")]
+    NotEmptyDir(std::path::PathBuf),
 }
 
 #[derive(Debug, Error, Serialize)]

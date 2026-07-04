@@ -259,6 +259,143 @@ impl Default for Config {
     }
 }
 
+// ============================================================================
+// Patch 结构（部分更新）
+//
+// 设计意图：前端 `ConfigUpdate = Partial<{ ... Partial<Section> }>`，每个字段
+// 都是可选的。后端收到 patch 后，把 None 的字段跳过，Some 的字段覆盖。
+//
+// 与「整段 deserialize」的区别：避免调用方为单个字段拼出整段 section。
+// 详见 `commands/config.rs::config_update`。
+// ============================================================================
+
+/// Paths section 的 patch
+#[derive(Debug, Default, Deserialize)]
+pub struct PathsConfigPatch {
+    pub comfyui_root: Option<PathBuf>,
+    pub venv_path: Option<PathBuf>,
+    pub python_version: Option<String>,
+}
+
+/// Launch section 的 patch
+#[derive(Debug, Default, Deserialize)]
+pub struct LaunchConfigPatch {
+    pub mode: Option<LaunchMode>,
+    pub listen_host: Option<String>,
+    pub listen_port: Option<u16>,
+    pub auto_open_browser: Option<bool>,
+    pub preview_method: Option<PreviewMethod>,
+    pub custom_args: Option<String>,
+    pub advanced: Option<AdvancedArgs>,
+}
+
+/// Torch section 的 patch
+#[derive(Debug, Default, Deserialize)]
+pub struct TorchConfigPatch {
+    pub cuda_version: Option<CudaVersion>,
+}
+
+/// Models section 的 patch
+#[derive(Debug, Default, Deserialize)]
+pub struct ModelsConfigPatch {
+    pub mode: Option<ModelsMode>,
+    pub custom_root: Option<PathBuf>,
+    pub advanced: Option<AdvancedModels>,
+}
+
+/// UI section 的 patch
+#[derive(Debug, Default, Deserialize)]
+pub struct UiConfigPatch {
+    pub theme: Option<Theme>,
+    pub language: Option<String>,
+    pub auto_check_update: Option<bool>,
+    pub minimize_to_tray: Option<bool>,
+}
+
+/// 顶层 Config patch
+#[derive(Debug, Default, Deserialize)]
+pub struct ConfigPatch {
+    pub paths: Option<PathsConfigPatch>,
+    pub launch: Option<LaunchConfigPatch>,
+    pub torch: Option<TorchConfigPatch>,
+    pub models: Option<ModelsConfigPatch>,
+    pub ui: Option<UiConfigPatch>,
+}
+
+/// 把 PathsConfigPatch 合并到 PathsConfig（Some 字段覆盖）
+pub fn apply_paths_patch(cfg: &mut PathsConfig, patch: PathsConfigPatch) {
+    if let Some(v) = patch.comfyui_root {
+        cfg.comfyui_root = v;
+    }
+    if let Some(v) = patch.venv_path {
+        cfg.venv_path = v;
+    }
+    if let Some(v) = patch.python_version {
+        cfg.python_version = v;
+    }
+}
+
+/// 把 LaunchConfigPatch 合并到 LaunchConfig
+pub fn apply_launch_patch(cfg: &mut LaunchConfig, patch: LaunchConfigPatch) {
+    if let Some(v) = patch.mode {
+        cfg.mode = v;
+    }
+    if let Some(v) = patch.listen_host {
+        cfg.listen_host = v;
+    }
+    if let Some(v) = patch.listen_port {
+        cfg.listen_port = v;
+    }
+    if let Some(v) = patch.auto_open_browser {
+        cfg.auto_open_browser = v;
+    }
+    if let Some(v) = patch.preview_method {
+        cfg.preview_method = v;
+    }
+    if let Some(v) = patch.custom_args {
+        cfg.custom_args = v;
+    }
+    if let Some(v) = patch.advanced {
+        cfg.advanced = v;
+    }
+}
+
+/// 把 TorchConfigPatch 合并到 TorchConfig
+pub fn apply_torch_patch(cfg: &mut TorchConfig, patch: TorchConfigPatch) {
+    if let Some(v) = patch.cuda_version {
+        cfg.cuda_version = v;
+    }
+}
+
+/// 把 ModelsConfigPatch 合并到 ModelsConfig
+pub fn apply_models_patch(cfg: &mut ModelsConfig, patch: ModelsConfigPatch) {
+    if let Some(v) = patch.mode {
+        cfg.mode = v;
+    }
+    if let Some(v) = patch.custom_root {
+        cfg.custom_root = v;
+    }
+    if let Some(v) = patch.advanced {
+        cfg.advanced = v;
+    }
+}
+
+/// 把 UiConfigPatch 合并到 UiConfig
+pub fn apply_ui_patch(cfg: &mut UiConfig, patch: UiConfigPatch) {
+    if let Some(v) = patch.theme {
+        cfg.theme = v;
+    }
+    if let Some(v) = patch.language {
+        cfg.language = v;
+    }
+    if let Some(v) = patch.auto_check_update {
+        cfg.auto_check_update = v;
+    }
+    if let Some(v) = patch.minimize_to_tray {
+        cfg.minimize_to_tray = v;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

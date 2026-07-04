@@ -21,7 +21,7 @@
  *      当前为前端占位实现，后续接入后端时只需替换 checkForUpdate 函数。
  */
 
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, onMounted, type Component } from "vue";
 import {
   NCard,
   NButton,
@@ -38,6 +38,15 @@ import {
 import { useCoreStore } from "@/stores/core";
 import { useToast } from "@/composables/useToast";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
+import {
+  Rocket,
+  RefreshCw,
+  Package,
+  Bug,
+  BookOpen,
+  Link,
+} from "@/components/icons";
+import SafeIcon from "@/components/SafeIcon.vue";
 
 const coreStore = useCoreStore();
 const toast = useToast();
@@ -108,7 +117,7 @@ const techStack: TechStackEntry[] = [
 
 interface LinkEntry {
   label: string;
-  icon: string;
+  icon: Component;
   url: string;
   description: string;
 }
@@ -116,25 +125,25 @@ interface LinkEntry {
 const links: LinkEntry[] = [
   {
     label: "项目仓库",
-    icon: "📦",
+    icon: Package,
     url: "https://github.com/AIJianGe/BoundLaunch",
     description: "GitHub 源码仓库",
   },
   {
     label: "反馈问题",
-    icon: "🐛",
+    icon: Bug,
     url: "https://github.com/your-org/BoundLaunch/issues",
     description: "提交 Bug 或功能建议",
   },
   {
     label: "使用文档",
-    icon: "📖",
+    icon: BookOpen,
     url: "https://github.com/AIJianGe/BoundLaunch/wiki",
     description: "Wiki 文档与教程",
   },
   {
     label: "ComfyUI 官方",
-    icon: "🔗",
+    icon: Link,
     url: "https://github.com/comfyanonymous/ComfyUI",
     description: "上游 ComfyUI 项目",
   },
@@ -230,13 +239,14 @@ onMounted(async () => {
         size="small"
         @click="onCheckUpdate"
       >
-        {{ isChecking ? "检查更新中..." : "🔄 检查更新" }}
+        <SafeIcon v-if="!isChecking" :component="RefreshCw" :size="14" />
+        {{ isChecking ? "检查更新中..." : "检查更新" }}
       </NButton>
     </div>
 
     <!-- 版本信息区 -->
     <div class="version-block">
-      <div class="app-icon">🚀</div>
+      <SafeIcon :component="Rocket" :size="48" class="app-icon" />
       <h1 class="app-name">无界启动器</h1>
       <div class="version-row">
         <span class="launcher-version">v{{ launcherVersion }}</span>
@@ -330,7 +340,7 @@ onMounted(async () => {
     <!-- 链接 -->
     <NCard :bordered="true" size="small" class="section-card">
       <template #header>
-        <span class="header-title">🔗 链接</span>
+        <span class="header-title"><SafeIcon :component="Link" :size="16" class="header-icon" /> 链接</span>
       </template>
       <div class="links-list">
         <div
@@ -339,7 +349,7 @@ onMounted(async () => {
           class="link-row"
           @click="onOpenLink(link.url)"
         >
-          <div class="link-icon">{{ link.icon }}</div>
+          <component :is="link.icon" class="link-icon" :size="20" />
           <div class="link-info">
             <div class="link-label">
               {{ link.label }}

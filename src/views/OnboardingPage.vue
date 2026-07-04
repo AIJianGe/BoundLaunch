@@ -20,7 +20,7 @@
  * - 「跳过向导」直接进入主界面（设置页仍可改配置）
  */
 
-import { ref, computed, reactive } from "vue";
+import { ref, computed, reactive, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import {
   NCard,
@@ -38,13 +38,16 @@ import {
 } from "naive-ui";
 import { useConfigStore } from "@/stores/config";
 import { useEnvStore } from "@/stores/env";
+import { useCoreStore } from "@/stores/core";
 import { useToast } from "@/composables/useToast";
+import { configLauncherWorkingDir } from "@/api/config";
 import FolderPicker from "@/components/FolderPicker.vue";
 import type { LaunchMode, CudaVersion } from "@/api/types";
 
 const router = useRouter();
 const configStore = useConfigStore();
 const envStore = useEnvStore();
+const coreStore = useCoreStore();
 const toast = useToast();
 
 // ========== State ==========
@@ -53,6 +56,8 @@ const initializing = ref(false);
 const initProgress = ref(0);
 const initStage = ref("");
 const initError = ref<string | null>(null);
+const cloning = ref(false);
+const cloneStage = ref("");
 
 // 表单数据（与 Config 字段对应）
 const form = reactive({
@@ -61,6 +66,24 @@ const form = reactive({
   python_version: "3.11",
   mode: "gpu_high" as LaunchMode,
   cuda_version: "cu121" as CudaVersion,
+});
+
+// ========== 初始化：自动填充 launcher 工作目录作为默认根目录 ==========
+onMounted(async () => {
+  try {
+    const workDir = await configLauncherWorkingDir();
+    if (!form.comfyui_root) {
+      // 用 launcher 工作目录的 "ComfyUI" 子目录作为默认根目录
+      // （与后端 apply_default_paths 行为一致）
+      // 统一用 forward-slash（Windows / POSIX 都接受）
+      form.comfyui_root = `${workDir}/ComfyUI`;
+    }
+    if (!form.venv_path) {
+      form.venv_path = `${form.comfyui_root}/venv`;
+    }
+  } catch (e) {
+    console.warn("[onboarding] failed to get launcher working dir:", e);
+  }
 });
 
 // ========== Computed ==========
@@ -94,6 +117,10 @@ function prev() {
 }
 
 async function saveConfig() {
+  /**
+   * 部分更新 Config（不重置未传字段）。
+   * 与后端 `config_update` 配合：Patch 结构 + apply_*_patch。
+   */
   await configStore.update({
     paths: {
       comfyui_root: form.comfyui_root,
@@ -109,11 +136,141 @@ async function saveConfig() {
   });
 }
 
-/** 跳过向导，进入主界面 */
+/**
+ * 跳过向导：仅保存配置，跳转主界面（不触发任何后端长任务）。
+ *
+ * 行为：
+ * - saveConfig 失败 → 弹错并停留向导页
+ * - 成功 → toast「已跳过向导」 + 跳 /launch + 后台异步 clone
+ *
+ * 后台 clone 失败由 ensureClonedInBackground 内部 toast ，
+ * 不会让 skipOnboarding 报「保存失败」（因为 saveConfig 实际成功了）。
+ */
 async function skipOnboarding() {
   try {
     await saveConfig();
-    toast.info("已跳过向导，可稍后在设置页配置");
+    toast.info("已跳过向导，配置已保存");
+    router.push("/launch");
+    // 后台异步触发 clone（不阻塞跳转；失败由内部 catch + toast）
+    void ensureClonedInBackground();
+  } catch (e) {
+    toast.error("保存配置失败", e);
+  }
+}
+
+/**
+ * 后台异步确保 ComfyUI 仓库已克隆（用于跳过/完成场景）
+ *
+ * 注意：clone 失败不影响用户主流程（用户已经在主界面了）。
+ * 因此所有错误都走 toast，不抛出。
+ */
+async function ensureClonedInBackground() {
+  if (cloning.value) return;
+  cloning.value = true;
+  cloneStage.value = "检查 ComfyUI 仓库...";
+  try {
+    await coreStore.ensureCloned();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // NotEmptyDir 是预期内的错误（用户用了非空目录），不弹错
+    if (msg.includes("NotEmptyDir")) {
+      console.info("[onboarding] ComfyUI 根目录已存在但非仓库，跳过 clone");
+    } else {
+      toast.error("ComfyUI 仓库克隆失败", e);
+    }
+  } finally {
+    cloning.value = false;
+    cloneStage.value = "";
+  }
+}
+
+/**
+ * 完成向导：保存配置 + 可选初始化环境
+ *
+ * 关键设计：错误按阶段分别 catch + 明确文案
+ * - 阶段 1：保存配置失败 → 「保存配置失败：<msg>」
+ * - 阶段 2：创建 venv 失败 → 「创建虚拟环境失败：<msg>」（可能原因：uv 不可用）
+ * - 阶段 3：安装 torch 失败 → 「安装 PyTorch 失败：<msg>」
+ * - 阶段 4：刷新环境信息失败 → 「环境校验失败：<msg>」（不致命，仅提示）
+ *
+ * 每次重试前会清空 initError，避免错误提示永久残留。
+ */
+async function finishWithInit() {
+  initializing.value = true;
+  initError.value = null; // 重试时清空
+  initProgress.value = 0;
+
+  try {
+    // ========== 阶段 1: 保存配置 ==========
+    initStage.value = "保存配置中...";
+    try {
+      await saveConfig();
+    } catch (e) {
+      throw new InitStageError("保存配置失败", e);
+    }
+    initProgress.value = 10;
+
+    // ========== 阶段 2: 创建 venv ==========
+    initStage.value = "创建 Python 虚拟环境（venv）...";
+    try {
+      await envStore.createVenv(form.python_version);
+    } catch (e) {
+      throw new InitStageError("创建虚拟环境失败", e);
+    }
+    initProgress.value = 40;
+
+    // ========== 阶段 3: 安装 torch（仅 GPU 模式） ==========
+    if (form.mode !== "cpu") {
+      initStage.value = `安装 PyTorch（${form.cuda_version}）...`;
+      try {
+        await envStore.installTorch(form.cuda_version);
+      } catch (e) {
+        throw new InitStageError("安装 PyTorch 失败", e);
+      }
+    }
+    initProgress.value = 80;
+
+    // ========== 阶段 4: 刷新环境信息（非致命） ==========
+    initStage.value = "校验环境...";
+    try {
+      await envStore.refresh();
+    } catch (e) {
+      // 不抛错 — 仅仅是 UI 状态可能滞后，下次手动刷新即可
+      console.warn("[onboarding] post-init refresh failed:", e);
+    }
+    initProgress.value = 100;
+
+    toast.success("环境初始化完成");
+    setTimeout(() => {
+      router.push("/launch");
+    }, 500);
+    // 后台异步触发 clone（不阻塞跳转）
+    void ensureClonedInBackground();
+  } catch (e) {
+    // InitStageError 自带中文 prefix；其他错误统一归为「初始化失败」
+    const msg = e instanceof InitStageError
+      ? `${e.stage}: ${e.cause instanceof Error ? e.cause.message : String(e.cause)}`
+      : e instanceof Error
+        ? e.message
+        : String(e);
+    initError.value = msg;
+    toast.error("初始化失败", msg);
+    // 不重置 initProgress — 让用户看到失败在哪个阶段
+  } finally {
+    initializing.value = false;
+  }
+}
+
+/**
+ * 仅保存配置，跳过环境初始化。
+ *
+ * 与「跳过向导」行为不同：本函数仅在向导第 4 步触发，配置保存后直接
+ * 跳转主界面，不触发任何后台 clone（用户可以在启动页手工触发）。
+ */
+async function finishWithoutInit() {
+  try {
+    await saveConfig();
+    toast.success("配置已保存，可稍后在启动页一键安装环境");
     router.push("/launch");
   } catch (e) {
     toast.error("保存配置失败", e);
@@ -121,59 +278,15 @@ async function skipOnboarding() {
 }
 
 /**
- * 完成向导（保存配置 + 可选初始化环境）
- *
- * - 用户点击「跳过初始化」：仅保存配置，跳转主界面
- * - 用户点击「开始初始化」：保存配置 + 创建 venv + 装 torch + 显示进度
+ * 阶段化错误：在 finishWithInit 流程中标识失败发生在哪个阶段
  */
-async function finishWithInit() {
-  initializing.value = true;
-  initError.value = null;
-  initProgress.value = 0;
-
-  try {
-    // 步骤 1: 保存配置
-    initStage.value = "保存配置中...";
-    await saveConfig();
-    initProgress.value = 10;
-
-    // 步骤 2: 创建 venv
-    initStage.value = "创建 Python 虚拟环境（venv）...";
-    await envStore.createVenv(form.python_version);
-    initProgress.value = 40;
-
-    // 步骤 3: 安装 torch（仅 GPU 模式）
-    if (form.mode !== "cpu") {
-      initStage.value = `安装 PyTorch（${form.cuda_version}）...`;
-      await envStore.installTorch(form.cuda_version);
-    }
-    initProgress.value = 80;
-
-    // 步骤 4: 刷新环境信息
-    initStage.value = "校验环境...";
-    await envStore.refresh();
-    initProgress.value = 100;
-
-    toast.success("环境初始化完成");
-    setTimeout(() => {
-      router.push("/launch");
-    }, 500);
-  } catch (e) {
-    initError.value = e instanceof Error ? e.message : String(e);
-    toast.error("初始化失败", e);
-  } finally {
-    initializing.value = false;
-  }
-}
-
-/** 仅保存配置，跳过环境初始化 */
-async function finishWithoutInit() {
-  try {
-    await saveConfig();
-    toast.success("配置已保存，可稍后在设置页初始化环境");
-    router.push("/launch");
-  } catch (e) {
-    toast.error("保存配置失败", e);
+class InitStageError extends Error {
+  constructor(
+    public readonly stage: string,
+    public readonly cause: unknown,
+  ) {
+    super(`${stage}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "InitStageError";
   }
 }
 </script>

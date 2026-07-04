@@ -21,6 +21,8 @@ import { useRouter } from "vue-router";
 import { NButton, NTooltip, NTag, NSpin } from "naive-ui";
 import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
+import { Rocket, Settings } from "@/components/icons";
+import SafeIcon from "@/components/SafeIcon.vue";
 
 const router = useRouter();
 const processStore = useProcessStore();
@@ -91,7 +93,7 @@ function goSettings() {
 <template>
   <div class="app-header">
     <div class="header-left">
-      <span class="rocket-icon">🚀</span>
+      <SafeIcon :component="Rocket" :size="18" class="rocket-icon" />
       <span class="app-name">无界启动器</span>
       <span class="app-version">v{{ launcherVersion }}</span>
     </div>
@@ -120,7 +122,7 @@ function goSettings() {
       <NTooltip placement="bottom">
         <template #trigger>
           <NButton quaternary circle @click="goSettings">
-            ⚙️
+            <SafeIcon :component="Settings" :size="16" />
           </NButton>
         </template>
         设置
@@ -145,7 +147,9 @@ function goSettings() {
 }
 
 .rocket-icon {
-  font-size: 18px;
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
 }
 
 .app-name {

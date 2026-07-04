@@ -16,6 +16,16 @@ pub fn app_data_dir() -> PathBuf {
         .join("boundlaunch")
 }
 
+/// launcher 工作目录（进程当前目录）
+///
+/// ComfyUI 根目录的默认值。当 config.toml 未配置 comfyui_root 时，
+/// 使用此目录作为 ComfyUI 仓库的克隆位置。
+///
+/// 注意：开发模式下指向项目根目录，生产模式下指向用户执行 launcher 的目录。
+pub fn launcher_working_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 /// config.toml 路径
 pub fn config_path() -> PathBuf {
     app_data_dir().join("config.toml")

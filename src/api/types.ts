@@ -175,6 +175,34 @@ export interface CompatibilityResult {
 }
 
 // ============================================================================
+// Environment Readiness（启动 ComfyUI 前的就绪性检查）
+// 对应后端 `env_inspector::readiness::ReadinessResult`
+// ============================================================================
+
+/** 缺失步骤（前端按顺序自动补齐） */
+export type ReadinessStep =
+  | { kind: "CloneComfyUI" }
+  | { kind: "CreateVenv"; params: { python_version: string } }
+  | { kind: "InstallTorch"; params: { cuda_version: string } }
+  | { kind: "InstallRequirements" };
+
+/** 分项检查结果 */
+export interface ReadinessChecks {
+  comfyui_cloned: boolean;
+  venv_exists: boolean;
+  uv_available: boolean;
+  torch_installed: boolean;
+  requirements_ok: boolean;
+}
+
+/** 就绪性检查返回值 */
+export interface ReadinessCheckResult {
+  ready: boolean;
+  missing_steps: ReadinessStep[];
+  checks: ReadinessChecks;
+}
+
+// ============================================================================
 // CoreManager 模块（对应 src-tauri/src/core_manager/models.rs）
 // ============================================================================
 

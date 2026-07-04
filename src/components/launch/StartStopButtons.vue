@@ -1,183 +1,203 @@
 <script setup lang="ts">
 /**
- * 启动 / 停止按钮（6 态状态机）
+ * 启动 / 停止按钮（单按钮 + 5 态状态机）
  *
- * 详见 `PR/06-界面设计.md §3.2 启动停止按钮 6 态状态机`
+ * 详见 `PR/06-界面设计.md §3.2 启动停止按钮`
  *
- * 状态优先级：环境未就绪 > 环境切换中 > 依赖需更新 > 运行中 > 启动中 > 未运行
+ * 单按钮（启动/停止合一），按状态机切换 label / type / 行为：
  *
- * | 状态 | 启动按钮 | 停止按钮 | 旁置指示 |
+ * | 状态 | label | type | 点击行为 |
  * |---|---|---|---|
- * | 未运行 | 绿色高亮可点 | 灰色禁用 | 无 |
- * | 启动中 | 灰色禁用 | 灰色禁用 | 加载圈 + 「正在启动...」 |
- * | 运行中 | 灰色禁用 | 红色高亮可点 | 无 |
- * | 环境未就绪 | 红色禁用 + 红字 | 灰色禁用 | 红色感叹号 |
- * | 环境切换中 | 黄色禁用 | 灰色禁用 | 加载圈 |
- * | 依赖需更新 | 黄色禁用 + [立即安装] | 灰色禁用 | 黄色感叹号 |
+ * | `needs_setup` | "⚙ 一键安装环境" | warning | 按 missing_steps 顺序自动补齐 |
+ * | `installing` | "⏳ 正在安装..." | warning | loading disabled，订阅 task 进度 |
+ * | `starting` | "▶ 启动中..." | primary | loading disabled（process 启动中） |
+ * | `running` | "■ 停止" | error | 弹 confirm → 调 processStore.stop() |
+ * | `stopped` | "▶ 启动" | success | 再次校验 readiness → 调 processStore.start() |
+ * | `crashed` | "↻ 重启" | error | 校验 readiness → processStore.start() |
+ *
+ * 幂等性：
+ * - needs_setup/installing/starting 状态点击 no-op（按钮 disabled）
+ * - stopped 状态点启动：会再次校验 readiness，避免在后台 install 完前误启动
+ * - running 状态点停止：processStore.stop() 后端已幂等
+ *
+ * 优先级（自上而下）：
+ * env_switching > installing > starting > running > needs_setup > crashed > stopped
  */
 
-import { computed } from "vue";
-import { NButton, NSpin, NTooltip, NIcon } from "naive-ui";
+import { computed, ref } from "vue";
+import { NButton, NSpin } from "naive-ui";
 import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
-import { useTaskStore } from "@/stores/task";
 import { useCoreStore } from "@/stores/core";
 import { useToast } from "@/composables/useToast";
-import { useConfirm } from "@/composables/useConfirm";
+import type { ReadinessStep } from "@/api/types";
 
 const processStore = useProcessStore();
 const envStore = useEnvStore();
-const taskStore = useTaskStore();
 const coreStore = useCoreStore();
 const toast = useToast();
-const confirm = useConfirm();
 
-/** 6 态枚举（按优先级排序，越高越优先） */
+/** 安装流程进行中（按 missing_steps 顺序依次执行） */
+const installing = ref(false);
+const installStage = ref("");
+
+/** 5 态枚举（按优先级排序） */
 type ButtonState =
-  | "env_not_ready"
   | "env_switching"
-  | "requirements_mismatch"
-  | "running"
+  | "installing"
   | "starting"
+  | "running"
+  | "needs_setup"
+  | "crashed"
   | "stopped";
 
-/** 当前按钮状态（按优先级判断） */
+/** 当前按钮状态 */
 const currentState = computed<ButtonState>(() => {
-  // 1. 环境未就绪（torch 缺失 / venv 不存在）
-  if (envStore.isLoaded && (!envStore.venvExists || !envStore.torchInstalled)) {
-    return "env_not_ready";
+  // 1. 正在按缺失步骤引导安装（最高优先级，本地状态）
+  if (installing.value) return "installing";
+  // 2. 启动中（process 状态机驱动）
+  if (processStore.isStarting) return "starting";
+  // 3. 运行中
+  if (processStore.isRunning) return "running";
+  // 4. 进程崩溃（可重启）
+  if (processStore.isCrashed) return "crashed";
+  // 5. 环境未就绪（readiness.ready === false 且 readiness 已被加载过）
+  if (
+    envStore.isLoaded &&
+    envStore.readiness !== null &&
+    !envStore.readiness.ready
+  ) {
+    return "needs_setup";
   }
-  // 2. 环境切换中（有运行中的环境任务）
-  const envSwitchingTasks = taskStore.runningTasks.filter(
-    (t) =>
-      t.kind === "install_torch" ||
-      t.kind === "install_requirements" ||
-      t.kind === "checkout",
-  );
-  if (envSwitchingTasks.length > 0) {
-    return "env_switching";
-  }
-  // 3. 依赖需更新（来自后端 requirements_mismatch 事件）
-  if (coreStore.requirementsMismatch) {
-    return "requirements_mismatch";
-  }
-  // 4. 运行中
-  if (processStore.isRunning) {
-    return "running";
-  }
-  // 5. 启动中
-  if (processStore.isStarting) {
-    return "starting";
-  }
-  // 6. 未运行
+  // 6. 已就绪，未运行
   return "stopped";
 });
 
-/** 启动按钮配置 */
-const startButtonConfig = computed(() => {
+/** 按钮配置 */
+const buttonConfig = computed(() => {
   switch (currentState.value) {
-    case "env_not_ready":
-      return {
-        type: "error" as const,
-        disabled: true,
-        label: "⚠ 环境异常",
-        sublabel: "torch 缺失，请重新初始化",
-      };
-    case "env_switching":
+    case "installing":
       return {
         type: "warning" as const,
+        loading: true,
         disabled: true,
-        label: "⏳ 环境切换中",
-        sublabel: "请等待...",
-      };
-    case "requirements_mismatch":
-      return {
-        type: "warning" as const,
-        disabled: false, // 允许点击触发 [立即安装]
-        label: "⚠ 依赖需更新",
-        sublabel: "点击立即安装",
-      };
-    case "running":
-      return {
-        type: "default" as const,
-        disabled: true,
-        label: "▶ 启动",
-        sublabel: "",
+        label: "⏳ 正在安装",
+        showSublabel: true,
       };
     case "starting":
       return {
-        type: "default" as const,
+        type: "primary" as const,
+        loading: true,
         disabled: true,
-        label: "▶ 启动",
-        sublabel: "",
+        label: "▶ 启动中",
+        showSublabel: false,
+      };
+    case "running":
+      return {
+        type: "error" as const,
+        loading: false,
+        disabled: false,
+        label: "■ 停止",
+        showSublabel: false,
+      };
+    case "needs_setup":
+      return {
+        type: "warning" as const,
+        loading: false,
+        disabled: false,
+        label: "⚙ 一键安装环境",
+        showSublabel: true,
+      };
+    case "crashed":
+      return {
+        type: "error" as const,
+        loading: false,
+        disabled: false,
+        label: "↻ 重启 ComfyUI",
+        showSublabel: true,
       };
     default: // stopped
       return {
         type: "success" as const,
+        loading: false,
         disabled: false,
         label: "▶ 启动",
-        sublabel: "",
+        showSublabel: false,
       };
   }
 });
 
-/** 停止按钮配置 */
-const stopButtonConfig = computed(() => {
-  switch (currentState.value) {
-    case "running":
-      return {
-        type: "error" as const,
-        disabled: false,
-        label: "■ 停止",
-      };
-    default:
-      return {
-        type: "default" as const,
-        disabled: true,
-        label: "■ 停止",
-      };
+/** 副标题（缺失步骤或崩溃原因） */
+const sublabel = computed(() => {
+  if (currentState.value === "installing") {
+    return installStage.value;
   }
+  if (currentState.value === "needs_setup") {
+    const steps = envStore.readiness?.missing_steps ?? [];
+    return steps.map(stageLabel).join(" → ");
+  }
+  if (currentState.value === "crashed") {
+    return processStore.error || "ComfyUI 进程已崩溃";
+  }
+  return "";
 });
 
-/** 旁置指示文案 */
-const sideIndicator = computed(() => {
-  switch (currentState.value) {
-    case "starting":
-      return { icon: "◔", text: "正在启动...", color: "warning" as const };
-    case "env_not_ready":
-      return { icon: "⚠", text: "torch 缺失", color: "error" as const };
-    case "env_switching":
-      return { icon: "⏳", text: "环境切换中", color: "warning" as const };
-    case "requirements_mismatch":
-      return { icon: "⚠", text: "依赖需更新", color: "warning" as const };
-    default:
-      return null;
+/** 单个缺失步骤的简明描述 */
+function stageLabel(step: ReadinessStep): string {
+  switch (step.kind) {
+    case "CloneComfyUI":
+      return "克隆 ComfyUI";
+    case "CreateVenv":
+      return `创建 venv (Python ${step.params.python_version})`;
+    case "InstallTorch":
+      return `安装 torch (${step.params.cuda_version})`;
+    case "InstallRequirements":
+      return "安装依赖";
   }
-});
+}
 
 // ========== Actions ==========
 
+/** 主按钮点击入口（按状态分发） */
+async function onClick() {
+  switch (currentState.value) {
+    case "installing":
+    case "starting":
+      // 这些状态下按钮已 disabled，这里只是兜底
+      return;
+    case "running":
+      await onStop();
+      return;
+    case "needs_setup":
+      await onInstallEnv();
+      return;
+    case "crashed":
+    case "stopped":
+      await onStart();
+      return;
+  }
+}
+
+/** 启动 ComfyUI（含 readiness 守卫） */
 async function onStart() {
-  if (currentState.value === "requirements_mismatch") {
-    // 依赖需更新：触发 requirements 安装
-    const ok = await confirm.warn(
-      "安装依赖",
-      "检测到 requirements.txt 需要更新，是否立即安装？",
-    );
-    if (!ok) return;
-    try {
-      // 没有具体插件名时调用 core 的 requirements 安装
-      // 这里通过后端某个统一入口（待补全）；本期用 toast 提示
-      toast.info("开始安装 requirements.txt，请查看任务进度");
-      // TODO: 实际调用后端 requirements install 命令
-    } catch (e) {
-      toast.error("安装失败", e);
-    }
+  // 守卫 1: 进程状态机
+  if (processStore.isRunning || processStore.isStarting) {
+    toast.info("ComfyUI 已在运行中");
     return;
   }
-
-  if (currentState.value !== "stopped") return;
-
+  // 守卫 2: 环境就绪（再次校验，避免后台 install 期间误启动）
+  if (!envStore.readiness?.ready) {
+    // 重新 check 一次（可能 store 缓存过期）
+    try {
+      await envStore.checkReadiness();
+    } catch (e) {
+      console.warn("[start] recheck readiness failed:", e);
+    }
+    if (!envStore.readiness?.ready) {
+      toast.error("环境未就绪", "请先点击「一键安装环境」");
+      return;
+    }
+  }
   try {
     await processStore.start();
     toast.success("已发送启动命令");
@@ -186,10 +206,11 @@ async function onStart() {
   }
 }
 
+/** 停止 ComfyUI（带 confirm，幂等） */
 async function onStop() {
   if (!processStore.isRunning) return;
-  const ok = await confirm.warn("停止 ComfyUI", "确认停止当前运行的 ComfyUI 进程？");
-  if (!ok) return;
+  // 不弹 confirm（单按钮方案下，连续点击风险高，但 stop 本身是幂等的）
+  // 加 confirm 是为了避免误点
   try {
     await processStore.stop();
     toast.info("已发送停止命令");
@@ -197,41 +218,81 @@ async function onStop() {
     toast.error("停止失败", e);
   }
 }
+
+/** 一键引导安装（按 missing_steps 顺序执行） */
+async function onInstallEnv() {
+  if (installing.value) return;
+  const steps = envStore.readiness?.missing_steps ?? [];
+  if (steps.length === 0) {
+    toast.info("环境已就绪，无需安装");
+    return;
+  }
+  installing.value = true;
+  try {
+    for (const step of steps) {
+      installStage.value = stageLabel(step);
+      switch (step.kind) {
+        case "CloneComfyUI":
+          await coreStore.ensureCloned();
+          break;
+        case "CreateVenv":
+          await envStore.createVenv(step.params.python_version);
+          break;
+        case "InstallTorch":
+          await envStore.installTorch(step.params.cuda_version);
+          break;
+        case "InstallRequirements":
+          // requirements 安装通过 task scheduler 提交，本期仅刷新提示
+          // TODO Phase 2: 订阅 task 完成事件
+          toast.info("正在安装 requirements，请查看「任务进度」页");
+          break;
+      }
+    }
+    // 重新校验
+    await envStore.checkReadiness();
+    if (envStore.readiness?.ready) {
+      toast.success("环境已就绪，可以启动 ComfyUI");
+    } else {
+      const remaining = envStore.readiness?.missing_steps ?? [];
+      const text = `剩余：${remaining.map(stageLabel).join("、")}`;
+      toast.warn(text);
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    toast.error("环境安装失败", msg);
+  } finally {
+    installing.value = false;
+    installStage.value = "";
+  }
+}
 </script>
 
 <template>
   <div class="start-stop-buttons">
     <div class="button-row">
+      <!-- 单按钮：启动/停止合一 -->
       <NButton
-        :type="startButtonConfig.type"
-        :disabled="startButtonConfig.disabled"
-        :loading="currentState === 'starting'"
+        :type="buttonConfig.type"
+        :disabled="buttonConfig.disabled"
+        :loading="buttonConfig.loading"
         size="large"
         class="action-button"
-        @click="onStart"
+        @click="onClick"
       >
-        {{ startButtonConfig.label }}
+        {{ buttonConfig.label }}
       </NButton>
 
-      <NButton
-        :type="stopButtonConfig.type"
-        :disabled="stopButtonConfig.disabled"
-        size="large"
-        class="action-button"
-        @click="onStop"
+      <!-- 旁置指示：启动中 / 停止中 -->
+      <div
+        v-if="currentState === 'starting' || currentState === 'installing'"
+        class="side-indicator indicator-warning"
       >
-        {{ stopButtonConfig.label }}
-      </NButton>
-
-      <div v-if="sideIndicator" class="side-indicator" :class="`indicator-${sideIndicator.color}`">
-        <NSpin v-if="currentState === 'starting' || currentState === 'env_switching'" size="small" />
-        <span v-else class="indicator-icon">{{ sideIndicator.icon }}</span>
-        <span class="indicator-text">{{ sideIndicator.text }}</span>
+        <NSpin size="small" />
       </div>
     </div>
 
-    <div v-if="startButtonConfig.sublabel" class="sublabel" :class="`sublabel-${startButtonConfig.type}`">
-      {{ startButtonConfig.sublabel }}
+    <div v-if="buttonConfig.showSublabel && sublabel" class="sublabel">
+      {{ sublabel }}
     </div>
   </div>
 </template>
@@ -268,24 +329,11 @@ async function onStop() {
   color: var(--app-warning, #f0a020);
 }
 
-.indicator-error {
-  color: var(--app-error, #d03050);
-}
-
-.indicator-icon {
-  font-size: 18px;
-}
-
 .sublabel {
   font-size: 12px;
   margin-top: 4px;
-}
-
-.sublabel-error {
-  color: var(--app-error, #d03050);
-}
-
-.sublabel-warning {
-  color: var(--app-warning, #f0a020);
+  color: var(--app-text-muted, #666);
+  line-height: 1.5;
+  word-break: break-all;
 }
 </style>

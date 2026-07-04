@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM  无界启动器 (BoundLaunch) Build Launcher (Windows)
+REM   藿        (BoundLaunch) Build Launcher (Windows)
 REM
 REM  Double-click to run. Delegates actual work to build.mjs.
 REM  Uses goto pattern to avoid cmd parenthesized block parsing issues.
@@ -14,7 +14,7 @@ setlocal EnableDelayedExpansion
 
 echo.
 echo ============================================================
-echo   无界启动器 Build Launcher (Windows)
+echo    藿        Build Launcher (Windows)
 echo   Backend script: build.mjs
 echo ============================================================
 echo.
@@ -187,20 +187,20 @@ echo.
 echo [INFO] Starting build: node build.mjs %BUILD_ARGS%
 echo.
 
-REM --- 6.5 Build Jobs 全局配置（透传） ---
-REM 详见 build.config.README.md / pr\05-依赖与启动参数.md §5
-REM 优先级：环境变量 BUILD_JOBS > build.config.json > 自动检测 (上限 16)
+REM --- 6.5 Build Jobs 全     茫 透     ---
+REM     build.config.README.md / pr\05-              .md   5
+REM    燃            BUILD_JOBS > build.config.json >  远     (     16)
 if defined BUILD_JOBS (
-  echo [INFO] BUILD_JOBS=%BUILD_JOBS% (用户指定)
+  echo [INFO] BUILD_JOBS=%BUILD_JOBS% ( 没 指  )
 ) else (
-  echo [INFO] BUILD_JOBS=未设置（build.mjs 将自动检测或读取 build.config.json）
+  echo [INFO] BUILD_JOBS=未   茫 build.mjs    远      取 build.config.json  
 )
 
 REM Switch console to UTF-8 so build.mjs Chinese output displays correctly
 chcp 65001 >nul 2>&1
 
 REM --- 7. Call build.mjs ---
-REM Windows CMD 默认会透传环境变量到子进程，无需显式 export
+REM Windows CMD 默 匣 透             咏  蹋       式 export
 node build.mjs %BUILD_ARGS%
 set EXIT_CODE=%ERRORLEVEL%
 goto :report

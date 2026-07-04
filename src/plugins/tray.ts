@@ -76,12 +76,19 @@ export function useTray() {
           console.warn("[tray] stop on quit failed:", e);
         });
       }
-      const win = getCurrentWindow();
-      await win.destroy();
+      // 调用 Tauri 的 app.exit() 通过 Rust 端彻底退出
+      // 不要用 win.destroy() —— 与 Tauri 默认销毁流程冲突
+      const { exit } = await import("@tauri-apps/plugin-process");
+      await exit(0);
     } catch (e) {
       console.error("[tray] quit failed:", e);
-      // 强制退出
-      window.close();
+      // 兜底：作为最后手段，关闭 webview
+      try {
+        const win = getCurrentWindow();
+        await win.destroy();
+      } catch (e2) {
+        console.error("[tray] fallback destroy failed:", e2);
+      }
     }
   }
 
@@ -121,19 +128,40 @@ export function useTray() {
 
   /** 监听窗口关闭按钮：最小化到托盘（保活 ComfyUI 进程） */
   async function setupCloseToTray() {
+    console.log("[tray] setupCloseToTray called");
     try {
       const win = getCurrentWindow();
-      await win.onCloseRequested(async (event) => {
-        if (processStore.isAlive) {
-          // 阻止默认关闭，最小化到托盘
+      console.log("[tray] got current window, label =", win.label);
+      // 关键：回调必须是同步函数（Tauri 2 的 onCloseRequested 需要在第一行同步
+      // 决定是否 preventDefault）。async 回调虽然第一行也是同步执行，但
+      // Tauri 内部会 await handler Promise，与默认 close 流程有 race condition。
+      // 所以：
+      //   1) 回调签名用 `(event) => void`（非 async）
+      //   2) preventDefault() 同步调用
+      //   3) win.hide() / win.destroy() 等副作用用 queueMicrotask 延后到下一个微任务
+      const unlisten = await win.onCloseRequested((event) => {
+        const alive = processStore.isAlive;
+        console.log("[tray] close-requested event, isAlive =", alive);
+        if (alive) {
+          // 阻止默认关闭
           event.preventDefault();
-          await win.hide();
-          toast.info("ComfyUI 仍在运行，已最小化到托盘");
+          // 副作用延后：避免在 close-requested 流程未结束时调用窗口 API
+          queueMicrotask(async () => {
+            try {
+              await win.hide();
+              toast.info("ComfyUI 仍在运行，已最小化到托盘");
+            } catch (e) {
+              console.warn("[tray] hide failed:", e);
+            }
+          });
         }
-        // 否则正常关闭
+        // else 分支：什么都不做，让 Tauri 默认流程关闭整个应用
+        // 不要调 win.destroy() —— 会与 Tauri 默认销毁流程冲突导致卡死
       });
+      unlisteners.push(unlisten);
+      console.log("[tray] onCloseRequested registered, total unlisteners =", unlisteners.length);
     } catch (e) {
-      console.warn("[tray] setup close-to-tray failed:", e);
+      console.error("[tray] setup close-to-tray failed:", e);
     }
   }
 

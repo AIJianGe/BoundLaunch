@@ -42,16 +42,27 @@ impl UvRunner {
 
     /// 检测 uv 是否可用
     pub async fn is_available(&self) -> bool {
-        if self.uv_binary == PathBuf::from("uv") {
+        let uv_bin = &self.uv_binary;
+        if uv_bin == &PathBuf::from("uv") {
             // 通过 PATH 查找
-            tokio::process::Command::new(&self.uv_binary)
+            tokio::process::Command::new(uv_bin)
                 .arg("--version")
                 .output()
                 .await
                 .map(|o| o.status.success())
                 .unwrap_or(false)
         } else {
-            self.uv_binary.exists()
+            // 绝对路径：检查文件存在 + 可执行
+            if !uv_bin.exists() {
+                return false;
+            }
+            // 用 --version 实际跑一遍确认可执行
+            tokio::process::Command::new(uv_bin)
+                .arg("--version")
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false)
         }
     }
 
@@ -74,20 +85,35 @@ impl UvRunner {
     /// 创建 venv
     ///
     /// `uv venv <path> --python <version>`
+    ///
+    /// 错误处理：uv 不存在时直接返回 `UvNotFound`，避免把底层 `program not found`
+    /// 错误归为 venv 创建失败。
     pub async fn create_venv(
         &self,
         venv_path: &Path,
         python_version: &str,
     ) -> Result<(), EnvError> {
+        // 先确认 uv 可用 — 避免把「uv not found」包成「venv 创建失败」
+        if !self.is_available().await {
+            return Err(EnvError::UvNotFound(self.uv_binary.to_string_lossy().into_owned()));
+        }
         let venv_str = venv_path.to_string_lossy().to_string();
         let python_arg = format!("--python={}", python_version);
-        let output = self
-            .run_cmd(&["venv", &venv_str, &python_arg])
-            .await
-            .map_err(|e| EnvError::VenvCreateFailed(e.to_string()))?;
+        let output = match self.run_cmd(&["venv", &venv_str, &python_arg]).await {
+            Ok(out) => out,
+            Err(e) => {
+                return Err(EnvError::VenvCreateFailed(format!(
+                    "{}\nvenv 路径: {}\nPython 版本: {}\n提示: 请检查 uv 是否在 PATH 中，或在「设置」中指定 uv 路径",
+                    e, venv_str, python_version
+                )));
+            }
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(EnvError::VenvCreateFailed(stderr.into_owned()));
+            return Err(EnvError::VenvCreateFailed(format!(
+                "{}\nvenv 路径: {}\nPython 版本: {}",
+                stderr, venv_str, python_version
+            )));
         }
         tracing::info!(?venv_path, python = python_version, "venv created");
         Ok(())

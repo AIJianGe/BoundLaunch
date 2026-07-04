@@ -11,6 +11,7 @@ pub mod cache;
 pub mod deps;
 pub mod gpu;
 pub mod models;
+pub mod readiness;
 pub mod scripts;
 
 use std::path::Path;

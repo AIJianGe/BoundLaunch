@@ -84,11 +84,27 @@ npm install
 
 ### 启动开发模式
 
+**Windows**（双击即可）：
+
+```cmd
+run.bat
+```
+
+**Linux / macOS**：
+
+```bash
+chmod +x run.sh
+./run.sh
+```
+
+**或直接调用**：
+
 ```bash
 npm run tauri dev
 ```
 
 首次启动会触发 Vite + Tauri + Rust 的完整编译，约 5-10 分钟（取决于机器配置）。
+脚本会自动检查 Node.js / Rust / MSVC 等依赖，首次运行缺失时自动 `npm install`。
 
 ### 打包发布
 
@@ -193,7 +209,9 @@ boundlaunch/
 │
 ├── build.mjs                     # 跨平台打包脚本（核心）
 ├── build.bat                     # Windows 打包启动器
-├── build.sh                      # Linux 打包启动器
+├── build.sh                      # Linux / macOS 打包启动器
+├── run.bat                       # Windows 开发模式启动器（npm run tauri dev）
+├── run.sh                        # Linux / macOS 开发模式启动器
 ├── build.config.json             # 编译并行度配置
 ├── build.config.example.json     # 配置模板
 ├── build.config.README.md        # 编译配置详细文档

@@ -7,7 +7,9 @@
 use std::path::PathBuf;
 
 use crate::app_state::AppState;
+use crate::config::Config;
 use crate::env_inspector::models::{DependencyInfo, EnvInfo, TorchInfo};
+use crate::env_inspector::readiness::{self, ReadinessResult};
 use tauri::State;
 
 /// 完整环境探查（前端进入启动页 / 点击刷新时调用）
@@ -66,4 +68,27 @@ pub async fn env_list_dependencies(state: State<'_, AppState>) -> Result<Vec<Dep
 pub async fn env_invalidate_cache(state: State<'_, AppState>) -> Result<(), String> {
     state.env_inspector.invalidate_cache();
     Ok(())
+}
+
+/// 环境就绪性检查（启动 ComfyUI 前调用）
+///
+/// 返回 `ReadinessResult`：
+/// - `ready = true`：环境就绪，可直接调 `process_start`
+/// - `ready = false`：缺失步骤在 `missing_steps` 中（按顺序），前端可依次引导/自动补齐
+///
+/// 不修改任何状态（不克隆、不安装），仅做只读检测。
+#[tauri::command]
+pub async fn env_readiness_check(state: State<'_, AppState>) -> Result<ReadinessResult, String> {
+    // Guard 持有期间不能跨 await 调用 — 先克隆出 Config 后再 drop
+    let cfg: Config = {
+        let guard = state.config.get();
+        (**guard).clone()
+    };
+    Ok(readiness::check_readiness(
+        &cfg,
+        &state.core_manager,
+        &state.env_inspector,
+        &state.python_env,
+    )
+    .await)
 }

@@ -18,6 +18,13 @@
  * 6. 日志
  * 7. 任务进度
  * 8. 关于
+ *
+ * 实现要点：
+ * - 使用 NMenu 标准 `icon` + `label` props（NMenu 在 collapsed 状态下会自动管理图标/文字显隐）
+ * - 自定义 `label: () => h(...)` 会触发 NMenu 给 `.n-menu-item-content-header` 设 `opacity: 0`，
+ *   吞掉所有子元素（包括图标）。这是本项目踩过的坑，方案 D 改用标准 props 规避。
+ * - SafeIcon wrapper 保留：把 `color` prop 显式传给 Lucide，避免 `stroke="currentColor"` 在
+ *   Tauri WebView2 上 paint 时被错误解析。
  */
 
 import {
@@ -27,59 +34,72 @@ import {
   NLayoutContent,
   NMenu,
   NScrollbar,
-  NTooltip,
   type MenuOption,
 } from "naive-ui";
-import { h, computed } from "vue";
-import { RouterLink, useRoute } from "vue-router";
+import { computed, h, type Component } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import AppHeader from "@/components/AppHeader.vue";
+import SafeIcon from "@/components/SafeIcon.vue";
+import {
+  Rocket,
+  RefreshCw,
+  Puzzle,
+  Package,
+  Settings,
+  ScrollText,
+  BarChart3,
+  Info,
+} from "@/components/icons";
 
 const route = useRoute();
+const router = useRouter();
 
 interface NavItem {
   key: string;
   label: string;
-  icon: string;
+  icon: Component;
   path: string;
 }
 
 const menus: readonly NavItem[] = [
-  { key: "launch", label: "启动", icon: "🚀", path: "/launch" },
-  { key: "core", label: "核心版本", icon: "🔄", path: "/core" },
-  { key: "plugins", label: "插件管理", icon: "🧩", path: "/plugins" },
-  { key: "models", label: "模型路径", icon: "📦", path: "/models" },
-  { key: "settings", label: "设置", icon: "⚙️", path: "/settings" },
-  { key: "logs", label: "日志", icon: "📜", path: "/logs" },
-  { key: "tasks", label: "任务进度", icon: "📊", path: "/tasks" },
-  { key: "about", label: "关于", icon: "ℹ️", path: "/about" },
+  { key: "launch", label: "启动", icon: Rocket, path: "/launch" },
+  { key: "core", label: "核心版本", icon: RefreshCw, path: "/core" },
+  { key: "plugins", label: "插件管理", icon: Puzzle, path: "/plugins" },
+  { key: "models", label: "模型路径", icon: Package, path: "/models" },
+  { key: "settings", label: "设置", icon: Settings, path: "/settings" },
+  { key: "logs", label: "日志", icon: ScrollText, path: "/logs" },
+  { key: "tasks", label: "任务进度", icon: BarChart3, path: "/tasks" },
+  { key: "about", label: "关于", icon: Info, path: "/about" },
 ] as const;
 
+/**
+ * 菜单选项（方案 D：使用标准 icon + label props）
+ *
+ * - icon: render 函数 → NMenu 在 collapsed 时只显示 icon（自动隐藏 label）
+ * - label: 普通字符串 → NMenu 内部处理显隐
+ */
 const menuOptions = computed<MenuOption[]>(() =>
   menus.map((m) => ({
     key: m.key,
-    label: () =>
-      h(
-        NTooltip,
-        { placement: "right" },
-        {
-          trigger: () =>
-            h(
-              RouterLink,
-              { to: m.path, class: "nav-link" },
-              {
-                default: () => [
-                  h("span", { class: "nav-icon" }, m.icon),
-                  h("span", { class: "nav-label" }, m.label),
-                ],
-              },
-            ),
-          default: () => m.label,
-        },
-      ),
+    label: m.label,
+    icon: () => h(SafeIcon, { component: m.icon, size: 20, class: "nav-icon" }),
   })),
 );
 
-const activeKey = computed(() => (typeof route.name === "string" ? route.name : ""));
+/** 当前路由对应的菜单 key */
+const activeKey = computed(() => {
+  // 用菜单项 path 匹配当前 route.path 找到对应 key
+  const matched = menus.find((m) => m.path === route.path);
+  return matched?.key ?? "";
+});
+
+/** 菜单点击：跳转到对应路由 */
+function onMenuSelect(key: string) {
+  const target = menus.find((m) => m.key === key);
+  if (target && route.path !== target.path) {
+    void router.push(target.path);
+  }
+}
 </script>
 
 <template>
@@ -99,6 +119,7 @@ const activeKey = computed(() => (typeof route.name === "string" ? route.name : 
           :collapsed="true"
           :collapsed-width="64"
           :indent="0"
+          @update:value="onMenuSelect"
         />
       </NScrollbar>
     </NLayoutSider>
@@ -114,24 +135,13 @@ const activeKey = computed(() => (typeof route.name === "string" ? route.name : 
 </template>
 
 <style scoped>
-.app-sider :deep(.nav-link) {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 8px 0;
-  text-decoration: none;
-  color: inherit;
-}
-
 .app-sider :deep(.nav-icon) {
-  font-size: 20px;
-  line-height: 1;
-}
-
-.app-sider :deep(.nav-label) {
-  font-size: 11px;
-  margin-top: 2px;
-  line-height: 1;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  display: block;
+  color: inherit;
+  /* 兜底：万一 currentColor 在 WebView2 解析失败，至少有字面值 */
+  stroke: #333;
 }
 </style>

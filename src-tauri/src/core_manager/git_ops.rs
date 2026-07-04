@@ -223,13 +223,40 @@ pub fn fetch_tags(repo: &Repository, remote_url: &str) -> Result<(), CoreError> 
 }
 
 /// 克隆仓库
+///
+/// 行为：
+/// - 目录不存在 → 自动创建后 clone
+/// - 目录存在但为空 → 直接 clone
+/// - 目录已存在且非空且含 .git → 返回 `AlreadyExists`（已是仓库）
+/// - 目录已存在且非空但不含 .git → 返回 `NotEmptyDir`（拒绝覆盖）
 pub fn clone_repo(
     repo_path: &Path,
     url: &str,
 ) -> Result<(), CoreError> {
-    if repo_path.exists() && repo_path.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false)
-    {
-        return Err(CoreError::AlreadyExists(PathBuf::from(repo_path)));
+    // 1. 目录已存在
+    if repo_path.exists() {
+        let is_empty = !repo_path
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+
+        if !is_empty {
+            // 目录非空：若已是 git 仓库，提示已存在；否则拒绝覆盖
+            if repo_path.join(".git").exists() {
+                return Err(CoreError::AlreadyExists(PathBuf::from(repo_path)));
+            }
+            return Err(CoreError::NotEmptyDir(PathBuf::from(repo_path)));
+        }
+    }
+
+    // 2. 目录为空或不存在：尝试 clone
+    //    libgit2 的 clone 在父目录不存在时会失败，所以预先创建父目录
+    if let Some(parent) = repo_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                CoreError::GitError(format!("failed to create parent dir {:?}: {}", parent, e))
+            })?;
+        }
     }
 
     Repository::clone(url, repo_path).map_err(|e| CoreError::GitError(e.to_string()))?;

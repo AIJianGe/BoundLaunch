@@ -13,6 +13,11 @@ export function configGet(): Promise<Config> {
   return invoke<Config>("config_get");
 }
 
+/** 获取 launcher 工作目录（ComfyUI 根目录默认值） */
+export function configLauncherWorkingDir(): Promise<string> {
+  return invoke<string>("config_launcher_working_dir");
+}
+
 /**
  * 部分更新 Config（深合并语义）
  *

@@ -53,14 +53,14 @@ impl ConfigService {
                     let backup = path.with_extension(format!("toml.corrupt-{}", chrono::Utc::now().timestamp()));
                     tracing::warn!(error = %e, ?backup, "config parse failed, backing up");
                     let _ = tokio::fs::rename(&path, &backup).await;
-                    let cfg = Config::default();
+                    let cfg = build_default_config();
                     save_to_disk(&path, &cfg).await?;
                     cfg
                 }
             }
         } else {
             // 文件不存在：创建默认
-            let cfg = Config::default();
+            let cfg = build_default_config();
             save_to_disk(&path, &cfg).await?;
             cfg
         };
@@ -144,6 +144,41 @@ async fn save_to_disk(path: &Path, config: &Config) -> Result<(), ConfigError> {
     super::atomic_write::atomic_write(path, &content)
         .await
         .map_err(|e| ConfigError::IoError(e.to_string()))
+}
+
+/// 构造默认 Config，并将空路径字段填充为 launcher 工作目录
+///
+/// 与 `Config::default()` 区别：
+/// - `Config::default()` 是无内存访问的纯默认值（空 PathBuf）
+/// - `build_default_config()` 额外调用 `paths::launcher_working_dir()` 填充 comfyui_root，
+///   并把 venv_path 设置为 `${comfyui_root}/venv`
+fn build_default_config() -> Config {
+    let mut cfg = Config::default();
+    apply_default_paths(&mut cfg);
+    cfg
+}
+
+/// 将空路径字段填充为 launcher 工作目录
+///
+/// 规则：
+/// - `comfyui_root` 为空 → 设置为 launcher 工作目录
+/// - `venv_path` 为空 → 设置为 `${comfyui_root}/venv`（此时 comfyui_root 一定非空）
+///
+/// 已配置的路径不会被覆盖（保证老用户的 config.toml 不会被打乱）。
+fn apply_default_paths(cfg: &mut Config) {
+    let launcher_dir = paths::launcher_working_dir();
+    // 关键：comfyui_root 必须是 launcher 工作目录的**子目录**（如 "ComfyUI"），
+    // 不能直接等于 launcher_dir 本身。原因：
+    //   - launcher_dir 通常已包含 launcher 自己的 .git、node_modules、src/ 等
+    //   - 若直接用 launcher_dir，CoreManager::is_cloned() 会返回 false（没有 ComfyUI 标记）
+    //   - clone_repo 会检测到目录非空但无 .git → 抛 NotEmptyDir
+    // 设为子目录后：目录不存在 → clone_repo 走"目录不存在"分支，正常 clone
+    if cfg.paths.comfyui_root.as_os_str().is_empty() {
+        cfg.paths.comfyui_root = launcher_dir.join("ComfyUI");
+    }
+    if cfg.paths.venv_path.as_os_str().is_empty() {
+        cfg.paths.venv_path = cfg.paths.comfyui_root.join("venv");
+    }
 }
 
 /// 内部：字段验证

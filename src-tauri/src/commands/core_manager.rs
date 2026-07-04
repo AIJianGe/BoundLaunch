@@ -21,6 +21,20 @@ pub async fn core_clone(
         .map_err(|e| e.to_string())
 }
 
+/// 确保 ComfyUI 仓库已克隆
+///
+/// - 若 `comfyui_root` 目录不存在或不含 `.git` → 自动 clone 默认仓库
+/// - 若已是 git 仓库 → 跳过
+/// - 若目录存在但非空且无 `.git` → 返回错误（让前端提示用户处理）
+#[tauri::command]
+pub async fn core_ensure_cloned(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .core_manager
+        .ensure_cloned()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 列出所有 tag（force_refresh=true 强制刷新）
 #[tauri::command]
 pub async fn core_list_tags(

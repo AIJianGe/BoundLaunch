@@ -95,6 +95,25 @@ impl CoreManagerService {
         Ok(())
     }
 
+    /// 确保 ComfyUI 仓库已克隆
+    ///
+    /// 行为：
+    /// - 已克隆（含 `.git`）→ 跳过，直接返回
+    /// - 目录不存在 → 自动 clone 默认仓库（`COMFYUI_REPO_URL`）
+    /// - 目录非空但非 git 仓库 → 返回 `NotEmptyDir` 错误（让前端提示用户）
+    ///
+    /// 用途：向导/启动页调用，无需用户手动选择 URL。
+    pub async fn ensure_cloned(&self) -> Result<(), CoreError> {
+        if self.is_cloned().await {
+            tracing::debug!("comfyui repo already cloned, skipping");
+            return Ok(());
+        }
+
+        // 委托给 clone_repo，自动检测目录状态
+        let url = models::COMFYUI_REPO_URL.to_string();
+        self.clone_repo(&url).await
+    }
+
     /// 列出所有 tag（缓存命中 < 5ms，未命中 1-10s）
     pub async fn list_tags(&self, force_refresh: bool) -> Result<Vec<TagInfo>, CoreError> {
         // 缓存检查

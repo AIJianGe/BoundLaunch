@@ -62,3 +62,11 @@ temp/
 *.bak
 *.orig
 *.rej
+
+# --- Sidecar 二进制（uv 等）---
+# uv 二进制按平台下载到 src-tauri/resources/uv/，不进版本库
+# 保留 .gitkeep 和 README.md
+src-tauri/resources/uv/*
+src-tauri/ComfyUI
+!src-tauri/resources/uv/.gitkeep
+!src-tauri/resources/uv/README.md

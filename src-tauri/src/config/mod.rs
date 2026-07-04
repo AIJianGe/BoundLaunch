@@ -13,8 +13,11 @@ pub mod models;
 pub mod service;
 
 pub use models::{
-    Config, LaunchMode, CudaVersion, ModelsMode, ModelsConfig, AdvancedArgs, PreviewMethod,
-    LaunchConfig, PathsConfig, TorchConfig, UiConfig, Theme,
+    apply_launch_patch, apply_models_patch, apply_paths_patch, apply_torch_patch,
+    apply_ui_patch, Config, ConfigPatch, LaunchConfigPatch, ModelsConfigPatch,
+    PathsConfigPatch, TorchConfigPatch, UiConfigPatch, LaunchMode, CudaVersion,
+    ModelsMode, ModelsConfig, AdvancedArgs, PreviewMethod, LaunchConfig, PathsConfig,
+    TorchConfig, UiConfig, Theme,
 };
 pub use service::ConfigService;
 

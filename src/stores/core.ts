@@ -19,6 +19,7 @@ import {
   coreIsCloned,
   coreStatus,
   coreClone,
+  coreEnsureCloned,
   coreListTags,
   coreCheckout,
   coreUpdate,
@@ -67,6 +68,31 @@ export const useCoreStore = defineStore("core", () => {
       await refresh();
     } finally {
       loading.value = false;
+    }
+  }
+
+  /**
+   * 确保 ComfyUI 仓库已克隆
+   *
+   * - 若 comfyui_root 已包含 `.git` → 跳过
+   * - 若目录不存在 → 自动 clone 默认仓库
+   * - 若目录非空但无 `.git` → 抛错（让前端处理）
+   *
+   * 注意：refresh 失败和 ensureCloned 失败是两个独立的事，分别 catch，
+   * 避免 refresh 错误（如 list_tags 参数问题）覆盖 ensureCloned 的真实错误。
+   */
+  async function ensureCloned() {
+    loading.value = true;
+    try {
+      await coreEnsureCloned();
+    } finally {
+      loading.value = false;
+    }
+    // refresh 单独 try，避免被 catch 块误判为 clone 失败
+    try {
+      await refresh();
+    } catch (e) {
+      console.warn("[core] refresh after ensureCloned failed:", e);
     }
   }
 
@@ -128,6 +154,7 @@ export const useCoreStore = defineStore("core", () => {
     // actions
     refresh,
     clone,
+    ensureCloned,
     checkout,
     update,
     subscribe,

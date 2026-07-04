@@ -29,6 +29,31 @@ html, body, #app {
   overflow: hidden;
 }
 
+/* ============================================================================
+ * SVG 图标全局兜底（解决 Tauri WebView2 上 stroke="currentColor" 渲染异常）
+ *
+ * 背景：在 Tauri WebView2 (Windows) 上，Lucide 图标的 `stroke="currentColor"`
+ * 在 paint 阶段有时会被错误解析为 transparent，导致图标完全不可见。
+ *
+ * 三层兜底：
+ * 1. 在 svg 元素上显式设 stroke（优先） — 让所有内联 SVG 都有兜底颜色
+ * 2. color: inherit — 让颜色继承上游 CSS（被 SafeIcon 包装后由 inline color 覆盖）
+ * 3. 使用 not(:has()) 排除已经被 SafeIcon 处理的 svg
+ * ============================================================================ */
+svg {
+  color: inherit;
+  /* 兜底：万一 currentColor 在 WebView2 解析失败，至少有字面值 */
+  stroke: var(--icon-fallback-color, #333);
+  fill: none;
+}
+
+/* AppHeader / 主区 / AboutPage 中的图标用次级色（深灰），覆盖默认 */
+.app-header svg,
+.version-block svg,
+.section-card svg {
+  stroke: var(--icon-fallback-color, #555);
+}
+
 #app {
   display: flex;
   flex-direction: column;

@@ -30,6 +30,7 @@ mod process_launcher;
 mod python_env;
 mod task_scheduler;
 mod tray;
+mod uv_sidecar;
 
 use crate::common::paths;
 use crate::config::ConfigService;
@@ -54,6 +55,7 @@ pub fn run() {
     tauri::Builder::default()
     .plugin(tauri_plugin_shell::init())
     .plugin(tauri_plugin_dialog::init())
+    .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // 初始化 AppState（异步块在 setup 内同步执行）
             let handle = app.handle().clone();
@@ -83,8 +85,20 @@ pub fn run() {
                 let env_inspector =
                     EnvironmentInspectorService::new((*event_bus).clone());
 
-                // PythonEnvManager 初始化（uv 通过 PATH 查找）
-                let python_env = PythonEnvService::from_path((*event_bus).clone());
+                // PythonEnvManager 初始化：优先 sidecar uv，回退到 PATH
+                // 详见 uv_sidecar.rs
+                let python_env = match uv_sidecar::ensure_released(&handle).await {
+                    Some(uv_path) => {
+                        tracing::info!(?uv_path, "using bundled uv sidecar");
+                        PythonEnvService::new(uv_path, (*event_bus).clone())
+                    }
+                    None => {
+                        tracing::warn!(
+                            "uv sidecar not available, falling back to PATH lookup (user must install uv)"
+                        );
+                        PythonEnvService::from_path((*event_bus).clone())
+                    }
+                };
 
                 // CoreManager 初始化（comfyui_root 来自 Config，复用同一个 Arc<LogStoreService>）
                 let comfyui_root = std::path::PathBuf::from(&config.get().paths.comfyui_root);
@@ -173,6 +187,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // Config
             commands::config::config_get,
+            commands::config::config_launcher_working_dir,
             commands::config::config_update,
             commands::config::config_reset,
             // LogStore
@@ -185,6 +200,7 @@ pub fn run() {
             commands::env_inspector::env_probe_torch,
             commands::env_inspector::env_list_dependencies,
             commands::env_inspector::env_invalidate_cache,
+            commands::env_inspector::env_readiness_check,
             // PythonEnvManager
             commands::python_env::env_status,
             commands::python_env::env_uv_available,
@@ -195,6 +211,7 @@ pub fn run() {
             commands::python_env::env_rebuild_venv,
             // CoreManager
             commands::core_manager::core_clone,
+            commands::core_manager::core_ensure_cloned,
             commands::core_manager::core_list_tags,
             commands::core_manager::core_checkout,
             commands::core_manager::core_update,
