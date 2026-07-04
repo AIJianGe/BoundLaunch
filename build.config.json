@@ -1,0 +1,5 @@
+{
+  "_comment": "myComfyUI 编译配置。完整规范见 pr/05-依赖与启动参数.md §5 与 pr/08-验证清单.md §4.4。",
+  "_schema_version": 1,
+  "build_jobs": 16
+}

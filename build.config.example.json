@@ -1,0 +1,8 @@
+{
+  "_comment": "build.config.json 模板 — 复制为 build.config.json 并按需修改。",
+  "_comment_priority": "优先级：环境变量 BUILD_JOBS > build.config.json > 自动检测 (os.cpus().length, 上限 16)",
+  "_comment_range": "build_jobs 取值范围: 1 - 32。设为 0 或 null 表示使用自动检测。",
+  "_comment_recommendation": "高核心数机器 (32+) 建议 8-12；常规 8 核机器用 8；CI runner (4 核 7GB) 用 2-4。",
+
+  "build_jobs": 8
+}

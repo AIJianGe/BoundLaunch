@@ -1,0 +1,38 @@
+{
+  "name": "my-comfyui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "typecheck": "vue-tsc --noEmit",
+    "package": "node build.mjs",
+    "package:fast": "node build.mjs --skip-tests",
+    "package:debug": "node build.mjs --debug --skip-tests",
+    "package:nsis": "node build.mjs --target nsis --skip-tests",
+    "package:msi": "node build.mjs --target msi --skip-tests"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tauri-apps/plugin-shell": "^2.0.0",
+    "naive-ui": "^2.38.0",
+    "pinia": "^2.2.0",
+    "vue": "^3.5.0",
+    "vue-router": "^4.4.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/node": "^22.0.0",
+    "@vitejs/plugin-vue": "^5.1.0",
+    "typescript": "^5.5.0",
+    "unplugin-auto-import": "^0.18.0",
+    "unplugin-vue-components": "^0.27.0",
+    "vfonts": "^0.0.3",
+    "vite": "^5.4.0",
+    "vue-tsc": "^2.1.0"
+  }
+}

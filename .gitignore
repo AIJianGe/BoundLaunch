@@ -1,0 +1,64 @@
+# ============================================================================
+# myComfyUI 启动器 - .gitignore
+# ============================================================================
+
+# --- 内部设计文档（不公开）---
+# PR/ 目录是开发期的内部需求/架构/模块设计文档，仅作者本人使用，不开源
+PR/
+# 兼容可能的 pr/ 小写
+pr/
+
+# --- 依赖 ---
+node_modules/
+.pnpm-store/
+
+# --- 构建产物 ---
+dist/
+dist-ssr/
+*.local
+
+# --- Rust / Tauri 编译产物 ---
+src-tauri/target/
+# 注：Cargo.lock **保留**（application 项目的可复现构建关键文件）
+# 之前曾忽略，现已移除（Cargo 官方推荐：app 提交、lib 不提交）
+
+# --- Tauri 自动生成 ---
+src-tauri/gen/
+
+# --- 调试/诊断临时文件（开发期 cargo / node 调试输出）---
+*_err.txt
+*_out.txt
+cargo-check-*.txt
+lib_imports.txt
+main_imports.txt
+vue-tsc-output.txt
+*.log
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- 自动生成（Vite + unplugin-auto-import）---
+src/auto-imports.d.ts
+src/components.d.ts
+
+# --- 环境变量 ---
+.env
+.env.local
+.env.*.local
+
+# --- 临时文件 ---
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+*.rej
