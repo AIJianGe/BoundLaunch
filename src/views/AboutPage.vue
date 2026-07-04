@@ -142,6 +142,15 @@ const links: LinkEntry[] = [
 
 const osTheme = useOsTheme();
 
+// 当前操作系统（用于版本信息展示）
+const platform = computed(() => {
+  const ua = navigator.userAgent;
+  if (ua.includes("Windows")) return "Windows";
+  if (ua.includes("Mac")) return "macOS";
+  if (ua.includes("Linux")) return "Linux";
+  return "Unknown";
+});
+
 // ========== Actions ==========
 
 async function onCheckUpdate() {
@@ -190,7 +199,7 @@ async function onOpenLink(url: string) {
 
 function onCopyVersion() {
   navigator.clipboard.writeText(
-    `无界启动器 ${launcherVersion} / ComfyUI ${comfyuiVersion.value} / OS ${platform.value}` ?? "unknown"}`,
+    `无界启动器 ${launcherVersion} / ComfyUI ${comfyuiVersion.value} / OS ${platform.value}`,
   ).then(
     () => toast.success("版本信息已复制"),
     () => toast.error("复制失败"),
