@@ -1,0 +1,11 @@
+# Windows 批处理文件：GBK 编码 + CRLF 行尾
+# 原因：cmd 默认用 GBK 解析，UTF-8 中文会乱码；LF 行尾会导致 cmd 解析失败
+# working-tree-encoding 让 git 在 index 中存 UTF-8，checkout 时自动转回 GBK
+*.bat text working-tree-encoding=GBK eol=CRLF
+*.cmd text working-tree-encoding=GBK eol=CRLF
+
+# Shell 脚本：UTF-8 编码 + LF 行尾（bash 标准）
+*.sh text eol=LF
+
+# Windows 特定文件：CRLF
+*.ps1 text eol=CRLF
