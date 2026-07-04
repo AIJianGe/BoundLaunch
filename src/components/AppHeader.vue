@@ -5,7 +5,7 @@
  * 详见 `PR/06-界面设计.md §2 顶栏与全局状态`
  *
  * 内容：
- * - 左侧：项目名 myComfyUI + 火箭图标
+ * - 左侧：项目名 无界启动器 + 火箭图标
  * - 中间：版本号
  * - 右侧：ComfyUI 进程状态指示（4 态） + 设置入口
  *
@@ -92,7 +92,7 @@ function goSettings() {
   <div class="app-header">
     <div class="header-left">
       <span class="rocket-icon">🚀</span>
-      <span class="app-name">myComfyUI</span>
+      <span class="app-name">无界启动器</span>
       <span class="app-version">v{{ launcherVersion }}</span>
     </div>
     <div class="header-right">

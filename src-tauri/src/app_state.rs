@@ -49,7 +49,7 @@ impl AppState {
         let env_inspector = Arc::new(EnvironmentInspectorService::new((*event_bus).clone()));
         let python_env = Arc::new(PythonEnvService::from_path((*event_bus).clone()));
         // CoreManager 用临时目录（测试不真实操作 git）
-        let tmp = std::env::temp_dir().join(format!("mycomfyui-test-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("boundlaunch-test-{}", uuid::Uuid::new_v4()));
         let core_manager = Arc::new(CoreManagerService::new(
             tmp.clone(),
             (*event_bus).clone(),
@@ -73,7 +73,7 @@ impl AppState {
         ));
         // ProcessLauncher 测试用临时 data_dir（PID 文件存放处）
         let data_dir = std::env::temp_dir().join(format!(
-            "mycomfyui-test-data-{}",
+            "boundlaunch-test-data-{}",
             uuid::Uuid::new_v4()
         ));
         let process_launcher = Arc::new(ProcessLauncherService::new(

@@ -1,4 +1,4 @@
-//! myComfyUI 启动器 - 后端入口
+//! 无界启动器 (BoundLaunch) - 后端入口
 //!
 //! 模块组织详见 `PR/03-模块设计/00-模块总览.md`
 
@@ -49,7 +49,7 @@ pub fn run() {
         .with_target(false)
         .init();
 
-    tracing::info!("myComfyUI launcher starting up...");
+    tracing::info!("BoundLaunch launcher starting up...");
 
     tauri::Builder::default()
     .plugin(tauri_plugin_shell::init())

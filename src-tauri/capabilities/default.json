@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "myComfyUI 默认权限集（含 shell + dialog）",
+  "description": "无界启动器 默认权限集（含 shell + dialog）",
   "windows": ["main"],
   "permissions": [
     "core:default",

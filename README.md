@@ -1,4 +1,4 @@
-# myComfyUI 启动器
+# 无界启动器 (BoundLaunch)
 
 > **跨平台、零依赖、开箱即用的 [ComfyUI](https://github.com/comfyanonymous/ComfyUI) 桌面启动器**
 >
@@ -77,8 +77,8 @@ sudo pacman -S --needed webkit2gtk4.1 gtk3 libappindicator-gtk3 librsvg patchelf
 ### 安装
 
 ```bash
-git clone https://github.com/<your-name>/myComfyUI.git
-cd myComfyUI
+git clone https://github.com/<your-name>/BoundLaunch.git
+cd BoundLaunch
 npm install
 ```
 
@@ -166,7 +166,7 @@ BUILD_JOBS=8 node build.mjs --skip-tests
 ## 📁 项目结构
 
 ```
-myComfyUI/
+boundlaunch/
 ├── src/                          # 前端（Vue 3 + TypeScript + Naive UI）
 │   ├── components/               # 通用组件
 │   ├── views/                    # 页面（启动/设置/插件/模型/关于…）
@@ -310,7 +310,7 @@ npm run package:fast     # 跳过测试快速打包
 ```
 MIT License
 
-Copyright (c) 2026 myComfyUI Contributors
+Copyright (c) 2026 BoundLaunch Contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

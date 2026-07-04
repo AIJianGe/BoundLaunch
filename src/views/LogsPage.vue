@@ -155,7 +155,7 @@ function onExport() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `mycomfyui-logs-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
+  a.download = `boundlaunch-logs-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
   a.click();
   URL.revokeObjectURL(url);
   toast.success("已导出日志文件");

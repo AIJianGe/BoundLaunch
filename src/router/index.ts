@@ -45,7 +45,7 @@ setupRouterGuards(router);
 
 // 标题同步
 router.afterEach((to) => {
-  document.title = to.meta.title ? `${to.meta.title} - myComfyUI` : "myComfyUI";
+  document.title = to.meta.title ? `${to.meta.title} - 无界启动器` : "无界启动器";
 });
 
 export default router;

@@ -117,19 +117,19 @@ const links: LinkEntry[] = [
   {
     label: "项目仓库",
     icon: "📦",
-    url: "https://github.com/your-org/myComfyUI",
+    url: "https://github.com/your-org/BoundLaunch",
     description: "GitHub 源码仓库",
   },
   {
     label: "反馈问题",
     icon: "🐛",
-    url: "https://github.com/your-org/myComfyUI/issues",
+    url: "https://github.com/your-org/BoundLaunch/issues",
     description: "提交 Bug 或功能建议",
   },
   {
     label: "使用文档",
     icon: "📖",
-    url: "https://github.com/your-org/myComfyUI/wiki",
+    url: "https://github.com/your-org/BoundLaunch/wiki",
     description: "Wiki 文档与教程",
   },
   {
@@ -190,7 +190,7 @@ async function onOpenLink(url: string) {
 
 function onCopyVersion() {
   navigator.clipboard.writeText(
-    `myComfyUI ${launcherVersion} / ComfyUI ${comfyuiVersion.value} / OS ${osTheme.value ?? "unknown"}`,
+    `无界启动器 ${launcherVersion} / ComfyUI ${comfyuiVersion.value} / OS ${platform.value}` ?? "unknown"}`,
   ).then(
     () => toast.success("版本信息已复制"),
     () => toast.error("复制失败"),
@@ -228,7 +228,7 @@ onMounted(async () => {
     <!-- 版本信息区 -->
     <div class="version-block">
       <div class="app-icon">🚀</div>
-      <h1 class="app-name">myComfyUI</h1>
+      <h1 class="app-name">无界启动器</h1>
       <div class="version-row">
         <span class="launcher-version">v{{ launcherVersion }}</span>
         <NTag
@@ -351,7 +351,7 @@ onMounted(async () => {
 
     <!-- 底部版权 -->
     <div class="footer">
-      © 2026 myComfyUI · 开源软件 (MIT License)
+      © 2026 BoundLaunch · 开源软件 (MIT License)
     </div>
   </div>
 </template>

@@ -184,6 +184,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "bound-launch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "chrono",
+ "dashmap",
+ "dirs 5.0.1",
+ "fs2",
+ "futures",
+ "git2",
+ "indexmap 2.14.0",
+ "nix",
+ "once_cell",
+ "parking_lot",
+ "rayon",
+ "regex",
+ "reqwest 0.12.28",
+ "sanitize-filename",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-shell",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "toml 0.8.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "brotli"
 version = "8.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2224,46 +2264,6 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "my-comfyui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "async-trait",
- "chrono",
- "dashmap",
- "dirs 5.0.1",
- "fs2",
- "futures",
- "git2",
- "indexmap 2.14.0",
- "nix",
- "once_cell",
- "parking_lot",
- "rayon",
- "regex",
- "reqwest 0.12.28",
- "sanitize-filename",
- "serde",
- "serde_json",
- "sqlx",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-shell",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "toml 0.8.2",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "walkdir",
- "windows 0.58.0",
 ]
 
 [[package]]

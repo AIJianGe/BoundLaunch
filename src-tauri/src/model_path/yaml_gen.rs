@@ -42,7 +42,7 @@ pub const MODEL_FILE_EXTENSIONS: &[&str] =
 /// launcher 生成 yaml 的首行标识
 ///
 /// `is_launcher_generated()` 通过读首行匹配此字符串判断
-pub const LAUNCHER_YAML_MARKER: &str = "# mycomfyui-launcher-generated-yaml v1";
+pub const LAUNCHER_YAML_MARKER: &str = "# boundlaunch-launcher-generated-yaml v1";
 
 /// 渲染 yaml 内容（纯函数）
 ///
@@ -70,7 +70,7 @@ pub fn render_yaml_content(config: &ModelsConfig) -> Result<String, ModelPathErr
     s.push_str(LAUNCHER_YAML_MARKER);
     s.push('\n');
     s.push_str("# ============================================================\n");
-    s.push_str("# 此文件由 myComfyUI launcher 自动生成，请勿手动修改\n");
+    s.push_str("# 此文件由 无界启动器 launcher 自动生成，请勿手动修改\n");
     s.push_str(&format!("# 生成时间：{}\n", timestamp));
     s.push_str(&format!("# 配置模式：{}\n", mode_str));
     s.push_str(&format!("# 根目录：{}\n", root));

@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM  myComfyUI Build Launcher (Windows)
+REM  无界启动器 (BoundLaunch) Build Launcher (Windows)
 REM
 REM  Double-click to run. Delegates actual work to build.mjs.
 REM  Uses goto pattern to avoid cmd parenthesized block parsing issues.
@@ -14,7 +14,7 @@ setlocal EnableDelayedExpansion
 
 echo.
 echo ============================================================
-echo   myComfyUI Build Launcher (Windows)
+echo   无界启动器 Build Launcher (Windows)
 echo   Backend script: build.mjs
 echo ============================================================
 echo.

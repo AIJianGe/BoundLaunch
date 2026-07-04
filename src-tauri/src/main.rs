@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    my_comfyui_lib::run()
+    bound_launch_lib::run()
 }

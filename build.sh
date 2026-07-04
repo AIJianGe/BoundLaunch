@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  myComfyUI 打包启动器 (Linux / macOS)
+#  无界启动器 (BoundLaunch) 打包启动器 (Linux / macOS)
 #
 #  跨平台说明：
 #    本脚本同时支持 Linux 与 macOS。通过 `uname -s` 检测当前平台，
@@ -45,7 +45,7 @@ fi
 
 echo
 echo "============================================================"
-echo -e "${BOLD}${CYAN}  myComfyUI 打包启动器 ($PLATFORM_LABEL)${RESET}"
+echo -e "${BOLD}${CYAN}  无界启动器 打包启动器 ($PLATFORM_LABEL)${RESET}"
 echo "  实际工作脚本: build.mjs"
 echo "  平台检测: OS_NAME=$OS_NAME"
 echo "============================================================"

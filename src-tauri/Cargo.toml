@@ -1,13 +1,13 @@
 [package]
-name = "my-comfyui"
+name = "bound-launch"
 version = "0.1.0"
-description = "ComfyUI 启动器"
-authors = ["myComfyUI"]
+description = "无界启动器 (BoundLaunch) - ComfyUI 启动器"
+authors = ["BoundLaunch"]
 edition = "2021"
 rust-version = "1.80"
 
 [lib]
-name = "my_comfyui_lib"
+name = "bound_launch_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

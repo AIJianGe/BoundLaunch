@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * myComfyUI 跨平台打包脚本
+ * 无界启动器 (BoundLaunch) 跨平台打包脚本
  *
  * 详见 `PR/08-验证清单.md §4 跨平台打包`
  *
@@ -33,7 +33,7 @@
  * - **Command**：每个阶段封装为独立 Command 类，便于单测和复用
  * - **Facade**：build.mjs 作为对外统一入口
  *
- * @author myComfyUI Team
+ * @author BoundLaunch Team
  * @version 1.0.0
  */
 
@@ -183,7 +183,7 @@ class ArgParser {
 
   showHelp() {
     console.log(`
-${paint(Colors.bold, "myComfyUI 打包脚本")}
+${paint(Colors.bold, "无界启动器 打包脚本")}
 
 ${paint(Colors.cyan, "用法:")}
   node build.mjs [options]
@@ -829,7 +829,7 @@ class ArtifactReporter {
 
 async function main() {
   const startTime = Date.now();
-  console.log(paint(Colors.bold + Colors.cyan, "\n🚀 myComfyUI 打包脚本 v1.0\n"));
+  console.log(paint(Colors.bold + Colors.cyan, "\n🚀 无界启动器 打包脚本 v1.0\n"));
 
   const argParser = new ArgParser(process.argv.slice(2));
   if (argParser.options.help) {

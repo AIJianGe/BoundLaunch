@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 
 /// 应用数据目录
 ///
-/// Windows: %APPDATA%\mycomfyui\
-/// Linux:   ~/.local/share/mycomfyui/
-/// macOS:   ~/Library/Application Support/mycomfyui/
+/// Windows: %APPDATA%\boundlaunch\
+/// Linux:   ~/.local/share/boundlaunch/
+/// macOS:   ~/Library/Application Support/boundlaunch/
 pub fn app_data_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-        .join("mycomfyui")
+        .join("boundlaunch")
 }
 
 /// config.toml 路径

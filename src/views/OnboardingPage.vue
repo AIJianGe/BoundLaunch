@@ -184,7 +184,7 @@ async function finishWithoutInit() {
       <template #header>
         <div class="card-header">
           <span class="header-icon">🚀</span>
-          <span class="header-title">欢迎使用 myComfyUI 启动器</span>
+          <span class="header-title">欢迎使用 无界启动器</span>
         </div>
       </template>
 
