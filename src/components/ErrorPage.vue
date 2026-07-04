@@ -115,8 +115,8 @@ function onRetry() {
 function onFeedback() {
   emit("feedback");
   // 默认打开 GitHub Issues
-  openExternal("https://github.com/your-org/BoundLaunch/issues").catch(() => {
-          window.open("https://github.com/your-org/BoundLaunch/issues", "_blank");
+  openExternal("https://github.com/AIJianGe/BoundLaunch/issues").catch(() => {
+          window.open("https://github.com/AIJianGe/BoundLaunch/issues", "_blank");
   });
 }
 

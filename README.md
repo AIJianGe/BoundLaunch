@@ -77,7 +77,7 @@ sudo pacman -S --needed webkit2gtk4.1 gtk3 libappindicator-gtk3 librsvg patchelf
 ### 安装
 
 ```bash
-git clone https://github.com/<your-name>/BoundLaunch.git
+git clone https://github.com/AIJianGe/BoundLaunch.git
 cd BoundLaunch
 npm install
 ```

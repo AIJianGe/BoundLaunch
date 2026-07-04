@@ -117,7 +117,7 @@ const links: LinkEntry[] = [
   {
     label: "项目仓库",
     icon: "📦",
-    url: "https://github.com/your-org/BoundLaunch",
+    url: "https://github.com/AIJianGe/BoundLaunch",
     description: "GitHub 源码仓库",
   },
   {
@@ -129,7 +129,7 @@ const links: LinkEntry[] = [
   {
     label: "使用文档",
     icon: "📖",
-    url: "https://github.com/your-org/BoundLaunch/wiki",
+    url: "https://github.com/AIJianGe/BoundLaunch/wiki",
     description: "Wiki 文档与教程",
   },
   {
