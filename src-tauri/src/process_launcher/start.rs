@@ -337,7 +337,13 @@ pub async fn remove_pid_file(path: &Path) {
 /// 检查 PID 对应进程是否为 ComfyUI（防 PID 复用误杀）
 ///
 /// - Windows：调用 wmic 查 CommandLine
-/// - Unix：读 /proc/<pid>/cmdline
+/// - Linux：读 /proc/<pid>/cmdline
+/// - macOS：调用 `ps -p <pid> -o command=` 查命令行
+///
+/// 设计要点：
+/// - macOS 没有 `/proc` 文件系统（这是 Linux 内核虚拟 FS）
+/// - macOS 上必须改用 `ps` 命令查询，否则函数永远返回 false
+/// - 三平台分支用 cfg 隔离，避免互相污染
 pub async fn is_comfyui_process(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -360,16 +366,48 @@ pub async fn is_comfyui_process(pid: u32) -> bool {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
+        // Linux 内核提供 /proc/<pid>/cmdline 虚拟文件，读取无需 root
         let path = format!("/proc/{}/cmdline", pid);
         match tokio::fs::read(&path).await {
             Ok(content) => {
-                let s = String::from_utf8_lossy(&content);
+                // /proc/<pid>/cmdline 用 \0 分隔参数，故先转空格再判断
+                let s = String::from_utf8_lossy(&content).replace('\0', " ");
                 s.contains("main.py") && s.contains("comfyui")
             }
             Err(_) => false,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS 无 /proc 文件系统，改用 `ps -p <pid> -o command=` 查命令行
+        // -p: 按 PID 过滤；-o command=: 仅输出命令列（无表头）
+        let pid_str = pid.to_string();
+        let output = tokio::process::Command::new("ps")
+            .args(["-p", &pid_str, "-o", "command="])
+            .output()
+            .await;
+        match output {
+            Ok(o) if o.status.success() => {
+                let cmdline = String::from_utf8_lossy(&o.stdout);
+                // ps 返回空字符串表示进程已退出
+                if cmdline.trim().is_empty() {
+                    return false;
+                }
+                cmdline.contains("main.py") && cmdline.contains("comfyui")
+            }
+            // ps 退出码非 0：通常表示 PID 不存在（已退出）
+            _ => false,
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        tracing::warn!("is_comfyui_process: unsupported platform, returning false");
+        false
     }
 }
 

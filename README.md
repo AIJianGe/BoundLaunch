@@ -216,7 +216,14 @@ myComfyUI/
 | **Windows 10 / 11** | ✅ 完整支持 | `.msi` / `.exe` (NSIS) |
 | **Linux (Ubuntu 22.04+)** | ✅ 完整支持 | `.deb` / `.AppImage` |
 | **Linux (Fedora / Arch)** | ✅ 完整支持 | `.AppImage`（deb 可手动打包） |
-| **macOS** | 🟡 理论支持（待测试） | `.dmg` |
+| **macOS (Intel + Apple Silicon)** | ✅ 完整支持 | `.dmg` / `.app` |
+
+### macOS 备注
+
+- **前置条件**：Xcode Command Line Tools（`xcode-select --install`）
+- **未签名 .dmg**：用户首次双击会被 Gatekeeper 拦截，需右键 → 打开 → 仍要打开
+- **正式分发**：建议配置 Apple Developer ID 代码签名 + 公证，详见 [pr/08-验证清单.md §4.3](./pr/08-验证清单.md)
+- **Apple Silicon**：默认按本机架构打包；跨架构需 `--target aarch64-apple-darwin` 或 `x86_64-apple-darwin`
 
 > macOS 需要本机有 Xcode Command Line Tools；Linux 不同发行版的 Tauri 依赖差异较大，遇到问题请提交 issue。
 
@@ -259,12 +266,12 @@ myComfyUI/
 - 9 模块基础架构（Config / PythonEnv / Core / Plugin / ModelPath / ProcessLauncher / EnvInspector / TaskScheduler / LogStore）
 - 首次运行向导（onboarding）
 - 启动页 + 设置页 + 模型路径页 + 插件管理页 + 关于页 + 任务进度中心 + 日志页
-- 跨平台打包（Windows / Linux）
+- 跨平台打包（Windows / Linux / macOS）
 - 编译并行度全局配置
 
 ### 🚧 后续规划
-- macOS 完整支持 + 签名公证
 - 应用内自动更新（updater 插件）
+- macOS 代码签名 + 公证自动化（CI 集成）
 - 模型下载（来自 Civitai / Hugging Face）
 - 工作流导出/导入
 - 插件市场

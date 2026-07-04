@@ -5,7 +5,12 @@
 // 启动器目前阶段（Phase 0-2）只接入了少量 commands，多数 Service/Helper 的 API
 // 是为后续阶段预留的（core_checkout / plugin_install / process_kill_stale 等）。
 // 全局屏蔽 dead_code，避免 CI 噪音；后续逐步接入时再移除该属性。
+//
+// 同时屏蔽 unused_imports：模块 `pub use models::{...}` 的 re-export 是为
+// `#[cfg(test)]` 模块使用的，主 lib 编译时这些 import 看起来未用。这与 dead_code
+// 同属"为后续阶段预留"的同一类问题，一并屏蔽避免 CI 噪音。
 #![allow(dead_code)]
+#![allow(unused_imports)]
 
 use tracing_subscriber::EnvFilter;
 use tauri::Manager;
