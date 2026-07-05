@@ -30,6 +30,19 @@ const toast = useToast();
 const envInfo = computed(() => envStore.envInfo);
 const refreshing = computed(() => envStore.loading);
 
+/** v2.18：监听地址 + 端口（用于运行中显示服务地址 + 打开浏览器） */
+const listenHost = computed(
+  () => configStore.config?.launch.listen_host ?? "127.0.0.1",
+);
+const listenPort = computed(
+  () => configStore.config?.launch.listen_port ?? 8188,
+);
+const serviceUrl = computed(() => {
+  // 0.0.0.0 在浏览器中替换为 127.0.0.1
+  const host = listenHost.value === "0.0.0.0" ? "127.0.0.1" : listenHost.value;
+  return "http://" + host + ":" + listenPort.value;
+});
+
 const processStatusText = computed(() => {
   switch (processStore.status.kind) {
     case "stopped":
@@ -37,7 +50,7 @@ const processStatusText = computed(() => {
     case "starting":
       return { text: "启动中", color: "warning" as const };
     case "running":
-      return { text: `运行中 (PID ${processStore.pid})`, color: "success" as const };
+      return { text: "运行中 (PID " + processStore.pid + ")", color: "success" as const };
     case "stopping":
       return { text: "停止中", color: "warning" as const };
     case "crashed":
@@ -61,6 +74,14 @@ const launchModeText = computed(() => {
       return "自定义";
   }
 });
+
+function openBrowser() {
+  try {
+    window.open(serviceUrl.value, "_blank", "noopener,noreferrer");
+  } catch (e) {
+    toast.error("打开浏览器失败", e);
+  }
+}
 
 async function onRefresh() {
   try {
@@ -162,6 +183,22 @@ async function onRefresh() {
         </template>
         ComfyUI 后端进程当前状态
       </NTooltip>
+
+      <!-- v2.18：服务地址 + 打开浏览器（仅运行中/启动中显示） -->
+      <NTooltip placement="top" v-if="processStore.status.kind === 'running' || processStore.status.kind === 'starting'">
+        <template #trigger>
+          <div class="status-item service-item">
+            <span class="item-label">服务地址</span>
+            <div class="service-row">
+              <code class="service-url">{{ serviceUrl }}</code>
+              <NButton size="tiny" type="primary" @click="openBrowser">
+                打开
+              </NButton>
+            </div>
+          </div>
+        </template>
+        ComfyUI 监听地址（可点击「打开」在浏览器中查看）
+      </NTooltip>
     </div>
 
     <div v-if="envInfo" class="footer-info">
@@ -238,6 +275,30 @@ async function onRefresh() {
   font-size: 13px;
   font-weight: 500;
   word-break: break-all;
+}
+
+/* v2.18 服务地址行 */
+.service-item {
+  grid-column: span 2;
+}
+
+.service-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.service-url {
+  flex: 1;
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  padding: 2px 6px;
+  background: var(--app-bg-muted, rgba(127, 127, 127, 0.08));
+  border-radius: 3px;
+  color: var(--app-text-default, #555);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .footer-info {

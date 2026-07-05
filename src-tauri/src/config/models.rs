@@ -23,9 +23,21 @@ pub struct PathsConfig {
     /// ComfyUI 仓库根目录
     pub comfyui_root: PathBuf,
     /// venv 虚拟环境路径
+    ///
+    /// v3.1（F26）：默认独立于 ComfyUI 仓库（位于 app_data_dir/data/venv），
+    /// 切换 ComfyUI 版本时不影响 venv。详见 §F26 决策 1：路径布局 B。
     pub venv_path: PathBuf,
     /// Python 版本（如 "3.11"）
     pub python_version: String,
+    /// 自定义 models 数据目录（v3.1 / F26 决策 12：C. 只允许 models 路径自定义）
+    ///
+    /// - `None`：使用默认 `<comfyui_root>/models`（向后兼容）
+    /// - `Some(path)`：使用自定义路径，并通过 junction/symlink 把
+    ///   `<comfyui_root>/models` 软链接到该路径，实现跨版本共享模型数据
+    ///
+    /// 切换 ComfyUI 版本时，会重新建立软链接关系，确保数据不丢失。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_path: Option<PathBuf>,
 }
 
 /// 启动配置
@@ -130,8 +142,21 @@ impl Default for AdvancedArgs {
 /// torch 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorchConfig {
-    /// CUDA 版本
+    /// CUDA 版本（v3.0 前字段，向后兼容保留）
+    ///
+    /// 老 config 文件或旧 install_torch 命令使用。
+    /// 新版推荐通过 `torch_variant` 字段表达（多厂商支持，F25）。
+    /// 切换 torch 时由 `env_change_torch_variant` 同步写入。
     pub cuda_version: CudaVersion,
+    /// torch 变体（v3.0 新增，F25）
+    ///
+    /// 序列化为 JSON 字符串（避免 config 模块与 python_env 模块循环依赖）。
+    /// 解析为 `crate::python_env::TorchVariant`，支持多厂商：
+    /// NVIDIA CUDA / AMD ROCm / Intel XPU / Apple MPS / CPU。
+    ///
+    /// 缺省 = None（启动时让前端触发 GPU 检测 + 智能推荐后写入）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torch_variant: Option<String>,
 }
 
 /// CUDA 版本
@@ -230,6 +255,7 @@ impl Default for Config {
                 comfyui_root: PathBuf::new(),
                 venv_path: PathBuf::new(),
                 python_version: "3.11".to_string(),
+                models_path: None,
             },
             launch: LaunchConfig {
                 mode: LaunchMode::GpuHigh,
@@ -242,6 +268,7 @@ impl Default for Config {
             },
             torch: TorchConfig {
                 cuda_version: CudaVersion::Cu121,
+                torch_variant: None,
             },
             models: ModelsConfig {
                 mode: ModelsMode::Default,
@@ -293,6 +320,8 @@ pub struct LaunchConfigPatch {
 #[derive(Debug, Default, Deserialize)]
 pub struct TorchConfigPatch {
     pub cuda_version: Option<CudaVersion>,
+    /// v3.0 新增：多厂商 torch 变体（JSON 字符串）
+    pub torch_variant: Option<String>,
 }
 
 /// Models section 的 patch
@@ -364,6 +393,9 @@ pub fn apply_launch_patch(cfg: &mut LaunchConfig, patch: LaunchConfigPatch) {
 pub fn apply_torch_patch(cfg: &mut TorchConfig, patch: TorchConfigPatch) {
     if let Some(v) = patch.cuda_version {
         cfg.cuda_version = v;
+    }
+    if let Some(v) = patch.torch_variant {
+        cfg.torch_variant = Some(v);
     }
 }
 

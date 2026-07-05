@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use crate::app_state::AppState;
 use crate::config::Config;
+use crate::env_inspector::dependency_conflict::{scan_custom_node_requirements, ConflictReport};
 use crate::env_inspector::models::{DependencyInfo, EnvSnapshot, TorchInfo};
 use crate::env_inspector::readiness::{self, ReadinessResult};
 use tauri::State;
@@ -106,4 +107,24 @@ pub async fn env_readiness_check(state: State<'_, AppState>) -> Result<Readiness
         &state.python_env,
     )
     .await)
+}
+
+/// v3.0 依赖冲突检测
+///
+/// 扫描 `<comfyui_root>/custom_nodes/*/requirements.txt`，检测同一 Python 包被多个节点
+/// 以不同版本约束引用的情况。
+///
+/// **只检测不解决**：返回 ConflictReport，前端展示给用户决策，不阻塞启动。
+///
+/// **性能**：单目录遍历，无子进程调用。典型 1-10 个自定义节点，< 50ms。
+#[tauri::command]
+pub async fn env_check_dependency_conflicts(
+    state: State<'_, AppState>,
+) -> Result<ConflictReport, String> {
+    let cfg: Config = {
+        let guard = state.config.get();
+        (**guard).clone()
+    };
+    let comfyui_root = PathBuf::from(&cfg.paths.comfyui_root);
+    Ok(scan_custom_node_requirements(&comfyui_root))
 }

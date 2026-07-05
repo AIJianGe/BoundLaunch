@@ -215,6 +215,78 @@ impl UvRunner {
         Ok(())
     }
 
+    /// 切换 torch 变体（v3.0 新增，F25）
+    ///
+    /// 5 厂商（NVIDIA / AMD / Intel / Apple / CPU）统一通过 `TorchVariant` 抽象。
+    ///
+    /// 实现要点：
+    /// - 用 `uv pip install --upgrade` 而非 `uninstall + install`
+    ///   原因：uninstall torch 会同时移除 torchvision / torchaudio 等依赖它的包，
+    ///   而 --upgrade 让 uv 智能检测现有版本，按需升级/降级/重装，保留其他包。
+    /// - 安装后调 `variant.verify_command()` 验证 torch 能 import + 设备可用
+    /// - 失败时返回 Err，旧 torch 保留（不破坏 venv）
+    pub async fn install_torch_variant(
+        &self,
+        venv_path: &Path,
+        variant: &crate::python_env::TorchVariant,
+    ) -> Result<(), EnvError> {
+        let venv_arg = format!("--python={}", venv_python_arg(venv_path));
+        let (pkgs, index_url) = variant.install_args();
+
+        let mut args: Vec<String> = vec![
+            "pip".into(),
+            "install".into(),
+            "--upgrade".into(),
+            venv_arg,
+        ];
+        for pkg in &pkgs {
+            args.push(pkg.clone());
+        }
+        if let Some(url) = index_url {
+            args.push("--index-url".into());
+            args.push(url);
+        }
+
+        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        tracing::info!(?variant, "switching torch variant");
+
+        let output = self
+            .run_cmd(&args_ref)
+            .await
+            .map_err(|e| EnvError::TorchInstallFailed(e.to_string()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EnvError::TorchInstallFailed(format!(
+                "切换 torch 变体失败 ({}): {}",
+                variant.label(),
+                stderr
+            )));
+        }
+
+        // 验证：python -c "<verify>"
+        let python = venv_python_path(venv_path);
+        if python.exists() {
+            let verify = variant.verify_command();
+            let verify_output = tokio::process::Command::new(&python)
+                .arg("-c")
+                .arg(verify)
+                .output()
+                .await
+                .map_err(|e| EnvError::TorchInstallFailed(format!("验证命令启动失败: {}", e)))?;
+            if !verify_output.status.success() {
+                let stderr = String::from_utf8_lossy(&verify_output.stderr);
+                return Err(EnvError::TorchInstallFailed(format!(
+                    "torch 切换后验证失败 ({}): {}",
+                    variant.label(),
+                    stderr.trim()
+                )));
+            }
+        }
+
+        tracing::info!(?variant, "torch variant installed and verified");
+        Ok(())
+    }
+
     /// 安装 requirements.txt
     ///
     /// `uv pip install -r <file> --python <venv>`
@@ -257,12 +329,18 @@ impl UvRunner {
 ///
 /// `uv pip install --python=<venv>/Scripts/python.exe` 或 `<venv>/bin/python`
 fn venv_python_arg(venv_path: &Path) -> String {
-    let python = if cfg!(windows) {
+    venv_python_path(venv_path).to_string_lossy().into_owned()
+}
+
+/// 构造 venv 的 python 可执行文件完整路径（跨平台）
+///
+/// `<venv>/Scripts/python.exe` (Windows) / `<venv>/bin/python` (Unix)
+fn venv_python_path(venv_path: &Path) -> PathBuf {
+    if cfg!(windows) {
         venv_path.join("Scripts").join("python.exe")
     } else {
         venv_path.join("bin").join("python")
-    };
-    python.to_string_lossy().into_owned()
+    }
 }
 
 /// 根据 CUDA 版本构造 PyTorch 索引 URL

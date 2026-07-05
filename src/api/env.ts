@@ -15,6 +15,9 @@ import type {
   CompatibilityResult,
   DependencyInfo,
   ReadinessCheckResult,
+  ConflictReport,
+  TorchVariant,
+  GpuInfo,
 } from "./types";
 
 // ============================================================================
@@ -91,6 +94,21 @@ export function envInstallTorch(cudaVersion: string): Promise<void> {
 }
 
 /**
+ * 安装 ComfyUI requirements.txt 依赖（v2.14）
+ *
+ * 幂等：`uv pip install -r requirements.txt` 对已满足的包自动跳过
+ * 路径：`<comfyui_root>/requirements.txt`（不存在则后端报错）
+ *
+ * 用例：
+ * - OnboardingPage 阶段 5
+ * - 设置页「路径配置」一键补装
+ * - 首页「一键补装」按钮（InstallRequirements missing step）
+ */
+export function envInstallRequirements(): Promise<void> {
+  return invoke<void>("env_install_requirements");
+}
+
+/**
  * 切换 Python 版本（5 步事务）
  *
  * 流程：检测 uv → 创建新 venv → 安装 torch → 安装 requirements → 切换。
@@ -108,4 +126,71 @@ export function envCheckCompatibility(): Promise<CompatibilityResult> {
 /** 重建 venv（保留 Python 版本，重装 torch + requirements） */
 export function envRebuildVenv(): Promise<void> {
   return invoke<void>("env_rebuild_venv");
+}
+
+/**
+ * v3.0 依赖冲突检测
+ *
+ * 扫描 [comfyui_root]/custom_nodes 下所有节点的 requirements.txt，检测同一 Python 包
+ * 被多个自定义节点以不同版本约束引用的情况。
+ *
+ * **只检测不解决**：返回 ConflictReport，前端展示给用户决策，不阻塞 ComfyUI 启动。
+ */
+export function envCheckDependencyConflicts(): Promise<ConflictReport> {
+  return invoke<ConflictReport>("env_check_dependency_conflicts");
+}
+
+// ============================================================================
+// v3.0 torch 多厂商支持（F25）
+// ============================================================================
+
+/**
+ * 切换 torch 变体（v3.0 新增，F25）
+ *
+ * 支持 5 厂商（NVIDIA / AMD / Intel / Apple / CPU）。
+ * 切换前会自动停止 ComfyUI（如果运行中），调用方需二次确认用户意图。
+ *
+ * 流程：停 ComfyUI → uv pip install --upgrade <torch> → 验证 → 更新 Config
+ * 失败时返回错误，旧 torch 保留（不破坏 venv）。
+ */
+export function envChangeTorchVariant(variant: TorchVariant): Promise<void> {
+  return invoke<void>("env_change_torch_variant", { variant });
+}
+
+// ============================================================================
+// v3.0 GPU 自动检测 + 智能推荐（F25）
+// ============================================================================
+
+/**
+ * 跨平台 GPU 检测（带 5 分钟缓存）
+ *
+ * @param forceRefresh 强制刷新（清除缓存重新检测），默认 false
+ *
+ * 返回所有检测到的 GPU 列表（含厂商 / 型号 / VRAM / 驱动版本 / CUDA 版本）。
+ * 失败或无 GPU 时返回空数组。
+ *
+ * 检测实现：
+ * - NVIDIA: `nvidia-smi`（Windows / Linux）
+ * - AMD: `rocm-smi`（Linux）/ WMI（Windows）
+ * - Intel: WMI（Windows）/ `sycl-ls`（Linux）
+ * - Apple: `system_profiler`（macOS）
+ */
+export function systemDetectGpus(forceRefresh = false): Promise<GpuInfo[]> {
+  return invoke<GpuInfo[]>("system_detect_gpus", { forceRefresh });
+}
+
+/** 清除 GPU 检测缓存 */
+export function systemClearGpuCache(): Promise<void> {
+  return invoke<void>("system_clear_gpu_cache");
+}
+
+/**
+ * 智能推荐 torch 变体
+ *
+ * 策略：NVIDIA > AMD(Linux/Windows) > Intel > Apple > CPU
+ *
+ * 同时返回 `GpuInfo[]`（含检测到的 GPU 列表，方便 UI 展示）。
+ */
+export function systemRecommendTorch(): Promise<TorchVariant> {
+  return invoke<TorchVariant>("system_recommend_torch");
 }

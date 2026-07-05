@@ -30,18 +30,20 @@ import { computed, ref } from "vue";
 import { NButton, NSpin } from "naive-ui";
 import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
-import { useCoreStore } from "@/stores/core";
 import { useToast } from "@/composables/useToast";
+import { useEnvInstaller } from "@/composables/useEnvInstaller";
 import type { ReadinessStep } from "@/api/types";
 
 const processStore = useProcessStore();
 const envStore = useEnvStore();
-const coreStore = useCoreStore();
 const toast = useToast();
 
-/** 安装流程进行中（按 missing_steps 顺序依次执行） */
-const installing = ref(false);
-const installStage = ref("");
+// v2.14：使用 composable 共享补装逻辑
+const {
+  installing,
+  currentStep: installStage,
+  installMissingSteps,
+} = useEnvInstaller();
 
 /** 6 态枚举（按优先级排序） */
 type ButtonState =
@@ -114,11 +116,13 @@ const buttonConfig = computed(() => {
         showSublabel: false,
       };
     case "needs_setup":
+      // v2.14：按钮文案按 missing_steps 动态调整
+      // 单一缺失步骤用更精确的描述
       return {
         type: "warning" as const,
         loading: false,
         disabled: false,
-        label: "⚙ 一键安装环境",
+        label: needsSetupLabel.value,
         showSublabel: true,
       };
     case "crashed":
@@ -138,6 +142,16 @@ const buttonConfig = computed(() => {
         showSublabel: false,
       };
   }
+});
+
+/** needs_setup 状态下的按钮文案（v2.14：按 missing_steps 动态调整） */
+const needsSetupLabel = computed(() => {
+  const steps = envStore.readiness?.missing_steps ?? [];
+  if (steps.length === 0) return "⚙ 一键安装环境";
+  if (steps.length === 1) {
+    return `⚙ ${stageLabel(steps[0])}`;
+  }
+  return "⚙ 一键补装环境";
 });
 
 /** 副标题（缺失步骤或崩溃原因） */
@@ -215,6 +229,24 @@ async function onStart() {
       return;
     }
   }
+  // 守卫 3: v3.0 依赖冲突检测（不阻塞，仅提示）
+  try {
+    await envStore.checkConflicts();
+    const report = envStore.conflictReport;
+    if (report && !report.clean) {
+      const majorCount = report.conflicts.filter(
+        (c) => c.severity === "major",
+      ).length;
+      if (majorCount > 0) {
+        // 主版本冲突才弹 warn，小版本/范围冲突不打扰
+        toast.warn(
+          `检测到 ${majorCount} 个 Python 包主版本冲突，请到设置页「依赖管理」查看详情`,
+        );
+      }
+    }
+  } catch (e) {
+    console.warn("[start] checkConflicts failed:", e);
+  }
   try {
     await processStore.start();
     toast.success("已发送启动命令");
@@ -236,51 +268,9 @@ async function onStop() {
   }
 }
 
-/** 一键引导安装（按 missing_steps 顺序执行） */
+/** 一键引导安装（v2.14：委托给 useEnvInstaller composable） */
 async function onInstallEnv() {
-  if (installing.value) return;
-  const steps = envStore.readiness?.missing_steps ?? [];
-  if (steps.length === 0) {
-    toast.info("环境已就绪，无需安装");
-    return;
-  }
-  installing.value = true;
-  try {
-    for (const step of steps) {
-      installStage.value = stageLabel(step);
-      switch (step.kind) {
-        case "CloneComfyUI":
-          await coreStore.ensureCloned();
-          break;
-        case "CreateVenv":
-          await envStore.createVenv(step.params.python_version);
-          break;
-        case "InstallTorch":
-          await envStore.installTorch(step.params.cuda_version);
-          break;
-        case "InstallRequirements":
-          // requirements 安装通过 task scheduler 提交，本期仅刷新提示
-          // TODO Phase 2: 订阅 task 完成事件
-          toast.info("正在安装 requirements，请查看「任务进度」页");
-          break;
-      }
-    }
-    // 重新校验
-    await envStore.checkReadiness();
-    if (envStore.readiness?.ready) {
-      toast.success("环境已就绪，可以启动 ComfyUI");
-    } else {
-      const remaining = envStore.readiness?.missing_steps ?? [];
-      const text = `剩余：${remaining.map(stageLabel).join("、")}`;
-      toast.warn(text);
-    }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    toast.error("环境安装失败", msg);
-  } finally {
-    installing.value = false;
-    installStage.value = "";
-  }
+  await installMissingSteps();
 }
 </script>
 

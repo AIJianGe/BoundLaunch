@@ -28,6 +28,7 @@ mod model_path;
 mod plugin_manager;
 mod process_launcher;
 mod python_env;
+mod system;
 mod task_scheduler;
 mod tray;
 mod uv_sidecar;
@@ -219,14 +220,18 @@ pub fn run() {
             commands::env_inspector::env_list_dependencies,
             commands::env_inspector::env_invalidate_cache,
             commands::env_inspector::env_readiness_check,
+            commands::env_inspector::env_check_dependency_conflicts,
             // PythonEnvManager
             commands::python_env::env_status,
             commands::python_env::env_uv_available,
             commands::python_env::env_create_venv,
             commands::python_env::env_install_torch,
+            commands::python_env::env_install_requirements,
             commands::python_env::env_switch_python,
             commands::python_env::env_check_compatibility,
             commands::python_env::env_rebuild_venv,
+            // v3.0 新增（F25）：torch 多厂商切换
+            commands::python_env::env_change_torch_variant,
             // CoreManager
             commands::core_manager::core_clone,
             commands::core_manager::core_ensure_cloned,
@@ -260,6 +265,10 @@ pub fn run() {
             commands::process_launcher::process_tail_log,
             commands::process_launcher::process_kill_stale,
             commands::process_launcher::shutdown_all,
+            // v3.0 新增：System 模块（GPU 检测 + 智能推荐）
+            commands::system::system_detect_gpus,
+            commands::system::system_clear_gpu_cache,
+            commands::system::system_recommend_torch,
             // Dev 诊断
             commands::dev_log::dev_log,
         ])

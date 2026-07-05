@@ -62,6 +62,8 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 fs2 = "0.4"
 sanitize-filename = "0.5"
 walkdir = "2.5"
+# Windows junction / Unix symlink 跨平台软链接（用于 models 等数据目录独立化）
+junction = "1.2"
 
 # 工具
 dirs = "5.0"

@@ -4,15 +4,21 @@
  *
  * 详见 `PR/06-界面设计.md §0 首次运行向导`
  *
- * 4 步向导：
- * 1. 选择 ComfyUI 根目录
- * 2. 选择 Python venv 位置
- * 3. 选择运行模式（CPU / GPU / Custom）
- * 4. 环境初始化（创建 venv + 装 torch，可选跳过）
+ * 5 步向导（v2.15 改版：5 步分两行布局）：
+ *
+ * 基础配置组（步骤 1-3）：
+ *  1. 选择 ComfyUI 根目录
+ *  2. 选择 Python venv 位置
+ *  3. 选择运行模式（CPU / GPU / Custom）
+ *
+ * 环境安装组（步骤 4-5）：
+ *  4. 环境初始化（创建 venv + 装 torch）
+ *  5. 安装 ComfyUI 依赖（requirements.txt）
  *
  * 设计模式：
  * - **Builder**：分步构建 Config，最后一步保存
- * - **State Machine**：currentStep 控制 4 态切换
+ * - **State Machine**：currentStep (0-4) 控制 5 态切换
+ * - **分组 UI**：currentStepConfig / currentStepInstall 派生自 currentStep
  *
  * 行为：
  * - 任意步骤可点击「上一步」回退（保留已填数据）
@@ -35,6 +41,7 @@ import {
   NAlert,
   NProgress,
   NSpin,
+  NDivider,
 } from "naive-ui";
 import { useConfigStore } from "@/stores/config";
 import { useEnvStore } from "@/stores/env";
@@ -98,18 +105,36 @@ const canNext = computed(() => {
       );
     case 2: // 模式
       return true;
-    case 3: // 初始化
+    case 3: // 环境初始化
+      return true; // 可继续到第 5 步浏览依赖安装
+    case 4: // 安装 ComfyUI 依赖
       return false; // 最后一步无 next
     default:
       return false;
   }
 });
 
+/** 配置组 NSteps 的 current（1-3，仅显示组内 1-3 步） */
+const currentStepConfig = computed(() =>
+  currentStep.value < 3 ? currentStep.value + 1 : 3,
+);
+
+/** 安装组 NSteps 的 current（1-2，仅显示组内 1-2 步） */
+const currentStepInstall = computed(() => {
+  if (currentStep.value < 3) return 1; // 还在配置组时，安装组全部"待办"
+  return currentStep.value - 2; // 3→1, 4→2
+});
+
+/** 步骤状态（error 时两组全标 error） */
+const stepsStatus = computed(() =>
+  initError.value ? ("error" as const) : ("process" as const),
+);
+
 // ========== Actions ==========
 
 function next() {
   if (!canNext.value) return;
-  currentStep.value = Math.min(3, currentStep.value + 1);
+  currentStep.value = Math.min(4, currentStep.value + 1);
 }
 
 function prev() {
@@ -238,6 +263,22 @@ async function finishWithInit() {
       // 不抛错 — 仅仅是 UI 状态可能滞后，下次手动刷新即可
       console.warn("[onboarding] post-init refresh failed:", e);
     }
+    initProgress.value = 90;
+
+    // ========== 阶段 5: 安装 ComfyUI 依赖（v2.14 新增）==========
+    // ComfyUI 启动需要 requirements.txt 里的 8+ 个依赖
+    // (torchsde / safetensors / transformers / tokenizers / kornia /
+    //  spandrel / aiohttp / pydantic 等)
+    // 幂等：uv pip install -r 自动跳过已满足的包
+    initStage.value = "安装 ComfyUI 依赖（requirements.txt）...";
+    try {
+      await envStore.installRequirements();
+    } catch (e) {
+      // 失败不致命 — 用户可稍后到「设置页 → 路径配置」一键补装
+      console.warn("[onboarding] install requirements failed:", e);
+      // 但仍然提示一下
+      toast.warn("ComfyUI 依赖安装失败，请到「设置 → 路径配置」补装");
+    }
     initProgress.value = 100;
 
     toast.success("环境初始化完成");
@@ -301,12 +342,48 @@ class InitStageError extends Error {
         </div>
       </template>
 
-      <NSteps :current="currentStep + 1" :status="initError ? 'error' : 'process'" class="steps">
-        <NStep title="ComfyUI 根目录" description="ComfyUI 仓库克隆位置" />
-        <NStep title="Python 环境" description="venv 虚拟环境路径" />
-        <NStep title="运行模式" description="CPU / GPU / 自定义" />
-        <NStep title="环境初始化" description="创建 venv + 安装 torch" />
-      </NSteps>
+      <!-- v2.15 改版：5 步分两组显示，中间用分组分隔符 -->
+      <div class="steps-group">
+        <div class="steps-group-header">
+          <span class="group-icon">📋</span>
+          <span class="group-title">基础配置</span>
+          <span class="group-hint">配置 ComfyUI 仓库与环境路径</span>
+        </div>
+        <NSteps
+          :current="currentStepConfig"
+          :status="stepsStatus"
+          size="small"
+          class="steps"
+        >
+          <NStep title="ComfyUI 根目录" description="ComfyUI 仓库克隆位置" />
+          <NStep title="Python 环境" description="venv 虚拟环境路径" />
+          <NStep title="运行模式" description="CPU / GPU / 自定义" />
+        </NSteps>
+      </div>
+
+      <NDivider class="group-divider">
+        <span class="divider-content">
+          <span class="divider-icon">🛠</span>
+          <span>环境安装</span>
+        </span>
+      </NDivider>
+
+      <div class="steps-group">
+        <div class="steps-group-header">
+          <span class="group-icon">🛠</span>
+          <span class="group-title">环境安装</span>
+          <span class="group-hint">创建 venv + 装 PyTorch + 装依赖</span>
+        </div>
+        <NSteps
+          :current="currentStepInstall"
+          :status="stepsStatus"
+          size="small"
+          class="steps"
+        >
+          <NStep title="环境初始化" description="创建 venv + 安装 PyTorch" />
+          <NStep title="安装 ComfyUI 依赖" description="requirements.txt 中的依赖" />
+        </NSteps>
+      </div>
 
       <!-- 步骤 1: ComfyUI 根目录 -->
       <div v-if="currentStep === 0" class="step-content">
@@ -397,7 +474,7 @@ class InitStageError extends Error {
         </NForm>
       </div>
 
-      <!-- 步骤 4: 环境初始化 -->
+      <!-- 步骤 4: 环境初始化（仅展示） -->
       <div v-if="currentStep === 3" class="step-content">
         <div v-if="!initializing && !initError">
           <NAlert type="info" :bordered="false" class="init-intro">
@@ -409,6 +486,7 @@ class InitStageError extends Error {
               <li>校验环境（verify_venv）</li>
             </ol>
             <p>预计耗时 5-15 分钟，取决于网络速度。</p>
+            <p class="hint">点击「下一步（浏览）」可预览下一步操作；点击「开始初始化」（下一步）将开始安装流程。</p>
           </NAlert>
         </div>
 
@@ -430,6 +508,22 @@ class InitStageError extends Error {
         </div>
       </div>
 
+      <!-- 步骤 5: 安装 ComfyUI 依赖（预览） -->
+      <div v-if="currentStep === 4" class="step-content">
+        <NAlert type="info" :bordered="false" class="init-intro">
+          <p><strong>第 5 步将执行：</strong></p>
+          <ol>
+            <li>读取 ComfyUI 仓库根目录下的 <code>requirements.txt</code></li>
+            <li>用 uv 装入 8+ 个关键依赖（torchsde / safetensors / transformers / tokenizers / kornia / spandrel / aiohttp / pydantic 等）</li>
+            <li>幂等安装 — uv 自动跳过已满足的包</li>
+          </ol>
+          <p>
+            预计耗时 3-10 分钟（取决于网络与缺失包数量）。
+            失败时可在「设置页 → 路径配置」一键补装。
+          </p>
+        </NAlert>
+      </div>
+
       <!-- 底部按钮区 -->
       <div class="footer-actions">
         <NButton @click="skipOnboarding" :disabled="initializing" quaternary>
@@ -437,22 +531,22 @@ class InitStageError extends Error {
         </NButton>
         <NSpace>
           <NButton
-            v-if="currentStep > 0 && currentStep < 3"
+            v-if="currentStep > 0 && currentStep < 4"
             @click="prev"
             :disabled="initializing"
           >
             上一步
           </NButton>
           <NButton
-            v-if="currentStep < 3"
+            v-if="currentStep < 4"
             type="primary"
             :disabled="!canNext"
             @click="next"
           >
-            下一步
+            {{ currentStep < 3 ? "下一步" : "下一步（浏览）" }}
           </NButton>
           <NButton
-            v-if="currentStep === 3"
+            v-if="currentStep === 4"
             type="default"
             :disabled="initializing"
             @click="finishWithoutInit"
@@ -460,7 +554,7 @@ class InitStageError extends Error {
             跳过初始化
           </NButton>
           <NButton
-            v-if="currentStep === 3"
+            v-if="currentStep === 4"
             type="primary"
             :loading="initializing"
             :disabled="initializing || !!initError"
@@ -505,7 +599,53 @@ class InitStageError extends Error {
 }
 
 .steps {
-  margin: 16px 0 24px;
+  margin: 8px 0 16px;
+}
+
+.steps-group {
+  padding: 12px 0 4px;
+}
+
+.steps-group-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 0 4px;
+}
+
+.group-icon {
+  font-size: 16px;
+}
+
+.group-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--app-fg, #333);
+}
+
+.group-hint {
+  font-size: 12px;
+  color: var(--app-fg-muted, #888);
+}
+
+.group-divider {
+  margin: 12px 0 8px !important;
+}
+
+.divider-content {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--app-fg-muted, #888);
+  background: var(--app-bg-muted, #f5f5f5);
+  padding: 0 4px;
+}
+
+.divider-icon {
+  font-size: 14px;
 }
 
 .step-content {

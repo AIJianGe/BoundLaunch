@@ -9,8 +9,11 @@
 
 pub mod compatibility;
 pub mod models;
+pub mod torch_variant;
 pub mod uv_runner;
 pub mod verify;
+
+pub use torch_variant::TorchVariant;
 
 use std::path::{Path, PathBuf};
 
@@ -169,6 +172,42 @@ impl PythonEnvService {
                 cuda_version: cuda_version.display_name().to_string(),
             });
 
+        Ok(())
+    }
+
+    /// 切换 torch 变体（v3.0 新增，F25）
+    ///
+    /// 支持 5 厂商（NVIDIA / AMD / Intel / Apple / CPU），通过 `TorchVariant` 抽象。
+    ///
+    /// 实现要点：
+    /// - 复用同一 `op_lock`，与 install_torch / install_requirements 互斥
+    /// - 委托给 `UvRunner::install_torch_variant`（--upgrade + 验证）
+    /// - 完成后通过事件总线广播 `TorchInstalled`（带 variant display name）
+    /// - 失败时返回 Err，旧 torch 保留（不破坏 venv）
+    /// - 调用方负责更新 Config（向后兼容字段 cuda_version + 新字段 torch_variant）
+    pub async fn switch_torch_variant(
+        &self,
+        venv_path: &Path,
+        variant: &TorchVariant,
+    ) -> Result<(), EnvError> {
+        let _guard = self.op_lock.lock().await;
+
+        if !venv_path.exists() {
+            return Err(EnvError::VenvCreateFailed(format!(
+                "venv 不存在: {}（请先完成环境初始化）",
+                venv_path.display()
+            )));
+        }
+
+        self.uv.install_torch_variant(venv_path, variant).await?;
+
+        // 通知其他模块
+        self.event_bus
+            .emit(SystemEvent::TorchInstalled {
+                cuda_version: variant.label(),
+            });
+
+        tracing::info!(?variant, "torch variant switched");
         Ok(())
     }
 

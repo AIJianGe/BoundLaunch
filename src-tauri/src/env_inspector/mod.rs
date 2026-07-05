@@ -8,6 +8,7 @@
 //! 详见 `PR/03-模块设计/07-EnvironmentInspector.md`
 
 pub mod cache;
+pub mod dependency_conflict;
 pub mod deps;
 pub mod gpu;
 pub mod models;

@@ -50,7 +50,18 @@ export interface LaunchConfig {
 }
 
 export interface TorchConfig {
+  /** 老字段（v3.0 前），保留用于向后兼容 + 老 config 文件 */
   cuda_version: CudaVersion;
+  /**
+   * v3.0 新增（F25）：多厂商 torch 变体，JSON 字符串形式存储
+   * （对应 `crate::python_env::TorchVariant` 的 serde 序列化）
+   *
+   * - `null` 或 `undefined`：未配置（启动时由前端触发 GPU 检测 + 智能推荐后写入）
+   * - `"{\"vendor\":\"nvidia_cuda\",\"version\":\"cu121\"}"`：已配置
+   *
+   * 解析见 `parseTorchVariant()` 工具函数
+   */
+  torch_variant: string | null;
 }
 
 export interface ModelsConfig {
@@ -237,6 +248,40 @@ export interface ReadinessCheckResult {
 }
 
 // ============================================================================
+// v3.0 依赖冲突检测（对应 src-tauri/src/env_inspector/dependency_conflict.rs）
+// ============================================================================
+
+/** 冲突严重度 */
+export type ConflictSeverity = "patch" | "major" | "minor";
+
+/** 单个包约束（来源 = 某个节点的 requirements.txt） */
+export interface PackageConstraint {
+  name: string;
+  constraint: string;
+  node_name: string;
+  source_file: string;
+}
+
+/** 冲突项 */
+export interface Conflict {
+  name: string;
+  severity: ConflictSeverity;
+  constraints: PackageConstraint[];
+  suggestion: string;
+  affected_nodes: string[];
+}
+
+/** 完整冲突报告 */
+export interface ConflictReport {
+  scanned_nodes: string[];
+  total_packages: number;
+  unique_packages: number;
+  conflicts: Conflict[];
+  clean: boolean;
+  scan_duration_ms: number;
+}
+
+// ============================================================================
 // CoreManager 模块（对应 src-tauri/src/core_manager/models.rs）
 // ============================================================================
 
@@ -369,4 +414,61 @@ export interface TaskHistoryRecord {
   completed_at: string | null;
   exit_code: number | null;
   error: string | null;
+}
+
+// ============================================================================
+// v3.0 torch 多厂商支持（F25）
+// ============================================================================
+
+/**
+ * torch 安装变体（5 厂商）
+ *
+ * 后端 `src-tauri/src/python_env/torch_variant.rs::TorchVariant` 的 serde 形式：
+ * `#[serde(tag = "vendor", content = "version", rename_all = "snake_case")]`
+ *
+ * 对应格式：
+ * - `{ vendor: "nvidia_cuda", version: "cu118" | "cu121" | "cu124" }`
+ * - `{ vendor: "amd_rocm",  version: "rocm5.7" | "rocm6.0" | "rocm6.1" }`
+ * - `{ vendor: "intel_xpu" }`
+ * - `{ vendor: "apple_silicon" }`
+ * - `{ vendor: "cpu_only" }`
+ */
+export type TorchVariant =
+  | { vendor: "nvidia_cuda"; version: "cu118" | "cu121" | "cu124" }
+  | { vendor: "amd_rocm"; version: "rocm5.7" | "rocm6.0" | "rocm6.1" }
+  | { vendor: "intel_xpu" }
+  | { vendor: "apple_silicon" }
+  | { vendor: "cpu_only" };
+
+/** 厂商枚举（UI 一级 Tab 用） */
+export type TorchVendor = TorchVariant["vendor"];
+
+/** torch 变体显示信息（UI 二级选项用） */
+export interface TorchVariantOption {
+  variant: TorchVariant;
+  label: string; // e.g. "CUDA 12.1"
+  compatible: boolean; // 平台兼容性（不兼容时 UI 灰显）
+  hint?: string; // 兼容性提示
+}
+
+// ============================================================================
+// v3.0 GPU 自动检测（F25）
+// ============================================================================
+
+/** GPU 厂商（与后端 `GpuVendor` 对应） */
+export type GpuVendor = "nvidia" | "amd" | "intel" | "apple" | "unknown";
+
+/** 单个 GPU 信息 */
+export interface GpuInfo {
+  vendor: GpuVendor;
+  /** 型号（如 "GeForce RTX 4080" / "Radeon RX 7900 XT" / "Apple M2 Pro"） */
+  model: string;
+  /** 显存大小（MB），无法探测时为 null */
+  vram_mb: number | null;
+  /** 驱动版本（NVIDIA 专用） */
+  driver_version: string | null;
+  /** CUDA 版本（NVIDIA 专用，从 nvidia-smi 头部提取） */
+  cuda_version: string | null;
+  /** ROCm 版本（AMD 专用，预留） */
+  rocm_version: string | null;
 }

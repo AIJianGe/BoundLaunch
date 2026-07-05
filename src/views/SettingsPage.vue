@@ -28,6 +28,7 @@ import { computed } from "vue";
 import PathsPanel from "@/components/settings/PathsPanel.vue";
 import PythonVersionPanel from "@/components/settings/PythonVersionPanel.vue";
 import TorchConfigPanel from "@/components/settings/TorchConfigPanel.vue";
+import DependenciesPanel from "@/components/settings/DependenciesPanel.vue";
 import UiPanel from "@/components/settings/UiPanel.vue";
 import DangerZonePanel from "@/components/settings/DangerZonePanel.vue";
 
@@ -64,6 +65,7 @@ onMounted(async () => {
       <PathsPanel />
       <PythonVersionPanel />
       <TorchConfigPanel />
+      <DependenciesPanel />
       <UiPanel />
       <DangerZonePanel />
     </template>

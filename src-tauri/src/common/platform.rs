@@ -1,4 +1,4 @@
-//! 跨平台进程终止
+//! 跨平台进程终止 + OS 检测
 //!
 //! 设计模式：适配器 (Adapter)
 //! 原始接口：Windows taskkill / Linux kill
@@ -7,6 +7,20 @@
 //! 详见 `PR/03-模块设计/06-ProcessLauncher.md §5.2`
 
 use std::io;
+
+/// 获取当前操作系统的标准化字符串（v3.0 新增，F25）
+///
+/// 返回值：`"windows"` | `"linux"` | `"macos"`
+/// 用于 TorchVariant 平台兼容性检查（system::recommend）。
+pub fn current_os() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
 
 /// 终止进程
 ///

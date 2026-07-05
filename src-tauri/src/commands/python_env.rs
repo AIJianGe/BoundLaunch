@@ -78,6 +78,69 @@ pub async fn env_install_torch(
         })
 }
 
+/// 切换 torch 变体（v3.0 新增，F25）
+///
+/// 支持多厂商（NVIDIA / AMD / Intel / Apple / CPU）。
+/// 切换前会先停止 ComfyUI 进程（如运行）。
+/// 失败时返回错误，旧 torch 保留。
+#[tauri::command]
+pub async fn env_change_torch_variant(
+    variant: crate::python_env::TorchVariant,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    // 1. 停 ComfyUI（如运行）
+    if state.process_launcher.status().await.is_alive() {
+        if let Err(e) = state.process_launcher.stop(app.clone()).await {
+            tracing::warn!(error = %e, "切换 torch 前停止 ComfyUI 失败，继续");
+        }
+    }
+
+    let config = state.config.get();
+    let venv_path = PathBuf::from(&config.paths.venv_path);
+
+    // 2. 切换 torch
+    state
+        .python_env
+        .switch_torch_variant(&venv_path, &variant)
+        .await
+        .map_err(|e| {
+            let _ = app.emit("env_error", e.to_string());
+            e.to_string()
+        })?;
+
+    // 3. 更新 Config（向后兼容 + 写新字段）
+    //    - cuda_version: 老字段，NvidiaCuda → cu118/cu121/cu124，其他 → Cpu
+    //    - torch_variant: 新字段，序列化为 JSON 字符串存储（避免 config ↔ python_env 循环依赖）
+    let new_cuda = match &variant {
+        crate::python_env::TorchVariant::NvidiaCuda(_) => {
+            parse_cuda_version(&variant.cuda_version_string())?
+        }
+        _ => CudaVersion::Cpu,
+    };
+    let variant_json = serde_json::to_string(&variant)
+        .map_err(|e| format!("序列化 torch 变体失败: {}", e))?;
+
+    if let Err(e) = state
+        .config
+        .update(move |cfg| {
+            cfg.torch.cuda_version = new_cuda;
+            cfg.torch.torch_variant = Some(variant_json);
+            Ok(())
+        })
+        .await
+    {
+        tracing::warn!(error = %e, "Config 更新失败，但 torch 切换已成功");
+    }
+
+    // 4. 失效环境检查缓存
+    state.env_inspector.invalidate_cache();
+
+    // 5. emit 事件
+    let _ = app.emit("TorchInstalled", variant);
+    Ok(())
+}
+
 /// 切换 Python 版本
 #[tauri::command]
 pub async fn env_switch_python(
@@ -120,6 +183,41 @@ pub async fn env_check_compatibility(
         .check_requirements_compatibility(&venv_path, &comfyui_root)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// 安装 ComfyUI requirements.txt 依赖（v2.14）
+///
+/// 幂等：`uv pip install -r requirements.txt` 对已满足的包自动跳过
+/// 路径：`<comfyui_root>/requirements.txt`（不存在则报错）
+///
+/// 用例：
+/// - OnboardingPage 阶段 5：venv + torch 装完后，装 ComfyUI 必备依赖
+/// - 设置页「路径配置」一键补装：envStore.readiness 提示有 InstallRequirements 时
+/// - 首页「一键补装」按钮：同上
+#[tauri::command]
+pub async fn env_install_requirements(
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let config = state.config.get();
+    let venv_path = PathBuf::from(&config.paths.venv_path);
+    let comfyui_root = PathBuf::from(&config.paths.comfyui_root);
+    let req_file = comfyui_root.join("requirements.txt");
+
+    if !req_file.exists() {
+        return Err(format!(
+            "requirements.txt 不存在: {}\n提示: 请先克隆 ComfyUI 仓库（请确认 ComfyUI 根目录配置正确）",
+            req_file.display()
+        ));
+    }
+
+    state
+        .python_env
+        .install_requirements(&venv_path, &req_file)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "env_install_requirements failed");
+            e.to_string()
+        })
 }
 
 /// 重建 venv

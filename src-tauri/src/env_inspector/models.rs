@@ -86,6 +86,8 @@ impl TorchInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct DependencyInfo {
     pub name: String,
+    /// 实际安装的版本（前端用 `version` 字段名访问）
+    #[serde(rename = "version")]
     pub installed_version: Option<String>,
     /// 来自 ComfyUI requirements.txt 的版本约束
     pub required_version: Option<String>,
@@ -94,7 +96,7 @@ pub struct DependencyInfo {
 
 /// 依赖状态
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", content = "detail")]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
 pub enum DepStatus {
     /// 已安装且满足版本要求
     Satisfied,

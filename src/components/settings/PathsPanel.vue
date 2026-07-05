@@ -18,7 +18,7 @@
  * - **Validator**：实时校验
  */
 
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, onMounted } from "vue";
 import {
   NCard,
   NForm,
@@ -27,13 +27,28 @@ import {
   NAlert,
   NSpace,
   NTooltip,
+  NButton,
+  NSpin,
 } from "naive-ui";
 import { useConfigStore } from "@/stores/config";
+import { useEnvStore } from "@/stores/env";
 import { useToast } from "@/composables/useToast";
+import { useEnvInstaller } from "@/composables/useEnvInstaller";
+import { useConfirm } from "@/composables/useConfirm";
 import FolderPicker from "@/components/FolderPicker.vue";
 
 const configStore = useConfigStore();
+const envStore = useEnvStore();
 const toast = useToast();
+const { confirm: showConfirm } = useConfirm();
+
+/** 上一保存的 venv 路径（用于切换时检测"路径真的变了"） */
+let lastSavedVenv = "";
+const {
+  installing: installingEnv,
+  currentStep: installStepText,
+  installMissingSteps,
+} = useEnvInstaller();
 
 const pythonVersionOptions = [
   { label: "3.10", value: "3.10" },
@@ -53,6 +68,10 @@ watch(
       localRoot.value = cfg.paths.comfyui_root;
       localVenv.value = cfg.paths.venv_path;
       localPython.value = cfg.paths.python_version;
+      // 首次加载时初始化 lastSavedVenv
+      if (!lastSavedVenv) {
+        lastSavedVenv = cfg.paths.venv_path;
+      }
     }
   },
   { immediate: true },
@@ -75,7 +94,41 @@ function debouncedUpdate(field: "root" | "venv" | "python", value: string) {
       if (field === "root") {
         await configStore.update({ paths: { comfyui_root: value } });
       } else if (field === "venv") {
+        // v3.0：切换 venv 路径时让用户确认
+        const oldPath = lastSavedVenv;
+        if (oldPath && oldPath !== value) {
+          const oldPathStr = oldPath;
+          const newPathStr = value;
+          const confirmed = await showConfirm({
+            title: "切换 venv 路径",
+            content:
+              "切换 venv 路径后，原 venv 中的 Python 包将不再被使用。\n\n" +
+              "旧路径：" +
+              oldPathStr +
+              "\n新路径：" +
+              newPathStr +
+              "\n\n如果新路径不存在或不是有效 venv，下次启动 ComfyUI 前需要重新初始化环境。是否继续？",
+            positiveText: "确认切换",
+            negativeText: "取消",
+          });
+          if (!confirmed) {
+            // 回退 localVenv 到原值
+            localVenv.value = oldPath;
+            return;
+          }
+          lastSavedVenv = value;
+        } else {
+          lastSavedVenv = value;
+        }
         await configStore.update({ paths: { venv_path: value } });
+        // 切换后立即重新做一次 readiness，让 UI 反映新 venv 状态
+        try {
+          await envStore.invalidateCache();
+          await envStore.refresh();
+          await envStore.checkReadiness();
+        } catch (e) {
+          console.warn("[PathsPanel] post-venv-change readiness failed:", e);
+        }
       } else if (field === "python") {
         await configStore.update({ paths: { python_version: value } });
       }
@@ -84,6 +137,42 @@ function debouncedUpdate(field: "root" | "venv" | "python", value: string) {
     }
   }, 500);
 }
+
+// v2.14：环境检测与补装
+onMounted(async () => {
+  // 初次进入面板时做一次 readiness 检查
+  try {
+    await envStore.refresh();
+    await envStore.checkReadiness();
+  } catch (e) {
+    console.warn("[PathsPanel] initial env check failed:", e);
+  }
+});
+
+/** 环境是否完全就绪（readiness.ready === true） */
+const envReady = computed(() => envStore.readiness?.ready ?? false);
+
+/** missing_steps 数量（0 = 就绪） */
+const missingCount = computed(
+  () => envStore.readiness?.missing_steps.length ?? 0,
+);
+
+/** missing_steps 简明描述（按 kind 翻译为中文） */
+const missingStepsText = computed(() => {
+  const steps = envStore.readiness?.missing_steps ?? [];
+  const labels: Record<string, string> = {
+    CloneComfyUI: "克隆 ComfyUI 仓库",
+    CreateVenv: "创建 Python 虚拟环境",
+    InstallTorch: "安装 PyTorch",
+    InstallRequirements: "安装 ComfyUI 依赖",
+  };
+  return steps.map((s) => labels[s.kind] ?? s.kind).join("、");
+});
+
+/** 点击「一键补装」按钮 */
+async function onInstallMissing() {
+  await installMissingSteps();
+}
 </script>
 
 <template>
@@ -91,6 +180,45 @@ function debouncedUpdate(field: "root" | "venv" | "python", value: string) {
     <template #header>
       <span class="header-title">📁 路径配置</span>
     </template>
+
+    <!-- v2.14：环境检测与补装入口 -->
+    <div class="env-check-section">
+      <NAlert
+        v-if="envStore.isLoaded && envReady"
+        type="success"
+        :show-icon="true"
+        :bordered="false"
+        class="env-alert"
+      >
+        ✅ 环境已就绪，可以启动 ComfyUI
+      </NAlert>
+      <NAlert
+        v-else-if="envStore.isLoaded && missingCount > 0"
+        type="warning"
+        :show-icon="true"
+        :bordered="false"
+        class="env-alert"
+      >
+        <div class="env-alert-content">
+          <span>
+            ⚠ 环境未完全就绪，缺失 {{ missingCount }} 项：
+            <strong>{{ missingStepsText }}</strong>
+          </span>
+          <NButton
+            size="small"
+            type="warning"
+            :loading="installingEnv"
+            :disabled="installingEnv"
+            @click="onInstallMissing"
+          >
+            <template #icon>
+              <NSpin v-if="installingEnv" size="small" />
+            </template>
+            {{ installingEnv ? installStepText : "一键补装" }}
+          </NButton>
+        </div>
+      </NAlert>
+    </div>
 
     <NForm label-placement="top" :show-feedback="false" size="small">
       <NFormItem label="ComfyUI 根目录">
@@ -156,6 +284,22 @@ function debouncedUpdate(field: "root" | "venv" | "python", value: string) {
 <style scoped>
 .paths-panel {
   margin-bottom: 16px;
+}
+
+.env-check-section {
+  margin-bottom: 16px;
+}
+
+.env-alert {
+  font-size: 13px;
+}
+
+.env-alert-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .header-title {

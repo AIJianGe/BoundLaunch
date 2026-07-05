@@ -4,16 +4,15 @@
  *
  * 详见 `PR/06-界面设计.md §3 启动页（首页）`
  *
- * 9 区块编排：
- * 1. §3.1 顶部状态卡片      StatusCard
+ * 8 区块编排（v2.18 合并：服务状态并入 StatusCard，移除 RunningStatusPanel）：
+ * 1. §3.1 顶部状态卡片      StatusCard（含服务状态 + 打开浏览器按钮）
  * 2. §3.2 启动/停止按钮       StartStopButtons
  * 3. §3.3 运行模式单选        LaunchModeSelector
  * 4. §3.4 基础参数表单        BasicParamsForm
  * 5. §3.5 关键依赖列表        DependencyList
  * 6. §3.6 命令预览            CommandPreview
  * 7. §3.7 高级参数折叠        AdvancedParamsPanel
- * 8. §3.8 启动后状态          RunningStatusPanel
- * 9. （可选）§3.9 实时日志面板 - 复用 LogsPage 简化版（本期略，日志页有完整版）
+ * （v2.18 移除）§3.8 启动后状态 RunningStatusPanel（合并到 §3.1）
  *
  * 容器职责：
  * - 加载初始 Config / envInfo / 历史日志
@@ -39,7 +38,8 @@ import BasicParamsForm from "@/components/launch/BasicParamsForm.vue";
 import DependencyList from "@/components/launch/DependencyList.vue";
 import CommandPreview from "@/components/launch/CommandPreview.vue";
 import AdvancedParamsPanel from "@/components/launch/AdvancedParamsPanel.vue";
-import RunningStatusPanel from "@/components/launch/RunningStatusPanel.vue";
+// v2.18：服务状态合并到 StatusCard，移除 RunningStatusPanel
+// import RunningStatusPanel from "@/components/launch/RunningStatusPanel.vue";
 
 const configStore = useConfigStore();
 const envStore = useEnvStore();
@@ -173,8 +173,8 @@ const initialLoading = computed(
       <!-- §3.7 高级参数折叠 -->
       <AdvancedParamsPanel />
 
-      <!-- §3.8 启动后状态 -->
-      <RunningStatusPanel />
+      <!-- v2.18：§3.8 启动后状态合并到 StatusCard，不再单独渲染 -->
+      <!-- <RunningStatusPanel /> -->
     </template>
   </div>
 </template>

@@ -1,39 +1,63 @@
 <script setup lang="ts">
 /**
- * torch CUDA 配置面板
+ * torch 多厂商配置面板（v3.0 重构，F25）
  *
- * 详见 `PR/06-界面设计.md §5.3 设置页 - torch 配置`
- *
- * 字段：cuda_version（cpu / cu118 / cu121 / cu124）
+ * UI 结构：
+ * - 一级 Tab 选择厂商（NVIDIA / AMD / Intel / Apple / CPU）
+ * - 二级选项选择具体版本（CUDA 11.8/12.1/12.4 / ROCm 5.7/6.0/6.1 / XPU / MPS / CPU Only）
+ * - 不兼容平台灰显并提示
  *
  * 行为：
- * - 切换前若 ComfyUI 运行中，弹确认框，用户确认后 stop()
+ * - 打开面板时自动检测 GPU（带 5 分钟缓存）
+ * - 显示"智能推荐"按钮 + 推荐变体
+ * - 切换前若 ComfyUI 运行中，弹确认框
  * - 切换是长任务（30 秒-数分钟），按钮转圈
  * - 失败时保留旧版本可用
  *
  * 设计模式：
- * - **Strategy**：CudaVersion 枚举对应不同 torch wheel 索引 URL
- * - **State Machine**：idle / installing / success / failed
+ * - **Strategy**：TorchVariant 枚举对应不同 torch wheel 索引 URL
+ * - **State Machine**：idle / detecting / installing / success / failed
+ *
+ * 详见 `PR/03-模块设计/02-PythonEnvManager.md §X` 和 `PR/06-界面设计.md §5.3`
  */
 
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, onMounted } from "vue";
 import {
   NCard,
   NForm,
   NFormItem,
+  NTabs,
+  NTabPane,
   NRadioGroup,
   NRadio,
   NButton,
   NTag,
   NAlert,
   NSpace,
+  NSpin,
+  NTooltip,
+  NDivider,
 } from "naive-ui";
 import { useConfigStore } from "@/stores/config";
 import { useEnvStore } from "@/stores/env";
 import { useProcessStore } from "@/stores/process";
 import { useToast } from "@/composables/useToast";
 import { useConfirm } from "@/composables/useConfirm";
-import type { CudaVersion } from "@/api/types";
+import type {
+  TorchVariant,
+  TorchVendor,
+  GpuInfo,
+  TorchVariantOption,
+} from "@/api/types";
+import {
+  variantLabel,
+  vendorLabel,
+  currentPlatform,
+  groupVariantsByVendor,
+  compareVariants,
+  variantToKey,
+  keyToVariant,
+} from "@/utils/torchVariant";
 
 const configStore = useConfigStore();
 const envStore = useEnvStore();
@@ -41,33 +65,79 @@ const processStore = useProcessStore();
 const toast = useToast();
 const confirm = useConfirm();
 
-const cudaOptions: Array<{ value: CudaVersion; label: string; hint: string }> = [
-  { value: "cpu", label: "CPU", hint: "无 GPU 或仅测试" },
-  { value: "cu118", label: "CUDA 11.8", hint: "兼容旧驱动" },
-  { value: "cu121", label: "CUDA 12.1（推荐）", hint: "RTX 30/40 系列推荐" },
-  { value: "cu124", label: "CUDA 12.4", hint: "最新 CUDA" },
-];
+const platform = currentPlatform();
+const vendorGroups = computed(() => groupVariantsByVendor(platform));
 
-const selectedCuda = ref<CudaVersion>("cu121");
-const installing = ref(false);
+// 一级 Tab 当前选中的厂商
+const activeVendor = ref<TorchVendor>("nvidia_cuda");
+// 二级当前选中的变体（Naive UI RadioGroup v-model 用 string key 避免对象类型不匹配）
+const selectedKey = ref<string>("");
+// 真实选中的变体对象（用于调用后端 API）
+const selectedVariant = computed<TorchVariant | null>(() =>
+  selectedKey.value ? keyToVariant(selectedKey.value) : null,
+);
 const installError = ref<string | null>(null);
 
-// 同步 store → 本地
+// === 初始化：解析 Config 中的 torch_variant ===
 watch(
-  () => configStore.config?.torch.cuda_version,
+  () => envStore.activeTorch,
   (val) => {
-    if (val) selectedCuda.value = val;
+    if (val) {
+      activeVendor.value = val.vendor;
+      selectedKey.value = variantToKey(val);
+    }
   },
   { immediate: true },
 );
 
-const currentCuda = computed(() => configStore.config?.torch.cuda_version || "未配置");
-const currentTorchVersion = computed(
-  () => envStore.envInfo?.torch_version || "未安装",
+// === 打开面板时自动检测 GPU ===
+onMounted(async () => {
+  try {
+    await envStore.detectGpus();
+    await envStore.recommendTorch();
+  } catch (e) {
+    console.warn("[TorchConfigPanel] auto detect failed:", e);
+  }
+});
+
+const currentVariant = computed(() => envStore.activeTorch);
+const isCurrent = computed(() =>
+  compareVariants(selectedVariant.value, currentVariant.value),
 );
-const isCurrent = computed(() => selectedCuda.value === currentCuda.value);
+const gpus = computed<GpuInfo[]>(() => envStore.gpus);
+const recommended = computed<TorchVariant | null>(() => envStore.recommendedTorch);
+
+// 按 vendor 过滤 GPU
+const gpusForVendor = (vendor: TorchVendor) =>
+  gpus.value.filter((g) => {
+    if (vendor === "nvidia_cuda") return g.vendor === "nvidia";
+    if (vendor === "amd_rocm") return g.vendor === "amd";
+    if (vendor === "intel_xpu") return g.vendor === "intel";
+    if (vendor === "apple_silicon") return g.vendor === "apple";
+    return false;
+  });
+
+async function onRefreshGpu() {
+  try {
+    await envStore.refreshGpuAndRecommendation();
+    toast.success(`检测到 ${gpus.value.length} 个 GPU`);
+  } catch (e) {
+    toast.error("GPU 检测失败", e);
+  }
+}
+
+async function onApplyRecommended() {
+  if (!recommended.value) return;
+  activeVendor.value = recommended.value.vendor;
+  selectedKey.value = variantToKey(recommended.value);
+  await onApply();
+}
 
 async function onApply() {
+  if (!selectedVariant.value) {
+    toast.warn("请先选择 torch 变体");
+    return;
+  }
   if (isCurrent.value) {
     toast.info("已选中版本与当前一致，无需切换");
     return;
@@ -90,27 +160,19 @@ async function onApply() {
 
   // 二次确认
   const ok = await confirm.warn(
-    "确认切换 torch CUDA",
-    `将卸载当前 torch 并安装 ${selectedCuda.value} 版本，预计耗时 1-5 分钟。是否继续？`,
+    "确认切换 torch",
+    `将切换到 ${variantLabel(selectedVariant.value)}，预计耗时 1-5 分钟。是否继续？`,
   );
   if (!ok) return;
 
-  installing.value = true;
   installError.value = null;
 
   try {
-    // 先更新 config（后端会感知）
-    await configStore.update({
-      torch: { cuda_version: selectedCuda.value },
-    });
-    // 调用后端安装 torch
-    await envStore.installTorch(selectedCuda.value);
-    toast.success(`torch 已切换到 ${selectedCuda.value}`);
+    await envStore.changeTorchVariant(selectedVariant.value);
+    toast.success(`torch 已切换到 ${variantLabel(selectedVariant.value)}`);
   } catch (e) {
     installError.value = e instanceof Error ? e.message : String(e);
     toast.error("torch 切换失败", e);
-  } finally {
-    installing.value = false;
   }
 }
 </script>
@@ -118,39 +180,113 @@ async function onApply() {
 <template>
   <NCard class="torch-panel" :bordered="true" size="small">
     <template #header>
-      <span class="header-title">🔥 torch 配置</span>
+      <NSpace align="center" :size="12">
+        <span class="header-title">🔥 torch 配置</span>
+        <NTag v-if="currentVariant" size="small" type="success">
+          当前：{{ variantLabel(currentVariant) }}
+        </NTag>
+        <NTag v-else size="small" type="warning">未配置</NTag>
+      </NSpace>
     </template>
 
     <NForm label-placement="top" :show-feedback="false" size="small">
-      <NFormItem label="CUDA 版本">
-        <NRadioGroup v-model:value="selectedCuda" :disabled="installing">
-          <NSpace>
-            <div
-              v-for="opt in cudaOptions"
-              :key="opt.value"
-              class="cuda-option"
-            >
-              <NRadio :value="opt.value" :disabled="installing">
-                {{ opt.label }}
-              </NRadio>
-              <span class="cuda-hint">{{ opt.hint }}</span>
-            </div>
-          </NSpace>
-        </NRadioGroup>
-      </NFormItem>
-
-      <div class="current-info">
-        <NSpace size="small" align="center">
-          <span class="info-label">当前 CUDA:</span>
-          <NTag size="small" :type="isCurrent ? 'success' : 'warning'">
-            {{ currentCuda }}
+      <!-- GPU 检测结果展示 -->
+      <div class="gpu-section">
+        <NSpace align="center" :size="8" style="margin-bottom: 8px">
+          <span class="section-label">检测到 GPU：</span>
+          <NSpin v-if="envStore.detectingGpus" size="small" />
+          <span v-else-if="gpus.length === 0" class="muted">无</span>
+          <NTag
+            v-for="(gpu, idx) in gpus"
+            :key="idx"
+            size="small"
+            :type="gpu.vendor === 'nvidia' ? 'success' : 'info'"
+          >
+            {{ gpu.model }}
+            <span v-if="gpu.vram_mb"> · {{ Math.round(gpu.vram_mb / 1024) }} GB</span>
+            <span v-if="gpu.cuda_version"> · CUDA {{ gpu.cuda_version }}</span>
           </NTag>
+          <NButton size="tiny" @click="onRefreshGpu" :loading="envStore.detectingGpus">
+            重新检测
+          </NButton>
         </NSpace>
-        <NSpace size="small" align="center">
-          <span class="info-label">torch 版本:</span>
-          <NTag size="small" type="info">{{ currentTorchVersion }}</NTag>
+        <!-- 智能推荐 -->
+        <NSpace v-if="recommended" align="center" :size="8" style="margin-bottom: 12px">
+          <span class="muted">推荐：</span>
+          <NTag size="small" type="warning">{{ variantLabel(recommended) }}</NTag>
+          <NButton
+            size="tiny"
+            type="primary"
+            ghost
+            :disabled="isCurrent && compareVariants(recommended, currentVariant)"
+            @click="onApplyRecommended"
+          >
+            一键应用推荐
+          </NButton>
         </NSpace>
       </div>
+
+      <NDivider style="margin: 8px 0 12px 0" />
+
+      <!-- 一级 Tab：选厂商 -->
+      <NTabs
+        v-model:value="activeVendor"
+        type="line"
+        animated
+        :bar-width="20"
+        size="small"
+      >
+        <NTabPane
+          v-for="(options, vendor) in vendorGroups"
+          :key="vendor"
+          :name="vendor"
+          :tab="vendorLabel(vendor as TorchVendor)"
+        >
+          <!-- 二级选项：选具体版本 -->
+          <NRadioGroup
+            v-model:value="selectedKey"
+            :disabled="envStore.switchingTorch"
+          >
+            <NSpace vertical :size="8">
+              <div
+                v-for="opt in options"
+                :key="variantToKey(opt.variant)"
+                class="variant-option"
+                :class="{ 'is-incompatible': !opt.compatible }"
+              >
+                <NTooltip v-if="!opt.compatible" placement="right">
+                  <template #trigger>
+                    <NRadio
+                      :value="variantToKey(opt.variant)"
+                      :disabled="true || envStore.switchingTorch"
+                    >
+                      {{ opt.label }}
+                    </NRadio>
+                  </template>
+                  {{ opt.hint }}
+                </NTooltip>
+                <NRadio
+                  v-else
+                  :value="variantToKey(opt.variant)"
+                  :disabled="envStore.switchingTorch"
+                >
+                  {{ opt.label }}
+                </NRadio>
+                <!-- 该厂商的 GPU 信息（仅显示当前选中的厂商） -->
+                <span
+                  v-if="
+                    opt.variant.vendor === activeVendor &&
+                    gpusForVendor(activeVendor).length > 0
+                  "
+                  class="vendor-gpu-hint muted"
+                >
+                  {{ gpusForVendor(activeVendor).map((g) => g.model).join("、") }}
+                </span>
+              </div>
+            </NSpace>
+          </NRadioGroup>
+        </NTabPane>
+      </NTabs>
 
       <NAlert type="info" :bordered="false" class="info-alert">
         ℹ 切换前会自动停止 ComfyUI 进程；切换失败时旧版本 torch 仍可用。
@@ -159,11 +295,11 @@ async function onApply() {
       <div class="action-row">
         <NButton
           type="primary"
-          :loading="installing"
-          :disabled="installing || isCurrent"
+          :loading="envStore.switchingTorch"
+          :disabled="envStore.switchingTorch || isCurrent || !selectedVariant"
           @click="onApply"
         >
-          {{ installing ? "安装中..." : "应用" }}
+          {{ envStore.switchingTorch ? "安装中..." : "应用" }}
         </NButton>
       </div>
     </NForm>
@@ -189,34 +325,41 @@ async function onApply() {
   font-weight: 600;
 }
 
-.cuda-option {
+.gpu-section {
+  margin-top: 4px;
+}
+
+.section-label {
+  font-size: 13px;
+  color: var(--app-text-muted, #999);
+}
+
+.muted {
+  color: var(--app-text-muted, #999);
+  font-size: 12px;
+}
+
+.variant-option {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.cuda-hint {
+.variant-option.is-incompatible {
+  opacity: 0.5;
+}
+
+.vendor-gpu-hint {
+  margin-left: 8px;
   font-size: 12px;
-  color: var(--app-text-muted, #999);
-}
-
-.current-info {
-  display: flex;
-  gap: 24px;
-  margin-top: 12px;
-  font-size: 13px;
-}
-
-.info-label {
-  color: var(--app-text-muted, #999);
 }
 
 .info-alert {
-  margin-top: 12px;
+  margin-top: 16px;
 }
 
 .action-row {
-  margin-top: 12px;
+  margin-top: 16px;
   display: flex;
   justify-content: flex-end;
 }

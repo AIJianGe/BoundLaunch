@@ -17,6 +17,7 @@
 import { computed } from "vue";
 import { NCard, NButton, NEmpty, NTag, NSpin, NSpace } from "naive-ui";
 import { useEnvStore } from "@/stores/env";
+import type { DependencyInfo } from "@/api/types";
 
 const envStore = useEnvStore();
 
@@ -24,8 +25,36 @@ const dependencies = computed(() => envStore.dependencies);
 const loading = computed(() => envStore.loading);
 const totalCount = computed(() => dependencies.value.length);
 
+/**
+ * 把后端 DepStatus 序列化的 `{kind, detail}` 对象映射到前端 UI 用的字符串状态
+ *
+ * 后端序列化（v2.17 调整）：
+ * - `{"kind":"satisfied"}` → "ok"
+ * - `{"kind":"needs_upgrade","detail":{...}}` → "outdated"
+ * - `{"kind":"missing"}` → "missing"
+ * - `{"kind":"not_required"}` → "unknown"
+ */
+type UiDepStatus = "ok" | "outdated" | "missing" | "unknown";
+
+function normalizeStatus(dep: DependencyInfo): UiDepStatus {
+  const s: unknown = dep.status;
+  if (typeof s === "string") {
+    // 兼容旧版（直接字符串）
+    if (s === "ok" || s === "outdated" || s === "missing") return s;
+    return "unknown";
+  }
+  if (s && typeof s === "object" && "kind" in s) {
+    const kind = (s as { kind: string }).kind;
+    if (kind === "satisfied") return "ok";
+    if (kind === "needs_upgrade") return "outdated";
+    if (kind === "missing") return "missing";
+    return "unknown";
+  }
+  return "unknown";
+}
+
 const statusTagConfig = computed(() => {
-  return (status: string) => {
+  return (status: UiDepStatus) => {
     switch (status) {
       case "ok":
         return { type: "success" as const, label: "✓", text: "已安装" };
@@ -41,9 +70,9 @@ const statusTagConfig = computed(() => {
 
 const summary = computed(() => {
   const deps = dependencies.value;
-  const ok = deps.filter((d) => d.status === "ok").length;
-  const outdated = deps.filter((d) => d.status === "outdated").length;
-  const missing = deps.filter((d) => d.status === "missing").length;
+  const ok = deps.filter((d) => normalizeStatus(d) === "ok").length;
+  const outdated = deps.filter((d) => normalizeStatus(d) === "outdated").length;
+  const missing = deps.filter((d) => normalizeStatus(d) === "missing").length;
   return { ok, outdated, missing, total: deps.length };
 });
 
@@ -88,16 +117,16 @@ async function onRefresh() {
         v-for="dep in dependencies"
         :key="dep.name"
         class="dep-row"
-        :class="`dep-${dep.status}`"
+        :class="`dep-${normalizeStatus(dep)}`"
       >
         <div class="dep-name">
-          <span class="dep-icon">{{ statusTagConfig(dep.status).label }}</span>
+          <span class="dep-icon">{{ statusTagConfig(normalizeStatus(dep)).label }}</span>
           <span class="dep-name-text">{{ dep.name }}</span>
         </div>
         <div class="dep-version">
           <span class="version-text">{{ dep.version || "未安装" }}</span>
-          <NTag size="tiny" :type="statusTagConfig(dep.status).type">
-            {{ statusTagConfig(dep.status).text }}
+          <NTag size="tiny" :type="statusTagConfig(normalizeStatus(dep)).type">
+            {{ statusTagConfig(normalizeStatus(dep)).text }}
           </NTag>
         </div>
       </div>

@@ -220,6 +220,7 @@ mod tests {
             },
             torch: TorchConfig {
                 cuda_version: crate::config::CudaVersion::Cu121,
+                torch_variant: None,
             },
             models: crate::config::ModelsConfig {
                 mode: crate::config::ModelsMode::Default,

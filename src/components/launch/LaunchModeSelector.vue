@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * §3.3 运行模式单选
+ * §3.3 运行模式选择（v2.17 改下拉）
  *
  * 详见 `PR/06-界面设计.md §3.3 运行模式单选`
  *
@@ -16,8 +16,8 @@
  * - 用户确认后自动 stop + 等待 + 切换配置（不自动 start，避免误启动）
  */
 
-import { computed } from "vue";
-import { NCard, NRadioGroup, NRadio, NSpace, NTag } from "naive-ui";
+import { computed, h } from "vue";
+import { NCard, NSelect, NTag, type SelectOption } from "naive-ui";
 import { useConfigStore } from "@/stores/config";
 import { useProcessStore } from "@/stores/process";
 import { useToast } from "@/composables/useToast";
@@ -27,7 +27,7 @@ import type { LaunchMode } from "@/api/types";
 const configStore = useConfigStore();
 const processStore = useProcessStore();
 const toast = useToast();
-const confirm = useConfirm();
+const { warn: showWarn } = useConfirm();
 
 const currentMode = computed<LaunchMode | null>(() => configStore.launchMode);
 
@@ -44,20 +44,31 @@ const modeOptions: Array<{
   { value: "custom", label: "自定义", hint: "用户填 custom_args" },
 ];
 
+/** NSelect options（label + 描述 hint） */
+const selectOptions = computed<SelectOption[]>(() =>
+  modeOptions.map((opt) => ({
+    label: opt.label + (opt.recommended ? "（推荐）" : ""),
+    value: opt.value,
+    hint: opt.hint,
+  })),
+);
+
+const selectedHint = computed(
+  () => modeOptions.find((o) => o.value === currentMode.value)?.hint ?? "",
+);
+
 async function onChange(mode: LaunchMode) {
   if (mode === currentMode.value) return;
 
   // 运行中切换需确认
   if (processStore.isAlive) {
-    const ok = await confirm.warn(
+    const ok = await showWarn(
       "切换运行模式",
       "ComfyUI 正在运行，切换模式将先停止当前进程，是否继续？",
     );
     if (!ok) return;
     try {
       await processStore.stop();
-      // 等待进程完全停止（事件订阅会更新 status）
-      // 这里仅等待后端响应，不轮询
     } catch (e) {
       toast.error("停止失败", e);
       return;
@@ -68,11 +79,32 @@ async function onChange(mode: LaunchMode) {
     await configStore.update({
       launch: { mode },
     });
-    toast.success(`运行模式已切换为：${modeOptions.find((o) => o.value === mode)?.label}`);
+    toast.success(
+      "运行模式已切换为：" + (modeOptions.find((o) => o.value === mode)?.label || mode),
+    );
   } catch (e) {
     toast.error("配置更新失败", e);
   }
 }
+
+const renderLabel = (option: SelectOption) => {
+  const opt = modeOptions.find((o) => o.value === option.value);
+  return h(
+    "div",
+    { class: "mode-select-row" },
+    [
+      h("span", { class: "mode-select-label" }, String(option.label)),
+      opt?.recommended
+        ? h(
+            NTag,
+            { size: "tiny", type: "success", class: "mode-select-tag" },
+            { default: () => "推荐" },
+          )
+        : null,
+      h("span", { class: "mode-select-hint" }, String(option.hint || "")),
+    ].filter(Boolean),
+  );
+};
 </script>
 
 <template>
@@ -81,31 +113,20 @@ async function onChange(mode: LaunchMode) {
       <span class="header-title">⚙️ 运行模式</span>
     </template>
 
-    <NRadioGroup
-      :value="currentMode || undefined"
-      @update:value="onChange"
-    >
-      <NSpace vertical :size="8">
-        <div
-          v-for="opt in modeOptions"
-          :key="opt.value"
-          class="mode-option"
-        >
-          <NRadio :value="opt.value">
-            <span class="mode-label">{{ opt.label }}</span>
-            <NTag
-              v-if="opt.recommended"
-              size="tiny"
-              type="success"
-              class="recommend-tag"
-            >
-              推荐
-            </NTag>
-          </NRadio>
-          <span class="mode-hint">{{ opt.hint }}</span>
-        </div>
-      </NSpace>
-    </NRadioGroup>
+    <div class="mode-select-wrapper">
+      <NSelect
+        :value="currentMode || undefined"
+        :options="selectOptions"
+        :render-label="renderLabel"
+        placeholder="选择运行模式"
+        size="medium"
+        @update:value="onChange"
+      />
+    </div>
+
+    <div v-if="selectedHint" class="mode-current-hint">
+      当前参数：<code>{{ selectedHint }}</code>
+    </div>
 
     <div class="mode-tip">
       ℹ 运行模式决定 ComfyUI 加载模型时的显存策略；
@@ -123,25 +144,22 @@ async function onChange(mode: LaunchMode) {
   font-weight: 600;
 }
 
-.mode-option {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 4px 0;
+.mode-select-wrapper {
+  margin-bottom: 8px;
 }
 
-.mode-label {
-  font-weight: 500;
-}
-
-.recommend-tag {
-  margin-left: 6px;
-}
-
-.mode-hint {
-  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+.mode-current-hint {
+  margin-top: 4px;
   font-size: 12px;
   color: var(--app-text-muted, #999);
+}
+
+.mode-current-hint code {
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  background: var(--app-bg-soft, rgba(127, 127, 127, 0.05));
+  padding: 2px 6px;
+  border-radius: 3px;
+  color: var(--app-text-default, #555);
 }
 
 .mode-tip {
@@ -150,6 +168,32 @@ async function onChange(mode: LaunchMode) {
   background: var(--app-bg-soft, rgba(127, 127, 127, 0.05));
   border-radius: 4px;
   font-size: 12px;
+  color: var(--app-text-muted, #999);
+}
+
+/* NSelect 自定义下拉项 */
+:deep(.mode-select-row) {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+:deep(.mode-select-label) {
+  font-weight: 500;
+}
+
+:deep(.mode-select-tag) {
+  font-size: 10px;
+  padding: 0 4px;
+  height: 16px;
+  line-height: 16px;
+}
+
+:deep(.mode-select-hint) {
+  margin-left: auto;
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
   color: var(--app-text-muted, #999);
 }
 </style>
