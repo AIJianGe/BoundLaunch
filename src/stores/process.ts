@@ -13,6 +13,7 @@
  * - `process_stopped`：状态 → Stopped / Crashed
  * - `stale_process_detected`：遗留进程检测（前端弹窗确认是否强杀）
  * - `log`：实时日志行（追加到 logBuffer）
+ * - `app_exiting` / `app_exited`：F24 退出流程事件
  *
  * 使用方式：
  * ```ts
@@ -20,6 +21,7 @@
  * await store.subscribe(); // App.vue onMounted 调用一次
  * await store.start();      // 启动 ComfyUI
  * await store.stop();       // 停止 ComfyUI
+ * store.setExiting(true);   // F24 退出流程标记（启动页按钮置灰）
  * ```
  */
 
@@ -33,7 +35,7 @@ import {
   processKillStale,
 } from "@/api/process";
 import { listen, type UnlistenFn } from "@/api";
-import type { ProcessStatus } from "@/api/types";
+import type { ProcessStatus, ShutdownReason } from "@/api/types";
 
 /** 前端日志缓冲最大容量（超出自动剔除最旧） */
 const MAX_LOG_BUFFER = 1000;
@@ -52,6 +54,10 @@ export const useProcessStore = defineStore("process", () => {
   const error = ref<string | null>(null);
   const logBuffer = ref<string[]>([]);
   const staleProcess = ref<StaleProcessInfo | null>(null);
+  /** F24 退出中标记（用于启动页按钮 disabled + spinner + 「正在退出...」） */
+  const isExiting = ref(false);
+  /** F24 退出原因（来自 AppExiting 事件载荷） */
+  const exitingReason = ref<ShutdownReason | null>(null);
 
   const unlisteners: UnlistenFn[] = [];
 
@@ -150,6 +156,22 @@ export const useProcessStore = defineStore("process", () => {
   }
 
   /**
+   * F24 退出流程：设置退出中标记
+   *
+   * 启动页按钮据此 disabled + 显示 spinner + 「正在退出...」
+   *
+   * @param exiting true=进入退出态 / false=退出退出态（兜底，正常流程中 app.exit 后进程已终止）
+   */
+  function setExiting(exiting: boolean, reason?: ShutdownReason) {
+    isExiting.value = exiting;
+    if (exiting && reason) {
+      exitingReason.value = reason;
+    } else if (!exiting) {
+      exitingReason.value = null;
+    }
+  }
+
+  /**
    * 订阅后端事件
    *
    * 应在应用启动时（App.vue onMounted）调用一次。
@@ -181,6 +203,15 @@ export const useProcessStore = defineStore("process", () => {
       await listen<StaleProcessInfo>("stale_process_detected", (e) => {
         staleProcess.value = e.payload;
       }),
+      // F24 退出流程事件
+      await listen<{ reason: ShutdownReason }>("app_exiting", (e) => {
+        console.info("[processStore] app_exiting", e.payload);
+        setExiting(true, e.payload.reason);
+      }),
+      await listen<void>("app_exited", () => {
+        console.info("[processStore] app_exited");
+        // 不重置 isExiting（后端即将 app.exit，前端保持显示）
+      }),
     );
 
     // 订阅后立即拉取一次真实状态（防止错过启动期间的事件）
@@ -204,6 +235,8 @@ export const useProcessStore = defineStore("process", () => {
     error,
     logBuffer,
     staleProcess,
+    isExiting,
+    exitingReason,
     // getters
     isRunning,
     isStarting,
@@ -221,6 +254,7 @@ export const useProcessStore = defineStore("process", () => {
     clearLogs,
     killStale,
     dismissStale,
+    setExiting,
     subscribe,
     unsubscribe,
   };

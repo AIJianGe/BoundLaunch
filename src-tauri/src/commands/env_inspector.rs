@@ -8,11 +8,15 @@ use std::path::PathBuf;
 
 use crate::app_state::AppState;
 use crate::config::Config;
-use crate::env_inspector::models::{DependencyInfo, EnvInfo, TorchInfo};
+use crate::env_inspector::models::{DependencyInfo, EnvSnapshot, TorchInfo};
 use crate::env_inspector::readiness::{self, ReadinessResult};
 use tauri::State;
 
 /// 完整环境探查（前端进入启动页 / 点击刷新时调用）
+///
+/// v2.13 起返回扁平 `EnvSnapshot`（对应前端 `EnvInfo` 类型），不再返回嵌套 `EnvInfo`。
+/// 之前返回嵌套结构时前端读不到 `torch_installed` / `comfyui_cloned` 等扁平字段，
+/// 导致首页 PYTORCH 等标签错误显示「未安装」。
 ///
 /// 前端示例：
 /// ```ts
@@ -21,7 +25,7 @@ use tauri::State;
 ///
 /// 注：venv_path 与 comfyui_root 由后端从 Config 读取，前端无需传入
 #[tauri::command]
-pub async fn env_inspect(state: State<'_, AppState>) -> Result<EnvInfo, String> {
+pub async fn env_inspect(state: State<'_, AppState>) -> Result<EnvSnapshot, String> {
     let config = state.config.get();
     let venv_path = config.paths.venv_path.clone();
     let comfyui_root = config.paths.comfyui_root.clone();
@@ -31,7 +35,7 @@ pub async fn env_inspect(state: State<'_, AppState>) -> Result<EnvInfo, String> 
 
     state
         .env_inspector
-        .inspect_all(&venv, &comfyui)
+        .inspect_snapshot(&venv, &comfyui)
         .await
         .map_err(|e| e.to_string())
 }
@@ -50,17 +54,28 @@ pub async fn env_probe_torch(state: State<'_, AppState>) -> Result<TorchInfo, St
 }
 
 /// 仅列出关键依赖（前端依赖列表刷新用）
+///
+/// v2.10 起命令层容错：探查失败时返回空列表 + warn 日志，不阻塞前端流程。
+///
+/// 原因：onboarding 第 4 步 `createVenv` → `refresh()` → `Promise.all([...,
+/// envListDependencies()])`，任一失败即整体失败，导致「venv 已创建但前端误报失败」。
+/// 依赖列表失败本身不阻塞 onboarding 流程（torch 已装就能进入下一步），容错更合理。
 #[tauri::command]
 pub async fn env_list_dependencies(state: State<'_, AppState>) -> Result<Vec<DependencyInfo>, String> {
     let config = state.config.get();
     let venv = PathBuf::from(&config.paths.venv_path);
     let comfyui = PathBuf::from(&config.paths.comfyui_root);
 
-    state
-        .env_inspector
-        .inspect_dependencies(&venv, &comfyui)
-        .await
-        .map_err(|e| e.to_string())
+    match state.env_inspector.inspect_dependencies(&venv, &comfyui).await {
+        Ok(deps) => Ok(deps),
+        Err(e) => {
+            tracing::warn!(
+                error = %e, venv = ?venv,
+                "env_list_dependencies failed, returning empty list (non-blocking)"
+            );
+            Ok(vec![])
+        }
+    }
 }
 
 /// 主动失效缓存（前端用户手动刷新时调用）

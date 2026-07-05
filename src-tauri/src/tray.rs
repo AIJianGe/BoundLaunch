@@ -82,8 +82,14 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
             None
         }
         MENU_ID_QUIT => {
-            // 直接退出应用（前端如需做清理工作，应在 onCloseRequested 中处理）
-            app.exit(0);
+            // F24 退出流程：托盘「🚪 退出」改为 emit 事件给前端
+            // 由前端 useExitConfirm → useShutdown 统一调度 shutdown_all
+            // （不走 app.exit(0) 避免 python worker 残留）
+            let _ = app.emit(
+                "tray_action",
+                serde_json::json!({ "action": "quit" }),
+            );
+            tracing::info!("tray menu: quit clicked, emit tray_action to frontend");
             None
         }
         _ => None,

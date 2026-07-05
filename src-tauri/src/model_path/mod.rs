@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::config::{ModelsConfig, ModelsMode};
+use crate::config::{ConfigService, ModelsConfig, ModelsMode};
 
 pub mod models;
 pub mod scanner;
@@ -62,11 +62,12 @@ pub fn validate_root(path: &Path) -> Result<(), ModelPathError> {
 /// - **单例**：通过 `AppState` 全局共享（Arc 包裹）
 /// - **Mutex**：`yaml_lock` 串行化 yaml 写操作（generate / remove 互斥）
 /// - **RwLock**：`scan_cache` 多读单写，提升扫描并发性能
+///
+/// **路径热加载**：`comfyui_root` 每次需要时从 ConfigService 读取，
+/// 用户在设置页修改 `comfyui_root` 后无需重启即可生效。
 pub struct ModelPathService {
-    /// ComfyUI 根目录（用于 RootSameAsComfyui 校验）
-    comfyui_root: PathBuf,
-    /// `<comfyui_root>/extra_model_paths.yaml`
-    yaml_path: PathBuf,
+    /// Config 共享引用（提供 `paths.comfyui_root` 热读取）
+    config: Arc<ConfigService>,
     /// 扫描缓存（60s TTL + root mtime 检查）
     scan_cache: Arc<ScanCacheStore>,
     /// yaml 写入互斥锁（generate / remove 串行化）
@@ -76,17 +77,26 @@ pub struct ModelPathService {
 impl ModelPathService {
     /// 创建服务实例
     ///
-    /// `comfyui_root` 用于：
-    /// 1. 拼接 `extra_model_paths.yaml` 路径
+    /// `config` 用于：
+    /// 1. 拼接 `extra_model_paths.yaml` 路径（<comfyui_root>/extra_model_paths.yaml）
     /// 2. 校验 custom_root 是否与之重复
-    pub fn new(comfyui_root: PathBuf) -> Self {
-        let yaml_path = comfyui_root.join("extra_model_paths.yaml");
+    /// 3. 路径热加载（修改 config 后立即生效）
+    pub fn new(config: Arc<ConfigService>) -> Self {
         Self {
-            comfyui_root,
-            yaml_path,
+            config,
             scan_cache: Arc::new(new_scan_cache()),
             yaml_lock: Mutex::new(()),
         }
+    }
+
+    /// 读取当前 comfyui_root（每次调用读最新 config，无锁原子）
+    fn current_comfyui_root(&self) -> PathBuf {
+        self.config.get().paths.comfyui_root.clone()
+    }
+
+    /// 当前 yaml 文件路径（每次计算：<current_comfyui_root>/extra_model_paths.yaml）
+    fn current_yaml_path(&self) -> PathBuf {
+        self.current_comfyui_root().join("extra_model_paths.yaml")
     }
 
     /// 生成 `extra_model_paths.yaml`
@@ -117,21 +127,23 @@ impl ModelPathService {
 
         // 2. 渲染 yaml 内容（纯函数 - 相同 config 相同输出）
         let content = render_yaml_content(models_config)?;
+        // 在持锁状态下读最新 yaml 路径（防止 config 变更导致前后不一致）
+        let yaml_path = self.current_yaml_path();
         tracing::info!(
-            ?self.yaml_path,
+            ?yaml_path,
             root = ?models_config.custom_root,
             "generating extra_model_paths.yaml"
         );
 
         // 3. 备份用户手动 yaml（launcher 生成的无需备份）
-        let backed_up = backup_user_yaml(&self.yaml_path).await?;
+        let backed_up = backup_user_yaml(&yaml_path).await?;
 
         // 4. 原子写入
-        atomic_write(&self.yaml_path, &content).await?;
+        atomic_write(&yaml_path, &content).await?;
 
-        tracing::info!(?self.yaml_path, ?backed_up, "yaml generated");
+        tracing::info!(?yaml_path, ?backed_up, "yaml generated");
         Ok(GenerateYamlResult {
-            yaml_path: self.yaml_path.clone(),
+            yaml_path,
             backed_up,
             generated_at: chrono::Utc::now(),
         })
@@ -144,21 +156,22 @@ impl ModelPathService {
     /// - 用户手动 yaml → 跳过（不删除）
     pub async fn remove_yaml(&self) -> Result<(), ModelPathError> {
         let _guard = self.yaml_lock.lock().await;
+        let yaml_path = self.current_yaml_path();
 
-        if !self.yaml_path.exists() {
+        if !yaml_path.exists() {
             return Ok(());
         }
 
-        if !is_launcher_generated(&self.yaml_path).await? {
+        if !is_launcher_generated(&yaml_path).await? {
             tracing::warn!(
-                ?self.yaml_path,
+                ?yaml_path,
                 "skipped removal: yaml is not launcher-generated"
             );
             return Ok(());
         }
 
-        tokio::fs::remove_file(&self.yaml_path).await?;
-        tracing::info!(?self.yaml_path, "removed launcher-generated yaml");
+        tokio::fs::remove_file(&yaml_path).await?;
+        tracing::info!(?yaml_path, "removed launcher-generated yaml");
         Ok(())
     }
 
@@ -181,7 +194,8 @@ impl ModelPathService {
     /// 重复时调用方应向用户显示警告（但允许继续）。
     pub fn is_same_as_comfyui(&self, custom_root: &Path) -> bool {
         // 标准化比较（不解析符号链接，避免 IO）
-        let a = self.comfyui_root.canonicalize().unwrap_or_else(|_| self.comfyui_root.clone());
+        let comfyui_root = self.current_comfyui_root();
+        let a = comfyui_root.canonicalize().unwrap_or_else(|_| comfyui_root);
         let b = custom_root.canonicalize().unwrap_or_else(|_| custom_root.to_path_buf());
         a == b
     }
@@ -208,7 +222,8 @@ impl ModelPathService {
     ///
     /// 仅读首行（< 5ms）。
     pub async fn is_launcher_generated(&self) -> Result<bool, ModelPathError> {
-        is_launcher_generated(&self.yaml_path).await
+        let yaml_path = self.current_yaml_path();
+        is_launcher_generated(&yaml_path).await
     }
 
     /// 启动前确保 yaml 状态正确（被 ProcessLauncher 调用）
@@ -240,19 +255,33 @@ impl ModelPathService {
     }
 
     /// yaml 文件路径（供调试 / 测试）
-    pub fn yaml_path(&self) -> &Path {
-        &self.yaml_path
+    pub fn yaml_path(&self) -> PathBuf {
+        self.current_yaml_path()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConfigService;
+    use crate::event_bus::EventBus;
 
-    fn make_service(tmp: &std::path::Path) -> ModelPathService {
+    /// 构造测试用 ModelPathService（路径热加载版）
+    ///
+    /// 与 `new(config)` 一致，但额外用 `config.update()` 把 `comfyui_root` 指向临时目录。
+    async fn make_service(tmp: &std::path::Path) -> ModelPathService {
         let comfyui_root = tmp.join("comfyui");
         std::fs::create_dir_all(&comfyui_root).unwrap();
-        ModelPathService::new(comfyui_root)
+        let event_bus = EventBus::new();
+        let config = std::sync::Arc::new(ConfigService::new_for_test(event_bus));
+        config
+            .update(|cfg| {
+                cfg.paths.comfyui_root = comfyui_root;
+                Ok(())
+            })
+            .await
+            .expect("set comfyui_root");
+        ModelPathService::new(config)
     }
 
     fn custom_root_config(root: &Path) -> ModelsConfig {
@@ -266,7 +295,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_yaml_creates_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         let models_root = tmp.path().join("models");
         std::fs::create_dir_all(&models_root).unwrap();
@@ -281,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_yaml_overwrites_launcher_generated() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         // 第一次生成
         let models_root_1 = tmp.path().join("models1");
@@ -298,18 +327,18 @@ mod tests {
         assert!(r2.backed_up.is_none(), "launcher 生成的 yaml 覆盖不应备份");
 
         // 验证内容是新的 root
-        let content = tokio::fs::read_to_string(&svc.yaml_path).await.unwrap();
+        let content = tokio::fs::read_to_string(&svc.yaml_path()).await.unwrap();
         assert!(content.contains("models2/checkpoints"));
     }
 
     #[tokio::test]
     async fn test_generate_yaml_backs_up_user_yaml() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         // 用户手动 yaml
         let user_yaml = "# user manual yaml\ncheckpoints: /old/data\n";
-        tokio::fs::write(&svc.yaml_path, user_yaml).await.unwrap();
+        tokio::fs::write(&svc.yaml_path(), user_yaml).await.unwrap();
 
         let models_root = tmp.path().join("models");
         std::fs::create_dir_all(&models_root).unwrap();
@@ -331,7 +360,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_yaml_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         // 不存在时返回 Ok
         svc.remove_yaml().await.unwrap();
@@ -341,10 +370,10 @@ mod tests {
         std::fs::create_dir_all(&models_root).unwrap();
         let cfg = custom_root_config(&models_root);
         svc.generate_yaml(&cfg).await.unwrap();
-        assert!(svc.yaml_path.exists());
+        assert!(svc.yaml_path().exists());
 
         svc.remove_yaml().await.unwrap();
-        assert!(!svc.yaml_path.exists());
+        assert!(!svc.yaml_path().exists());
 
         // 重复删除仍 Ok
         svc.remove_yaml().await.unwrap();
@@ -353,21 +382,21 @@ mod tests {
     #[tokio::test]
     async fn test_remove_yaml_skips_user_yaml() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         // 用户手动 yaml
-        tokio::fs::write(&svc.yaml_path, "# user yaml\ncheckpoints: /x\n")
+        tokio::fs::write(&svc.yaml_path(), "# user yaml\ncheckpoints: /x\n")
             .await
             .unwrap();
 
         svc.remove_yaml().await.unwrap();
-        assert!(svc.yaml_path.exists(), "用户 yaml 不应被删除");
+        assert!(svc.yaml_path().exists(), "用户 yaml 不应被删除");
     }
 
     #[tokio::test]
     async fn test_validate_root_not_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
         let result = svc.validate_root(Path::new("/nonexistent/path")).await;
         assert!(matches!(result, Err(ModelPathError::RootNotFound(_))));
     }
@@ -375,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_root_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
         let result = svc.validate_root(Path::new("")).await;
         assert!(matches!(result, Err(ModelPathError::EmptyRoot)));
     }
@@ -383,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_root_ok() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
         let dir = tmp.path().join("models");
         std::fs::create_dir_all(&dir).unwrap();
         svc.validate_root(&dir).await.unwrap();
@@ -394,7 +423,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let comfyui_root = tmp.path().join("comfyui");
         std::fs::create_dir_all(&comfyui_root).unwrap();
-        let svc = ModelPathService::new(comfyui_root.clone());
+        let svc = make_service(tmp.path()).await;
 
         assert!(svc.is_same_as_comfyui(&comfyui_root));
         assert!(!svc.is_same_as_comfyui(&tmp.path().join("other")));
@@ -403,14 +432,14 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_yaml_for_launch_default_mode() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         // 先生成 launcher yaml
         let models_root = tmp.path().join("models");
         std::fs::create_dir_all(&models_root).unwrap();
         let cfg_custom = custom_root_config(&models_root);
         svc.generate_yaml(&cfg_custom).await.unwrap();
-        assert!(svc.yaml_path.exists());
+        assert!(svc.yaml_path().exists());
 
         // 切回 default 模式 → 删除 launcher yaml
         let cfg_default = ModelsConfig {
@@ -419,16 +448,16 @@ mod tests {
             advanced: Default::default(),
         };
         svc.ensure_yaml_for_launch(&cfg_default).await.unwrap();
-        assert!(!svc.yaml_path.exists(), "default 模式应删除 launcher yaml");
+        assert!(!svc.yaml_path().exists(), "default 模式应删除 launcher yaml");
     }
 
     #[tokio::test]
     async fn test_ensure_yaml_for_launch_default_keeps_user_yaml() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         // 用户手动 yaml
-        tokio::fs::write(&svc.yaml_path, "# user yaml\ncheckpoints: /x\n")
+        tokio::fs::write(&svc.yaml_path(), "# user yaml\ncheckpoints: /x\n")
             .await
             .unwrap();
 
@@ -438,27 +467,27 @@ mod tests {
             advanced: Default::default(),
         };
         svc.ensure_yaml_for_launch(&cfg_default).await.unwrap();
-        assert!(svc.yaml_path.exists(), "用户 yaml 应保留");
+        assert!(svc.yaml_path().exists(), "用户 yaml 应保留");
     }
 
     #[tokio::test]
     async fn test_ensure_yaml_for_launch_custom_mode() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         let models_root = tmp.path().join("models");
         std::fs::create_dir_all(&models_root).unwrap();
         let cfg = custom_root_config(&models_root);
 
         svc.ensure_yaml_for_launch(&cfg).await.unwrap();
-        assert!(svc.yaml_path.exists());
+        assert!(svc.yaml_path().exists());
         assert!(svc.is_launcher_generated().await.unwrap());
     }
 
     #[tokio::test]
     async fn test_ensure_yaml_for_launch_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         let models_root = tmp.path().join("models");
         std::fs::create_dir_all(&models_root).unwrap();
@@ -466,10 +495,10 @@ mod tests {
 
         // 多次调用结果一致
         svc.ensure_yaml_for_launch(&cfg).await.unwrap();
-        let content1 = tokio::fs::read_to_string(&svc.yaml_path).await.unwrap();
+        let content1 = tokio::fs::read_to_string(&svc.yaml_path()).await.unwrap();
 
         svc.ensure_yaml_for_launch(&cfg).await.unwrap();
-        let content2 = tokio::fs::read_to_string(&svc.yaml_path).await.unwrap();
+        let content2 = tokio::fs::read_to_string(&svc.yaml_path()).await.unwrap();
 
         // 时间戳在 header 中，但子目录映射行必须一致
         let body1: Vec<&str> = content1.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).collect();

@@ -132,17 +132,83 @@ pub async fn terminate_process(pid: u32, force: bool) -> std::io::Result<()> {
     }
 }
 
-/// 完整停止流程：interrupt → SIGTERM → SIGKILL
+/// F24 进程组终止
+///
+/// 与 `terminate_process` 的区别：终止**整个进程组**（含 Python worker 子进程），
+/// 避免 launcher 退出后 python worker 残留。
+///
+/// 平台差异：
+/// - **Unix**：`spawn_process` 时 `setsid()` 让 ComfyUI 成为新进程组头（pgid == pid），
+///   终止时用 `kill -<pgid>` 向整个进程组发信号
+///   - pgid 通过 `getpgid(pid)` 派生，失败（ESRCH）时 fallback 到单进程 `terminate_process`
+/// - **Windows**：`CREATE_NEW_PROCESS_GROUP` + 现有 `taskkill /T` 已终止进程树，
+///   所以 Windows 直接调用 `terminate_process(pid, force)`（保留 /T 行为）
+///
+/// `force=true` 时使用强制终止（SIGKILL / taskkill /F）。
+pub async fn terminate_process_group(pid: u32, force: bool) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        // Windows 进程组 = 进程树，taskkill /T 已覆盖
+        // 直接复用 terminate_process（其已带 /T 标志）
+        return terminate_process(pid, force).await;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::{getpgid, Pid};
+
+        let nix_pid = Pid::from_raw(pid as i32);
+
+        // 尝试获取进程组 ID（ComfyUI 启动时 setsid 后 pgid == pid）
+        let pgid = match getpgid(nix_pid) {
+            Ok(p) => p,
+            Err(nix::errno::Errno::ESRCH) => {
+                // 进程已退出：幂等返回 Ok
+                tracing::debug!(pid, "terminate_process_group: process already exited (ESRCH)");
+                return Ok(());
+            }
+            Err(e) => {
+                // 其他错误（如 EPERM 权限不足）：fallback 到单进程终止
+                tracing::warn!(pid, error = %e, "getpgid failed, falling back to single-process terminate");
+                return terminate_process(pid, force).await;
+            }
+        };
+
+        let sig = if force { Signal::SIGKILL } else { Signal::SIGTERM };
+
+        // kill(-pgid, sig)：负号 = 进程组（系统调用语义）
+        match kill(pgid, sig) {
+            Ok(()) => {
+                tracing::debug!(pid, ?pgid, force, "process group kill signal sent");
+                Ok(())
+            }
+            Err(nix::errno::Errno::ESRCH) => {
+                tracing::debug!(pid, "process group already exited");
+                Ok(())
+            }
+            Err(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("kill(-pgid={}, {:?}) failed: {}", pgid, sig, e),
+            )),
+        }
+    }
+}
+
+/// 完整停止流程：interrupt → 进程组 SIGTERM → 进程组 SIGKILL
 ///
 /// 返回子进程退出状态。
 ///
 /// # 流程
 /// 1. POST /interrupt（best-effort，2s 超时）
-/// 2. SIGTERM（terminate_process force=false）
+/// 2. 进程组 SIGTERM（`terminate_process_group` force=false）
 /// 3. wait child.wait() 5s
-/// 4. 仍存活 → SIGKILL（terminate_process force=true）
+/// 4. 仍存活 → 进程组 SIGKILL（`terminate_process_group` force=true）
 /// 5. wait child.wait() 2s
 /// 6. 仍存活 → 返回 `StopFailed`
+///
+/// F24 进程组隔离配套：步骤 2/4 用 `terminate_process_group` 而非单进程 `terminate_process`，
+/// 确保 ComfyUI + 其 Python worker 子进程被整体终止，避免 launcher 退出后 python 残留。
 pub async fn stop_with_grace(
     mut child: Child,
     pid: u32,
@@ -151,10 +217,10 @@ pub async fn stop_with_grace(
     // 阶段 1：POST /interrupt（best-effort）
     post_interrupt(port).await;
 
-    // 阶段 2：SIGTERM（force=false）
-    tracing::info!(pid, "sending SIGTERM");
-    if let Err(e) = terminate_process(pid, false).await {
-        tracing::warn!(pid, error = %e, "SIGTERM failed, will try SIGKILL");
+    // 阶段 2：进程组 SIGTERM（force=false）
+    tracing::info!(pid, "sending SIGTERM to process group");
+    if let Err(e) = terminate_process_group(pid, false).await {
+        tracing::warn!(pid, error = %e, "process group SIGTERM failed, will try SIGKILL");
     }
 
     // 阶段 3：wait 5s
@@ -173,10 +239,10 @@ pub async fn stop_with_grace(
         }
     }
 
-    // 阶段 4：SIGKILL（force=true）
-    tracing::info!(pid, "sending SIGKILL");
-    if let Err(e) = terminate_process(pid, true).await {
-        tracing::error!(pid, error = %e, "SIGKILL failed");
+    // 阶段 4：进程组 SIGKILL（force=true）
+    tracing::info!(pid, "sending SIGKILL to process group");
+    if let Err(e) = terminate_process_group(pid, true).await {
+        tracing::error!(pid, error = %e, "process group SIGKILL failed");
         return Err(ProcessError::StopFailed);
     }
 

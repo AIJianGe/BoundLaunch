@@ -10,19 +10,29 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::app_state::AppState;
 use crate::config::CudaVersion;
-use crate::python_env::models::{CompatibilityReport, EnvInfo};
+use crate::python_env::models::{CompatibilityReport, PythonEnvStatus};
 
-/// 查询当前 venv 状态
+/// 查询当前 venv 状态（v2.13）
+///
+/// 返回前端 `PythonEnvStatus` 接口对应的完整结构：
+/// uv 状态（uv_installed / uv_path / uv_version）+ venv 状态（venv_exists /
+/// venv_python_version / venv_torch_installed / venv_torch_version /
+/// venv_torch_cuda）。
+///
+/// 之前返回 `EnvInfo` 时（v2.10 之前），前端组件 `PythonVersionPanel.vue`
+/// 读 `envStore.pythonEnvStatus?.venv_python_version` 永远为 `undefined`，
+/// 因为 `EnvInfo` 不含 `venv_python_version` 字段 → 显示「未配置」。
+///
+/// 所有探测都是只读（不修改 venv），最坏情况 5-30s（verify_venv 的 probe_torch 90s 超时）。
 #[tauri::command]
-pub async fn env_status(state: State<'_, AppState>) -> Result<EnvInfo, String> {
+pub async fn env_status(state: State<'_, AppState>) -> Result<PythonEnvStatus, String> {
     let config = state.config.get();
     let venv_path = PathBuf::from(&config.paths.venv_path);
 
-    state
+    Ok(state
         .python_env
-        .verify_venv(&venv_path)
-        .await
-        .map_err(|e| e.to_string())
+        .get_status(&venv_path)
+        .await)
 }
 
 /// 检查 uv 是否可用
@@ -71,7 +81,7 @@ pub async fn env_install_torch(
 /// 切换 Python 版本
 #[tauri::command]
 pub async fn env_switch_python(
-    new_version: String,
+    python_version: String,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
@@ -88,7 +98,7 @@ pub async fn env_switch_python(
 
     let result = state
         .python_env
-        .switch_python_version(&new_version, &config, tx)
+        .switch_python_version(&python_version, &config, tx)
         .await
         .map_err(|e| e.to_string());
 

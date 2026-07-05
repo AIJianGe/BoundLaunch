@@ -10,14 +10,17 @@
 //! - 进程状态机管理
 //! - 日志环形缓冲（保留最近 N 行供前端查询历史）
 //! - 崩溃恢复（PID 文件 + 进程身份校验）
+//! - **F24 退出流程**（ShutdownCoordinator，详见 `shutdown.rs`）
+//! - 进程组隔离（spawn 时 setsid / CREATE_NEW_PROCESS_GROUP；终止时用进程组）
 //!
 //! ## 设计模式
 //! - **State**：ProcessStatus 状态机
 //! - **Decorator**：LogPipeline 在 stdout/stderr 流上叠加聚合 / 持久化
-//! - **Adapter**：terminate_process 跨平台终止
-//! - **Template Method**：start 流程的步骤序列固定
+//! - **Adapter**：terminate_process + terminate_process_group 跨平台终止
+//! - **Template Method**：start / shutdown 5 步事务的步骤序列固定
 //! - **Singleton**：通过 AppState 全局共享
 //! - **Facade**：Tauri commands 层封装服务接口
+//! - **Reentrant Guard**：ShutdownCoordinator AtomicBool 防重入
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,7 +41,7 @@ use crate::python_env::PythonEnvService;
 
 use self::command_builder::build_command;
 use self::log_pipeline::{DEFAULT_BUFFER_CAPACITY, LogPipeline};
-use self::models::{HealthInfo, LaunchArgs, ProcessStatus, StopReason};
+use self::models::{HealthInfo, LaunchArgs, ProcessStatus, ShutdownReport, StopReason};
 use self::start::{
     check_port_available, spawn_health_check, spawn_process, spawn_stderr_reader,
     spawn_stdout_reader, verify_preconditions, venv_python_path, write_pid_file,
@@ -54,9 +57,13 @@ pub mod command_builder;
 pub mod log_pipeline;
 pub mod models;
 pub mod ring_buffer;
+pub mod shutdown;
 pub mod start;
 pub mod state_machine;
 pub mod stop;
+
+// F24 公开 re-export：让 AppState / commands 等可以引用 ShutdownCoordinator
+pub use self::shutdown::ShutdownCoordinator;
 
 /// 监控任务轮询间隔（try_wait 检测自然退出）
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -86,9 +93,7 @@ struct Inner {
     log_store: Arc<LogStoreService>,
     config: Arc<ConfigService>,
 
-    // 路径
-    comfyui_root: PathBuf,
-    venv_path: PathBuf,
+    // 路径（仅 pid_file_path 保留固定路径；comfyui_root/venv_path 热加载）
     pid_file_path: PathBuf,
 }
 
@@ -103,13 +108,15 @@ pub struct ProcessLauncherService {
 
 impl ProcessLauncherService {
     /// 构造
+    ///
+    /// **路径热加载**：`comfyui_root` / `venv_path` 每次需要时从 ConfigService
+    /// 读取最新的 `paths.comfyui_root` / `paths.venv_path`，实现"修改 config 后无需重启立即生效"。
+    /// `pid_file_path` 属于 app data 目录状态，构造时固定一次。
     pub fn new(
         python_env: Arc<PythonEnvService>,
         model_path: Arc<ModelPathService>,
         log_store: Arc<LogStoreService>,
         config: Arc<ConfigService>,
-        comfyui_root: PathBuf,
-        venv_path: PathBuf,
         data_dir: PathBuf,
     ) -> Self {
         let pid_file_path = data_dir.join(PID_FILE_NAME);
@@ -127,11 +134,19 @@ impl ProcessLauncherService {
                 model_path,
                 log_store,
                 config,
-                comfyui_root,
-                venv_path,
                 pid_file_path,
             }),
         }
+    }
+
+    /// 读取当前 comfyui_root（每次调用读最新 config）
+    fn current_comfyui_root(&self) -> PathBuf {
+        self.inner.config.get().paths.comfyui_root.clone()
+    }
+
+    /// 读取当前 venv_path（每次调用读最新 config）
+    fn current_venv_path(&self) -> PathBuf {
+        self.inner.config.get().paths.venv_path.clone()
     }
 
     /// 启动 ComfyUI 进程
@@ -171,11 +186,11 @@ impl ProcessLauncherService {
         *self.inner.state.write() = next.clone();
         emit_status(&app, &next, "process_starting");
 
-        // 5. verify_preconditions
+        // 5. verify_preconditions（路径热加载：读最新 venv + comfyui_root）
         let _env_info = match verify_preconditions(
             &self.inner.python_env,
-            &self.inner.venv_path,
-            &self.inner.comfyui_root,
+            &self.current_venv_path(),
+            &self.current_comfyui_root(),
         )
         .await
         {
@@ -211,13 +226,13 @@ impl ProcessLauncherService {
 
         // 8. build_command + spawn
         let cmd_args = build_command(&args);
-        let venv_python = venv_python_path(&self.inner.venv_path);
+        let venv_python = venv_python_path(&self.current_venv_path());
         tracing::info!(
             ?venv_python,
             ?cmd_args,
             "spawning ComfyUI process"
         );
-        let mut child = match spawn_process(&venv_python, &self.inner.comfyui_root, cmd_args) {
+        let mut child = match spawn_process(&venv_python, &self.current_comfyui_root(), cmd_args) {
             Ok(c) => c,
             Err(e) => {
                 *self.inner.state.write() = ProcessStatus::Stopped;
@@ -296,6 +311,21 @@ impl ProcessLauncherService {
     /// 幂等：未运行直接返回 Ok
     pub async fn stop(&self, app: AppHandle) -> Result<(), ProcessError> {
         stop_impl(&self.inner, &app, StopReason::UserRequested).await
+    }
+
+    /// 停止 ComfyUI 进程（带 reason，泛型 Runtime 版本）
+    ///
+    /// F24 退出流程专用：`ShutdownCoordinator` 调此方法传 `StopReason::Shutdown`，
+    /// 与 `stop()` 行为一致（流程相同），但保留 reason 用于日志/审计。
+    /// 使用泛型 R 兼容 ShutdownCoordinator 的 R: Runtime 调用。
+    ///
+    /// 幂等：未运行直接返回 Ok
+    pub async fn stop_with_reason<R: tauri::Runtime>(
+        &self,
+        reason: StopReason,
+        app: tauri::AppHandle<R>,
+    ) -> Result<(), ProcessError> {
+        stop_impl_generic(&self.inner, &app, reason).await
     }
 
     /// 查询当前状态
@@ -446,6 +476,15 @@ async fn stop_impl(
     app: &AppHandle,
     reason: StopReason,
 ) -> Result<(), ProcessError> {
+    stop_impl_generic(inner, app, reason).await
+}
+
+/// 停止流程实现（泛型 Runtime 版本，F24 ShutdownCoordinator 调用）
+async fn stop_impl_generic<R: tauri::Runtime>(
+    inner: &Arc<Inner>,
+    app: &tauri::AppHandle<R>,
+    reason: StopReason,
+) -> Result<(), ProcessError> {
     let _lock = inner.instance_lock.lock().await;
 
     // refresh（可能与 monitor 同时检测到退出，state 已 terminal 时直接返回）
@@ -492,7 +531,7 @@ async fn stop_impl(
     // transition to Stopping
     let next = transition_to_stopping(&current, reason.clone())?;
     *inner.state.write() = next.clone();
-    emit_status(app, &next, "process_stopping");
+    emit_status_generic(app, &next, "process_stopping");
 
     // Take child out for stop_with_grace
     let child = inner.child.lock().await.take();
@@ -584,6 +623,15 @@ fn spawn_monitor(inner: Arc<Inner>, app: AppHandle) -> JoinHandle<()> {
 
 /// 辅助：emit 状态变更事件
 fn emit_status(app: &AppHandle, status: &ProcessStatus, event_name: &str) {
+    let _ = app.emit(event_name, status);
+}
+
+/// 泛型 Runtime 版本（F24 ShutdownCoordinator / stop_with_reason 走此路径）
+fn emit_status_generic<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    status: &ProcessStatus,
+    event_name: &str,
+) {
     let _ = app.emit(event_name, status);
 }
 

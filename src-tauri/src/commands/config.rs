@@ -72,6 +72,8 @@ pub async fn config_update(
 
 /// 重置配置为默认
 #[tauri::command]
-pub async fn config_reset(state: State<'_, AppState>) -> Result<(), String> {
-    state.config.reset().await.map_err(|e| e.to_string())
+pub async fn config_reset(state: State<'_, AppState>) -> Result<Config, String> {
+    state.config.reset().await.map_err(|e| e.to_string())?;
+    let guard = state.config.get();
+    Ok((**guard).clone())
 }

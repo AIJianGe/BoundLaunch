@@ -5,7 +5,7 @@
  * 详见 `PR/06-界面设计.md §1 整体布局`
  *
  * 结构：
- * - 左侧：8 项导航（窄边栏 64px，仅图标 + tooltip）
+ * - 左侧：7 项导航（窄边栏 64px，仅图标 + tooltip）
  * - 顶栏：AppHeader（项目名 + 状态指示 + 设置入口）
  * - 内容区：RouterView
  *
@@ -14,10 +14,10 @@
  * 2. 核心版本
  * 3. 插件管理
  * 4. 模型路径
- * 5. 设置
- * 6. 日志
- * 7. 任务进度
- * 8. 关于
+ * 5. 日志
+ * 6. 任务进度
+ * 7. 关于
+ * （设置入口在顶栏右上角 AppHeader）
  *
  * 实现要点：
  * - 使用 NMenu 标准 `icon` + `label` props（NMenu 在 collapsed 状态下会自动管理图标/文字显隐）
@@ -45,7 +45,6 @@ import {
   RefreshCw,
   Puzzle,
   Package,
-  Settings,
   ScrollText,
   BarChart3,
   Info,
@@ -66,7 +65,6 @@ const menus: readonly NavItem[] = [
   { key: "core", label: "核心版本", icon: RefreshCw, path: "/core" },
   { key: "plugins", label: "插件管理", icon: Puzzle, path: "/plugins" },
   { key: "models", label: "模型路径", icon: Package, path: "/models" },
-  { key: "settings", label: "设置", icon: Settings, path: "/settings" },
   { key: "logs", label: "日志", icon: ScrollText, path: "/logs" },
   { key: "tasks", label: "任务进度", icon: BarChart3, path: "/tasks" },
   { key: "about", label: "关于", icon: Info, path: "/about" },

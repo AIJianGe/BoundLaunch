@@ -12,17 +12,20 @@
 //! | `process_status` | 查询当前状态 | - |
 //! | `process_tail_log` | 读取最近 N 行日志 | - |
 //! | `process_kill_stale` | 强制杀死遗留进程 | - |
+//! | `shutdown_all` | F24 退出流程（弹确认 + 联动关闭 ComfyUI + 30s 超时兜底） | `app_exiting` / `app_exited` |
 //!
 //! ## 设计要点
 //! - `process_start` 不接收 LaunchArgs 参数：从 `ConfigService.get().launch` 构造
 //!   这样前端只需调用 `invoke('process_start')`，参数来自用户在设置页保存的配置
 //! - 错误统一序列化为字符串（前端通过 `Err(String)` 接收）
 //! - 状态变更通过事件推送，前端 listen 即可
+//! - `shutdown_all` 触发 F24 5 步事务：防重入 → 广播 AppExiting → 进程组终止 → 资源释放 → app.exit
 
 use tauri::{AppHandle, State};
 
 use crate::app_state::AppState;
-use crate::process_launcher::models::{LaunchArgs, ProcessStatus};
+use crate::event_bus::ShutdownReason;
+use crate::process_launcher::models::{LaunchArgs, ProcessStatus, ShutdownReport};
 
 /// 从 Config 构造 LaunchArgs（运行时快照）
 ///
@@ -159,6 +162,35 @@ pub async fn process_kill_stale(
             tracing::error!(error = %e, pid, "process_kill_stale failed");
             e.to_string()
         })
+}
+
+/// F24 退出流程：联动关闭 ComfyUI + 资源释放 + app.exit
+///
+/// 由前端在弹确认对话框后调用。`ShutdownCoordinator` 内部：
+/// 1. CAS 防重入（多次调用仅首次执行）
+/// 2. 广播 `AppExiting` 事件
+/// 3. 调用 `process_launcher.stop_with_reason(StopReason::Shutdown)` 走进程组终止
+/// 4. 资源释放（500ms）
+/// 5. 广播 `AppExited` + `app.exit(0)`
+///
+/// 30s 总超时兜底：超时时 `std::process::exit(0)` 强制退出。
+///
+/// # 参数
+/// - `reason`: 退出原因（前端从 [WindowClose / TrayQuit / ShortcutCtrlQ / Restart] 中选）
+///
+/// # 返回
+/// `ShutdownReport { comfyui_was_running, stop_elapsed_ms, reason }`
+#[tauri::command]
+pub async fn shutdown_all(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    reason: ShutdownReason,
+) -> Result<ShutdownReport, String> {
+    tracing::info!(?reason, "shutdown_all invoked");
+    state
+        .shutdown_coordinator
+        .shutdown_all(app, reason)
+        .await
 }
 
 #[cfg(test)]

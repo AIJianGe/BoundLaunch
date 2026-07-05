@@ -14,7 +14,7 @@ pub mod models;
 pub mod readiness;
 pub mod scripts;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde_json::Value;
@@ -25,23 +25,44 @@ use crate::event_bus::{EventBus, SystemEvent};
 use cache::EnvCache;
 use deps::build_dependency_list;
 use gpu::detect_gpu;
-use models::{DependencyInfo, EnvInfo, GpuInfo, TorchInfo};
-use scripts::{probe_torch_script, run_pip_list};
+use models::{DependencyInfo, EnvInfo, EnvSnapshot, GpuInfo, TorchInfo};
+use scripts::{probe_torch_script, run_pip_list, venv_python_path};
 
 /// EnvironmentInspector 服务
 ///
 /// - 30s TTL 内存缓存
 /// - 事件总线订阅（TorchInstalled / VenvRebuilt / CoreVersionSwitched）主动失效
+/// - v2.10：持有 uv_binary 用于加速 `pip list` 探查（uv pip list 主路径 + python -m pip fallback）
 pub struct EnvironmentInspectorService {
     cache: EnvCache,
     event_bus: EventBus,
+    /// uv binary 路径（用于 uv pip list 加速依赖探查）
+    ///
+    /// - `Some(path)`：生产环境从 lib.rs 注入 uv sidecar 路径
+    /// - `None`：测试场景或 uv 不可用，run_pip_list 会直接走 fallback 路径
+    uv_binary: Option<PathBuf>,
 }
 
 impl EnvironmentInspectorService {
-    pub fn new(event_bus: EventBus) -> Self {
+    /// 生产构造：注入 uv binary 路径
+    ///
+    /// uv_binary 通常来自 `uv_sidecar::ensure_released()` 返回的 sidecar 路径。
+    pub fn new(event_bus: EventBus, uv_binary: PathBuf) -> Self {
         let service = Self {
             cache: EnvCache::new(),
             event_bus,
+            uv_binary: Some(uv_binary),
+        };
+        service.spawn_event_listener();
+        service
+    }
+
+    /// 测试构造：不注入 uv binary（run_pip_list 走 python -m pip fallback）
+    pub fn new_for_test(event_bus: EventBus) -> Self {
+        let service = Self {
+            cache: EnvCache::new(),
+            event_bus,
+            uv_binary: None,
         };
         service.spawn_event_listener();
         service
@@ -120,6 +141,56 @@ impl EnvironmentInspectorService {
         Ok(info)
     }
 
+    /// 扁平环境快照（v2.13 前端 `env_inspect` 命令专用）
+    ///
+    /// 与 `inspect_all` 的区别：
+    /// - `inspect_all` 返回嵌套 `EnvInfo`（模块内部用）
+    /// - `inspect_snapshot` 返回扁平 `EnvSnapshot`（前端用，字段与前端 `EnvInfo` 类型完全对齐）
+    ///
+    /// 缓存逻辑：
+    /// - 先调 `inspect_all` 走原有 30s TTL 缓存
+    /// - 再把嵌套结果扁平化 + 补全 `comfyui_cloned` / `python_path` 等新字段
+    ///
+    /// comfyui_cloned 探测：检查 comfyui_root 目录是否存在 + 是否为合法 git 仓库
+    /// （含 `.git` 目录）。Phase 7+ 接入 CoreManager 后可替换为 `core_manager.is_cloned()`。
+    pub async fn inspect_snapshot(
+        &self,
+        venv_path: &Path,
+        comfyui_root: &Path,
+    ) -> Result<EnvSnapshot, EnvError> {
+        // 1. 复用 inspect_all 拿嵌套数据（走 30s 缓存）
+        let inner = self.inspect_all(venv_path, comfyui_root).await?;
+
+        // 2. python 路径
+        let python_path = venv_python_path(venv_path);
+        let python_path_str = python_path.to_string_lossy().into_owned();
+
+        // 3. comfyui_cloned 探测（v2.13 临时实现：检查 .git 目录）
+        let comfyui_cloned = is_comfyui_cloned(comfyui_root);
+
+        // 4. python_version 提取
+        //    优先用 probe_torch 输出的 platform.release（已有数据，无额外探测成本）
+        //    备选用 static "unknown"
+        let python_version = python_version_from_torch_probe(venv_path).await
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // 5. 扁平化
+        Ok(EnvSnapshot {
+            python_path: python_path_str,
+            venv_path: venv_path.to_string_lossy().into_owned(),
+            comfyui_root: comfyui_root.to_string_lossy().into_owned(),
+            python_version,
+            torch_installed: inner.torch.installed,
+            torch_version: inner.torch.version,
+            cuda_available: inner.torch.cuda_available,
+            cuda_version: inner.torch.cuda_version,
+            gpu_name: gpu_display_name(&inner.gpu),
+            comfyui_cloned,
+            dependencies: inner.dependencies,
+            last_updated: inner.inspected_at,
+        })
+    }
+
     /// 探查 venv 中的 torch
     pub async fn probe_torch(&self, venv_path: &Path) -> Result<TorchInfo, EnvError> {
         if !venv_exists(venv_path) {
@@ -187,8 +258,8 @@ impl EnvironmentInspectorService {
             )));
         }
 
-        // 1. pip list
-        let pip_json = run_pip_list(venv_path).await?;
+        // 1. pip list（v2.10：uv pip list 主路径 + python -m pip fallback）
+        let pip_json = run_pip_list(venv_path, self.uv_binary.as_deref()).await?;
         let installed = deps::parse_pip_list(&pip_json)?;
 
         // 2. requirements.txt（不存在则跳过版本比对）
@@ -229,13 +300,48 @@ fn venv_exists(venv_path: &Path) -> bool {
     venv_path.exists() && venv_path.is_dir()
 }
 
+/// v2.13：检查 ComfyUI 目录是否是已克隆的 git 仓库
+///
+/// 临时实现：检查 `<comfyui_root>/.git` 目录是否存在。
+/// Phase 7+ 接入 CoreManager 后应替换为 `core_manager.is_cloned(comfyui_root)`。
+fn is_comfyui_cloned(comfyui_root: &Path) -> bool {
+    if !comfyui_root.exists() || !comfyui_root.is_dir() {
+        return false;
+    }
+    comfyui_root.join(".git").exists()
+}
+
+/// v2.13：把 GpuInfo 枚举扁平化为字符串（给前端展示用）
+fn gpu_display_name(gpu: &GpuInfo) -> Option<String> {
+    match gpu {
+        GpuInfo::Nvidia { name, .. } => Some(name.clone()),
+        GpuInfo::Amd { name } => Some(name.clone()),
+        GpuInfo::Intel { name } => Some(name.clone()),
+        GpuInfo::CpuOnly { cpu_model } => Some(cpu_model.clone()),
+        GpuInfo::Unknown => None,
+    }
+}
+
+/// v2.13：从 probe_torch_script 输出中提取 Python 版本
+///
+/// 复用现有 `PROBE_TORCH_SCRIPT` 中的 `platform.release` 字段（其实是 OS release，
+/// 不是 python 版本）。真正的 Python 版本需要单独探测，但为避免重复跑脚本，
+/// 我们重新跑一个轻量探测（5s 超时）。
+async fn python_version_from_torch_probe(venv_path: &Path) -> Option<String> {
+    let python = venv_python_path(venv_path);
+    if !python.exists() {
+        return None;
+    }
+    crate::python_env::verify::probe_python_version(&python).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn make_service() -> EnvironmentInspectorService {
         let event_bus = EventBus::new();
-        EnvironmentInspectorService::new(event_bus)
+        EnvironmentInspectorService::new_for_test(event_bus)
     }
 
     #[tokio::test]

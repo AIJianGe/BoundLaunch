@@ -14,7 +14,7 @@
  */
 
 import { invoke } from "./index";
-import type { ProcessStatus } from "./types";
+import type { ProcessStatus, ShutdownReason, ShutdownReport } from "./types";
 
 /**
  * 启动 ComfyUI 进程
@@ -72,4 +72,28 @@ export function processTailLog(lines: number): Promise<string[]> {
  */
 export function processKillStale(pid: number): Promise<void> {
   return invoke<void>("process_kill_stale", { pid });
+}
+
+/**
+ * F24 退出流程：联动关闭 ComfyUI + 资源释放 + app.exit
+ *
+ * 由前端在弹确认对话框后调用。`ShutdownCoordinator` 内部 5 步事务：
+ * 1. CAS 防重入（多次调用仅首次执行）
+ * 2. 广播 `app_exiting` 事件
+ * 3. 调用 `process_launcher.stop_with_reason(StopReason::Shutdown)` 走进程组终止
+ * 4. 资源释放（500ms）
+ * 5. 广播 `app_exited` + `app.exit(0)`
+ *
+ * 30s 总超时兜底：超时时 `std::process::exit(0)` 强制退出（不返回）。
+ *
+ * 事件（前端 listen）：
+ * - `app_exiting`：订阅者清理本地缓存 + 拒绝新操作
+ * - `app_exited`：资源清理完毕，即将 `app.exit(0)`
+ *
+ * @param reason 退出原因（[window_close / tray_quit / shortcut_ctrl_q / restart]）
+ * @returns `ShutdownReport` 含 ComfyUI 运行时状态 + 实际停止耗时
+ * @throws `ApiError` 当 `ShutdownCoordinator` 因 30s 超时已强制退出时
+ */
+export function shutdownAll(reason: ShutdownReason): Promise<ShutdownReport> {
+  return invoke<ShutdownReport>("shutdown_all", { reason });
 }

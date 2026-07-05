@@ -30,7 +30,12 @@ use crate::common::paths;
 pub const UV_SIDECAR_VERSION: &str = "0.4.18";
 
 /// sidecar 二进制在 launcher 资源目录中的子目录
-const RESOURCE_SUBDIR: &str = "uv";
+///
+/// 注意：Tauri 2 的 `bundle.resources = ["resources/uv/*"]` 会把
+/// `src-tauri/resources/uv/` 下的文件复制到 `target/<profile>/resources/uv/`。
+/// 而 `app.path().resource_dir()` 返回 `target/<profile>/`（不含 `resources/`）。
+/// 因此这里必须是 `"resources/uv"`，不能只是 `"uv"`。
+const RESOURCE_SUBDIR: &str = "resources/uv";
 
 /// sidecar 二进制在 launcher 资源目录中的文件名（含 target-triple 后缀）
 ///
@@ -96,20 +101,57 @@ fn expected_bundled_filename() -> String {
 /// 优先匹配 `uv-{host-triple}[.exe]`，找不到则退到 `uv.exe` / `uv`
 fn locate_bundled_uv(resource_dir: &Path) -> Option<PathBuf> {
     let uv_dir = resource_dir.join(RESOURCE_SUBDIR);
+    tracing::info!(
+        ?resource_dir,
+        ?uv_dir,
+        subdir = RESOURCE_SUBDIR,
+        "locate_bundled_uv: searching for uv binary"
+    );
     if !uv_dir.exists() {
+        tracing::warn!(
+            ?uv_dir,
+            "locate_bundled_uv: uv subdir does not exist"
+        );
+        // 列出 resource_dir 下的内容，帮助诊断
+        if let Ok(entries) = std::fs::read_dir(resource_dir) {
+            let listing: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            tracing::info!(
+                ?listing,
+                "locate_bundled_uv: resource_dir contents"
+            );
+        }
         return None;
     }
 
     // 1) 严格匹配 host triple（生产 / 显式多平台打包场景）
     let expected = uv_dir.join(expected_bundled_filename());
+    tracing::info!(?expected, "locate_bundled_uv: trying expected filename");
     if expected.exists() {
+        tracing::info!("locate_bundled_uv: found via host-triple match");
         return Some(expected);
     }
 
     // 2) 退到 basename 匹配（开发场景，`resources/uv/uv.exe` 这样的简化命名）
     let fallback = uv_dir.join(bundled_binary_name());
+    tracing::info!(?fallback, "locate_bundled_uv: trying fallback filename");
     if fallback.exists() {
+        tracing::info!("locate_bundled_uv: found via fallback basename match");
         return Some(fallback);
+    }
+
+    // 列出 uv_dir 下的内容，帮助诊断
+    if let Ok(entries) = std::fs::read_dir(&uv_dir) {
+        let listing: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        tracing::warn!(
+            ?listing,
+            "locate_bundled_uv: uv_dir exists but no uv binary found, contents:"
+        );
     }
 
     None

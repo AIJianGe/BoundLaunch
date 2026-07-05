@@ -20,7 +20,16 @@ param(
 $ErrorActionPreference = "Stop"
 
 # 切换到仓库根目录
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+# 注：优先用 $PSScriptRoot（PS 3.0+ 自动变量，最可靠）；
+# 回退到 $MyInvocation.MyCommand.Definition（兼容老版本，但在 & {} 包裹下可能为空）
+$ScriptDir = if ($PSScriptRoot) {
+    $PSScriptRoot
+} elseif ($MyInvocation.MyCommand.Definition) {
+    Split-Path -Parent $MyInvocation.MyCommand.Definition
+} else {
+    # 最后兜底：假设当前工作目录就是仓库根目录
+    (Get-Location).Path
+}
 $RepoRoot = Split-Path -Parent $ScriptDir
 Set-Location $RepoRoot
 

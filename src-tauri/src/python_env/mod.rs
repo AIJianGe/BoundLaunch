@@ -21,9 +21,9 @@ use crate::config::{Config, CudaVersion};
 use crate::error::EnvError;
 use crate::event_bus::{EventBus, SystemEvent};
 
-use models::{CompatibilityReport, EnvInfo, InstallProgress, InstallStage};
+use models::{CompatibilityReport, EnvInfo, InstallProgress, InstallStage, PythonEnvStatus};
 use uv_runner::UvRunner;
-use verify::{is_venv_ready, verify_venv};
+use verify::{is_venv_ready, probe_python_version, verify_venv};
 
 /// PythonEnv 服务
 ///
@@ -57,6 +57,83 @@ impl PythonEnvService {
     /// uv 是否可用
     pub async fn is_uv_available(&self) -> bool {
         self.uv.is_available().await
+    }
+
+    /// 获取 Python 环境状态总览（v2.13）
+    ///
+    /// 探测内容：
+    /// - uv 二进制是否可用 + 版本号
+    /// - venv 目录是否存在
+    /// - venv 中的 Python 版本
+    /// - venv 中是否安装 torch + 版本 + CUDA 状态
+    ///
+    /// 所有探测都是只读，不会修改任何状态。
+    /// 用于前端 `envStatus` 命令（设置页「Python 版本切换」当前版本显示）。
+    pub async fn get_status(&self, venv_path: &Path) -> PythonEnvStatus {
+        // 1. uv 状态
+        let (uv_version, uv_installed) = self.uv.get_version().await;
+        let uv_path = if uv_installed {
+            Some(self.uv.binary_path().to_string_lossy().into_owned())
+        } else {
+            None
+        };
+
+        // 2. venv 状态
+        let venv_exists = venv_path.exists();
+        if !venv_exists {
+            return PythonEnvStatus {
+                uv_installed,
+                uv_path,
+                uv_version,
+                venv_exists: false,
+                venv_python_version: None,
+                venv_torch_installed: false,
+                venv_torch_version: None,
+                venv_torch_cuda: false,
+            };
+        }
+
+        // 3. venv 中 python 是否存在
+        let python = crate::env_inspector::scripts::venv_python_path(venv_path);
+        if !python.exists() {
+            return PythonEnvStatus {
+                uv_installed,
+                uv_path,
+                uv_version,
+                venv_exists: true,
+                venv_python_version: None,
+                venv_torch_installed: false,
+                venv_torch_version: None,
+                venv_torch_cuda: false,
+            };
+        }
+
+        // 4. 探查 python 版本（轻量：`python -c "import sys; print(sys.version.split()[0])"`，5s 超时）
+        let venv_python_version = probe_python_version(&python).await;
+
+        // 5. 探查 torch（用现有 verify_venv 逻辑，但 venv_python_version 已拿到）
+        //    注意：verify_venv 会调 probe_torch_script（90s 超时），失败时降级
+        let (torch_installed, torch_version, torch_cuda) =
+            match verify_venv(venv_path).await {
+                Ok(info) => (info.torch_installed, info.torch_version, info.cuda_available),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e, "get_status: verify_venv failed, torch status unknown"
+                    );
+                    (false, None, false)
+                }
+            };
+
+        PythonEnvStatus {
+            uv_installed,
+            uv_path,
+            uv_version,
+            venv_exists: true,
+            venv_python_version,
+            venv_torch_installed: torch_installed,
+            venv_torch_version: torch_version,
+            venv_torch_cuda: torch_cuda,
+        }
     }
 
     /// 创建 venv
@@ -116,12 +193,19 @@ impl PythonEnvService {
     }
 
     /// 比对 venv 已装依赖 vs requirements.txt
+    ///
+    /// v2.10：注入 uv_binary 用于加速 pip list（uv pip list 主路径）
     pub async fn check_requirements_compatibility(
         &self,
         venv_path: &Path,
         comfyui_root: &Path,
     ) -> Result<CompatibilityReport, EnvError> {
-        compatibility::check_requirements_compatibility(venv_path, comfyui_root).await
+        compatibility::check_requirements_compatibility(
+            venv_path,
+            comfyui_root,
+            Some(self.uv.binary_path()),
+        )
+        .await
     }
 
     /// venv 重建

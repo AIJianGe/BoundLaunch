@@ -6,6 +6,33 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+/// 退出原因（与 ShutdownReason 对齐，前端可见）
+///
+/// F24 退出流程专用，附在 `AppExiting` 事件载荷中
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownReason {
+    /// 窗口 [X] 关闭按钮触发
+    WindowClose,
+    /// 托盘菜单「🚪 退出」触发
+    TrayQuit,
+    /// 快捷键 Ctrl+Q 触发
+    ShortcutCtrlQ,
+    /// 重启 launcher（v0.2.0 扩展，shutdown_all(reason=Restart) → 启动新实例）
+    Restart,
+}
+
+impl ShutdownReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::WindowClose => "window_close",
+            Self::TrayQuit => "tray_quit",
+            Self::ShortcutCtrlQ => "shortcut_ctrl_q",
+            Self::Restart => "restart",
+        }
+    }
+}
+
 /// 系统事件枚举
 ///
 /// 各 Service 通过 EventBus.subscribe() 订阅感兴趣的事件
@@ -44,6 +71,21 @@ pub enum SystemEvent {
         missing: Vec<String>,
         outdated: Vec<String>,
     },
+
+    /// launcher 即将退出（F24 退出流程）
+    ///
+    /// 由 ShutdownCoordinator 在事务开始时广播：
+    /// - 订阅者清理本地缓存（EnvironmentInspector / Config / LogStore 临时索引等）
+    /// - 拒绝新操作（API 返回 Err / 命令拒绝入队）
+    /// - 当前 event_bus 仍可用，订阅者**不要**在这里 unsubscribe
+    AppExiting { reason: ShutdownReason },
+
+    /// launcher 资源清理完毕（F24 退出流程）
+    ///
+    /// 由 ShutdownCoordinator 在 stop + 资源释放完成后、`app.exit(0)` 之前广播：
+    /// - 订阅者做最终清理（持久化 WAL checkpoint / 关闭文件句柄等）
+    /// - 这是 ShutdownCoordinator 5 步事务的最后一步，下一步立即 `app.exit(0)`
+    AppExited,
 }
 
 impl SystemEvent {
@@ -58,6 +100,8 @@ impl SystemEvent {
             Self::VenvRebuilt => "VenvRebuilt",
             Self::PythonVersionSwitched { .. } => "PythonVersionSwitched",
             Self::RequirementsMismatch { .. } => "RequirementsMismatch",
+            Self::AppExiting { .. } => "AppExiting",
+            Self::AppExited => "AppExited",
         }
     }
 }

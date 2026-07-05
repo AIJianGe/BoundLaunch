@@ -105,7 +105,8 @@ export type StopReason =
   | "user_requested"
   | "health_check_timeout"
   | "external_signal"
-  | "parent_exit";
+  | "parent_exit"
+  | "shutdown";
 
 /**
  * 进程状态机（discriminated union）
@@ -124,6 +125,39 @@ export interface HealthInfo {
   ready: boolean;
   status_code: number | null;
   elapsed_ms: number;
+}
+
+// ============================================================================
+// F24 退出流程（对应 src-tauri/src/event_bus.rs ShutdownReason +
+//                src-tauri/src/process_launcher/models.rs ShutdownReport）
+// ============================================================================
+
+/**
+ * 退出原因（前端与后端共用枚举值，snake_case 序列化）
+ *
+ * - `window_close`：主窗口 [X] 关闭按钮
+ * - `tray_quit`：托盘菜单「🚪 退出」
+ * - `shortcut_ctrl_q`：快捷键 Ctrl+Q
+ * - `restart`：重启 launcher（v0.2.0 扩展）
+ */
+export type ShutdownReason =
+  | "window_close"
+  | "tray_quit"
+  | "shortcut_ctrl_q"
+  | "restart";
+
+/**
+ * F24 退出流程结果报告（ShutdownCoordinator 5 步事务完成后产出）
+ *
+ * 前端调用 `invoke('shutdown_all', { reason })` 时接收
+ */
+export interface ShutdownReport {
+  /** ComfyUI 是否在退出前处于运行中 */
+  comfyui_was_running: boolean;
+  /** ComfyUI 停止阶段耗时（毫秒） */
+  stop_elapsed_ms: number;
+  /** 退出原因（与入参一致） */
+  reason: ShutdownReason;
 }
 
 // ============================================================================

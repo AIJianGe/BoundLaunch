@@ -25,6 +25,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
 
+use crate::config::ConfigService;
 use crate::event_bus::{EventBus, SystemEvent};
 
 use self::url_util::sanitize_url_for_log;
@@ -70,9 +71,12 @@ impl ListCache {
 /// - **单例**：通过 AppState 全局共享
 /// - **DashMap**：plugin_locks 提供插件级互斥（不同插件可并发操作）
 /// - **RwLock**：list_cache 多读单写
+///
+/// **路径热加载**：`custom_nodes_path` 和 `venv_path` 每次需要时从 ConfigService
+/// 读取最新的 `paths.comfyui_root` / `paths.venv_path`，实现"修改 config 后无需重启立即生效"。
 pub struct PluginManagerService {
-    custom_nodes_path: PathBuf,
-    venv_path: PathBuf,
+    /// Config 共享引用（提供 `paths.comfyui_root` / `paths.venv_path` 热读取）
+    config: Arc<ConfigService>,
     event_bus: EventBus,
     /// 插件级互斥锁（按插件名分桶）
     plugin_locks: DashMap<String, Arc<Mutex<()>>>,
@@ -81,14 +85,23 @@ pub struct PluginManagerService {
 }
 
 impl PluginManagerService {
-    pub fn new(custom_nodes_path: PathBuf, venv_path: PathBuf, event_bus: EventBus) -> Self {
+    pub fn new(config: Arc<ConfigService>, event_bus: EventBus) -> Self {
         Self {
-            custom_nodes_path,
-            venv_path,
+            config,
             event_bus,
             plugin_locks: DashMap::new(),
             list_cache: RwLock::new(None),
         }
+    }
+
+    /// 读取当前 custom_nodes 路径（每次调用读最新 config）
+    fn current_custom_nodes_path(&self) -> PathBuf {
+        self.config.get().paths.comfyui_root.join("custom_nodes")
+    }
+
+    /// 读取当前 venv 路径（每次调用读最新 config）
+    fn current_venv_path(&self) -> PathBuf {
+        self.config.get().paths.venv_path.clone()
     }
 
     /// 列出所有插件（30s 缓存）
@@ -109,8 +122,8 @@ impl PluginManagerService {
             }
         }
 
-        // 2. spawn_blocking 扫描
-        let custom_nodes = self.custom_nodes_path.clone();
+        // 2. spawn_blocking 扫描（路径热加载：读最新 custom_nodes_path）
+        let custom_nodes = self.current_custom_nodes_path();
         let plugins = tokio::task::spawn_blocking(move || registry::scan_plugins(&custom_nodes))
             .await
             .map_err(|e| PluginError::CloneFailed {
@@ -173,8 +186,8 @@ impl PluginManagerService {
                 }
             }
         }
-        // 即使缓存未命中也检查文件系统
-        if registry::plugin_dir_path(&self.custom_nodes_path, &plugin_name).is_some() {
+        // 即使缓存未命中也检查文件系统（路径热加载）
+        if registry::plugin_dir_path(&self.current_custom_nodes_path(), &plugin_name).is_some() {
             return Err(PluginError::AlreadyExists(plugin_name));
         }
 
@@ -182,8 +195,8 @@ impl PluginManagerService {
         let lock = self.get_plugin_lock(&plugin_name);
         let _guard = lock.lock().await;
 
-        // 4. spawn_blocking(git2 clone)
-        let target_dir = self.custom_nodes_path.join(&plugin_name);
+        // 4. spawn_blocking(git2 clone)（路径热加载）
+        let target_dir = self.current_custom_nodes_path().join(&plugin_name);
         let url_clone = url.to_string();
         // 通知前端开始克隆（粒度粗：开始/完成/失败，详细进度需 mpsc 方案，本期简化）
         progress(PluginProgress::Cloning { percent: 0 });
@@ -208,9 +221,9 @@ impl PluginManagerService {
         }
         // clone 成功后 Repository 实例不需要保留（info 在后续 spawn_blocking 中重新打开）
 
-        // 5. 读 git 信息 + 描述
+        // 5. 读 git 信息 + 描述（路径热加载）
         let info_result = tokio::task::spawn_blocking({
-            let custom_nodes = self.custom_nodes_path.clone();
+            let custom_nodes = self.current_custom_nodes_path();
             let plugin_name = plugin_name.clone();
             move || -> Result<PluginInfo, PluginError> {
                 let path = registry::plugin_dir_path(&custom_nodes, &plugin_name)
@@ -271,7 +284,7 @@ impl PluginManagerService {
         let lock = self.get_plugin_lock(name);
         let _guard = lock.lock().await;
 
-        let plugin_path = registry::plugin_dir_path(&self.custom_nodes_path, name)
+        let plugin_path = registry::plugin_dir_path(&self.current_custom_nodes_path(), name)
             .ok_or_else(|| PluginError::NotFound(name.to_string()))?;
 
         let (old_commit, new_commit) = tokio::task::spawn_blocking(move || -> Result<(String, String), PluginError> {
@@ -301,10 +314,10 @@ impl PluginManagerService {
         let lock = self.get_plugin_lock(name);
         let _guard = lock.lock().await;
 
-        let plugin_path = registry::plugin_dir_path(&self.custom_nodes_path, name)
+        let plugin_path = registry::plugin_dir_path(&self.current_custom_nodes_path(), name)
             .ok_or_else(|| PluginError::NotFound(name.to_string()))?;
 
-        let custom_nodes = self.custom_nodes_path.clone();
+        let custom_nodes = self.current_custom_nodes_path();
         let result = tokio::task::spawn_blocking(move || {
             trash::move_to_trash(&plugin_path, &custom_nodes)
         })
@@ -326,7 +339,7 @@ impl PluginManagerService {
         let lock = self.get_plugin_lock(name);
         let _guard = lock.lock().await;
 
-        let custom_nodes = self.custom_nodes_path.clone();
+        let custom_nodes = self.current_custom_nodes_path();
         let name_clone = name.to_string();
         tokio::task::spawn_blocking(move || {
             registry::toggle_plugin(&custom_nodes, &name_clone, enabled)
@@ -349,19 +362,20 @@ impl PluginManagerService {
     /// - venv 未就绪 → VenvNotReady
     /// - pip install 失败 → RequirementsFailed（不影响插件本身可用）
     pub async fn install_requirements(&self, name: &str) -> Result<(), PluginError> {
-        let venv_path = &self.venv_path;
+        // 路径热加载：读最新 venv_path 和 custom_nodes_path
+        let venv_path = self.current_venv_path();
         if venv_path.as_os_str().is_empty() || !venv_path.exists() {
             return Err(PluginError::VenvNotReady);
         }
 
-        let plugin_path = registry::plugin_dir_path(&self.custom_nodes_path, name)
+        let plugin_path = registry::plugin_dir_path(&self.current_custom_nodes_path(), name)
             .ok_or_else(|| PluginError::NotFound(name.to_string()))?;
         let requirements_file = plugin_path.join("requirements.txt");
         if !requirements_file.exists() {
             return Ok(()); // 无 requirements 视为已满足
         }
 
-        let venv_python = venv_python_binary(venv_path);
+        let venv_python = venv_python_binary(&venv_path);
         tracing::info!(name, ?requirements_file, "installing plugin requirements");
 
         let output = tokio::process::Command::new(&venv_python)
@@ -389,7 +403,7 @@ impl PluginManagerService {
         let mut results = Vec::with_capacity(list.plugins.len());
 
         for plugin in &list.plugins {
-            let path = match registry::plugin_dir_path(&self.custom_nodes_path, &plugin.name) {
+            let path = match registry::plugin_dir_path(&self.current_custom_nodes_path(), &plugin.name) {
                 Some(p) => p,
                 None => continue,
             };
@@ -531,14 +545,28 @@ fn read_description_safe(plugin_path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConfigService;
 
-    fn make_service(tmp: &Path) -> PluginManagerService {
+    /// 构造测试用 PluginManagerService（路径热加载版）
+    ///
+    /// 与 `new(config, event_bus)` 一致，但额外用 `config.update()` 把
+    /// `comfyui_root` / `venv_path` 指向临时目录。
+    async fn make_service(tmp: &Path) -> PluginManagerService {
         let custom_nodes = tmp.join("custom_nodes");
         std::fs::create_dir_all(&custom_nodes).unwrap();
         let venv_path = tmp.join("venv");
         std::fs::create_dir_all(&venv_path).unwrap();
         let event_bus = EventBus::new();
-        PluginManagerService::new(custom_nodes, venv_path, event_bus)
+        let config = std::sync::Arc::new(ConfigService::new_for_test(event_bus.clone()));
+        config
+            .update(|cfg| {
+                cfg.paths.comfyui_root = tmp.to_path_buf();
+                cfg.paths.venv_path = venv_path;
+                Ok(())
+            })
+            .await
+            .expect("set paths");
+        PluginManagerService::new(config, event_bus)
     }
 
     fn make_local_git_repo(parent: &Path, name: &str) -> PathBuf {
@@ -562,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_plugins_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
         let result = svc.list_plugins(false).await.unwrap();
         assert!(result.plugins.is_empty());
     }
@@ -570,7 +598,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_plugins_cache_hit() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         // 创建一个插件目录
         std::fs::create_dir_all(tmp.path().join("custom_nodes").join("test-plugin")).unwrap();
@@ -589,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_plugins_force_refresh() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         std::fs::create_dir_all(tmp.path().join("custom_nodes").join("p1")).unwrap();
         std::fs::write(
@@ -616,7 +644,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_plugin_info_not_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
         let result = svc.get_plugin_info("nonexistent").await;
         assert!(matches!(result, Err(PluginError::NotFound(_))));
     }
@@ -624,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_plugin_info_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         let plugin_dir = tmp.path().join("custom_nodes").join("found-plugin");
         std::fs::create_dir_all(&plugin_dir).unwrap();
@@ -638,7 +666,7 @@ mod tests {
     #[tokio::test]
     async fn test_toggle_disable_then_enable() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         let plugin_dir = tmp.path().join("custom_nodes").join("toggle-test");
         std::fs::create_dir_all(&plugin_dir).unwrap();
@@ -655,7 +683,7 @@ mod tests {
     #[tokio::test]
     async fn test_toggle_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         let plugin_dir = tmp.path().join("custom_nodes").join("idempotent");
         std::fs::create_dir_all(&plugin_dir).unwrap();
@@ -674,7 +702,7 @@ mod tests {
     #[tokio::test]
     async fn test_uninstall_moves_to_trash() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         let plugin_dir = tmp.path().join("custom_nodes").join("uninstall-me");
         std::fs::create_dir_all(&plugin_dir).unwrap();
@@ -689,7 +717,7 @@ mod tests {
     #[tokio::test]
     async fn test_uninstall_not_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
         let result = svc.uninstall("nonexistent").await;
         assert!(matches!(result, Err(PluginError::NotFound(_))));
     }
@@ -697,7 +725,7 @@ mod tests {
     #[tokio::test]
     async fn test_install_already_exists() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
 
         // 预创建同名插件目录
         let plugin_dir = tmp.path().join("custom_nodes").join("existing-plugin");
@@ -719,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn test_install_invalid_url_protocol() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
         let result = svc.install("file:///etc/passwd", |_| {}).await;
         assert!(matches!(result, Err(PluginError::InvalidUrl(_))));
     }
@@ -727,7 +755,7 @@ mod tests {
     #[tokio::test]
     async fn test_install_url_with_credentials_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path());
+        let svc = make_service(tmp.path()).await;
         let result = svc
             .install("https://token@github.com/user/repo", |_| {})
             .await;
@@ -740,7 +768,20 @@ mod tests {
         let custom_nodes = tmp.path().join("custom_nodes");
         std::fs::create_dir_all(&custom_nodes).unwrap();
         let venv_path = PathBuf::new(); // 空 venv
-        let svc = PluginManagerService::new(custom_nodes, venv_path, EventBus::new());
+        // 路径热加载版 fixture（config.comfyui_root 指向 tmp）
+        let event_bus = EventBus::new();
+        let config = std::sync::Arc::new(
+            crate::config::ConfigService::new_for_test(event_bus.clone()),
+        );
+        config
+            .update(|cfg| {
+                cfg.paths.comfyui_root = tmp.path().to_path_buf();
+                cfg.paths.venv_path = venv_path;
+                Ok(())
+            })
+            .await
+            .expect("set paths");
+        let svc = PluginManagerService::new(config, event_bus);
 
         let result = svc.install_requirements("any-plugin").await;
         assert!(matches!(result, Err(PluginError::VenvNotReady)));
@@ -789,7 +830,17 @@ mod tests {
         std::fs::create_dir_all(&plugin_dir).unwrap();
         std::fs::write(plugin_dir.join("__init__.py"), "# test\n").unwrap();
 
-        let svc = PluginManagerService::new(custom_nodes, venv_path, bus);
+        // 路径热加载版 fixture
+        let config = std::sync::Arc::new(crate::config::ConfigService::new_for_test(bus.clone()));
+        config
+            .update(|cfg| {
+                cfg.paths.comfyui_root = tmp.path().to_path_buf();
+                cfg.paths.venv_path = venv_path;
+                Ok(())
+            })
+            .await
+            .expect("set paths");
+        let svc = PluginManagerService::new(config, bus);
         svc.uninstall("emit-test").await.unwrap();
 
         let event = rx.recv().await.unwrap();

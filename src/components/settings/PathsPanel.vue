@@ -26,6 +26,7 @@ import {
   NSelect,
   NAlert,
   NSpace,
+  NTooltip,
 } from "naive-ui";
 import { useConfigStore } from "@/stores/config";
 import { useToast } from "@/composables/useToast";
@@ -103,7 +104,22 @@ function debouncedUpdate(field: "root" | "venv" | "python", value: string) {
         />
       </NFormItem>
 
-      <NFormItem label="venv 路径">
+      <NFormItem>
+        <template #label>
+          <span class="label-with-help">
+            venv 路径
+            <NTooltip placement="top" trigger="hover">
+              <template #trigger>
+                <span class="help-icon" aria-label="venv 路径说明">?</span>
+              </template>
+              <div class="help-content">
+                venv 是 ComfyUI 专用的 Python 运行环境目录，程序会在此自动下载
+                Python 并安装所需依赖（如 torch）。请选择一个空文件夹或新路径
+                （程序会自动创建），请勿指向系统已有的 Python 安装目录，以免冲突。
+              </div>
+            </NTooltip>
+          </span>
+        </template>
         <FolderPicker
           v-model="localVenv"
           placeholder="如 D:\AIWork\ComfyUI\venv"
@@ -148,5 +164,36 @@ function debouncedUpdate(field: "root" | "venv" | "python", value: string) {
 
 .error-list {
   margin-top: 12px;
+}
+
+.label-with-help {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.help-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--app-text-muted, #999);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: help;
+  user-select: none;
+  transition: background 0.2s;
+}
+
+.help-icon:hover {
+  background: var(--app-primary, #18a058);
+}
+
+.help-content {
+  max-width: 360px;
+  line-height: 1.6;
 }
 </style>

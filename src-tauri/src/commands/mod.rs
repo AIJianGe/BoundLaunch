@@ -4,6 +4,7 @@
 //! 设计模式：门面 (Facade) - 前端只与本层交互，不直接调 Service
 
 pub mod config;
+pub mod dev_log;
 pub mod log_store;
 pub mod env_inspector;
 pub mod python_env;

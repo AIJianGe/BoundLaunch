@@ -18,14 +18,16 @@ use super::models::{CompatibilityReport, PackageMismatch, PackageReq};
 ///
 /// - `venv_path`：venv 根目录（用于 `pip list`）
 /// - `comfyui_root`：ComfyUI 仓库根（含 requirements.txt）
+/// - `uv_binary`：可选 uv binary 路径（v2.10：用于加速 pip list）
 ///
 /// 返回 `CompatibilityReport`，`is_compatible` 在 missing + outdated 都为空时为 true
 pub async fn check_requirements_compatibility(
     venv_path: &Path,
     comfyui_root: &Path,
+    uv_binary: Option<&Path>,
 ) -> Result<CompatibilityReport, EnvError> {
-    // 1. 读 venv 已装包
-    let pip_json = run_pip_list(venv_path).await?;
+    // 1. 读 venv 已装包（v2.10：uv pip list 主路径 + python -m pip fallback）
+    let pip_json = run_pip_list(venv_path, uv_binary).await?;
     let installed = parse_pip_list(&pip_json)?;
 
     // 2. 读 requirements.txt

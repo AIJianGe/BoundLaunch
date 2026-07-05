@@ -11,6 +11,7 @@ use crate::log_store::LogStoreService;
 use crate::model_path::ModelPathService;
 use crate::plugin_manager::PluginManagerService;
 use crate::process_launcher::ProcessLauncherService;
+use crate::process_launcher::ShutdownCoordinator;
 use crate::python_env::PythonEnvService;
 use crate::task_scheduler::TaskSchedulerService;
 use std::sync::Arc;
@@ -31,6 +32,8 @@ pub struct AppState {
     pub plugin_manager: Arc<PluginManagerService>,
     pub task_scheduler: Arc<TaskSchedulerService>,
     pub process_launcher: Arc<ProcessLauncherService>,
+    /// F24 退出流程编排器（防重入 + 5 步事务 + 30s 超时兜底）
+    pub shutdown_coordinator: Arc<ShutdownCoordinator>,
 }
 
 impl AppState {
@@ -46,23 +49,28 @@ impl AppState {
                 .await
                 .expect("failed to init test LogStore"),
         );
-        let env_inspector = Arc::new(EnvironmentInspectorService::new((*event_bus).clone()));
+        let env_inspector = Arc::new(EnvironmentInspectorService::new_for_test((*event_bus).clone()));
         let python_env = Arc::new(PythonEnvService::from_path((*event_bus).clone()));
-        // CoreManager 用临时目录（测试不真实操作 git）
+        // CoreManager 测试 fixture（路径热加载：用 config.update 设置 comfyui_root）
         let tmp = std::env::temp_dir().join(format!("boundlaunch-test-{}", uuid::Uuid::new_v4()));
+        config
+            .update(|cfg| {
+                cfg.paths.comfyui_root = tmp.clone();
+                cfg.paths.venv_path = tmp.join("venv");
+                Ok(())
+            })
+            .await
+            .expect("set paths");
         let core_manager = Arc::new(CoreManagerService::new(
-            tmp.clone(),
+            config.clone(),
             (*event_bus).clone(),
             log_store.clone(),
         ));
-        // ModelPathService 复用同一临时 comfyui_root
-        let model_path = Arc::new(ModelPathService::new(tmp.clone()));
-        // PluginManager 用临时 custom_nodes + venv
-        let custom_nodes = tmp.join("custom_nodes");
-        let venv_path = tmp.join("venv");
+        // ModelPathService（路径热加载：复用 config）
+        let model_path = Arc::new(ModelPathService::new(config.clone()));
+        // PluginManager（路径热加载：复用 config）
         let plugin_manager = Arc::new(PluginManagerService::new(
-            custom_nodes,
-            venv_path,
+            config.clone(),
             (*event_bus).clone(),
         ));
         // TaskScheduler 测试用 new_for_test（无 AppHandle，emit 跳过）
@@ -81,9 +89,12 @@ impl AppState {
             model_path.clone(),
             log_store.clone(),
             config.clone(),
-            tmp.clone(),
-            tmp.join("venv"),
             data_dir,
+        ));
+        // F24 退出流程：构造 ShutdownCoordinator（依赖 process_launcher + event_bus）
+        let shutdown_coordinator = Arc::new(ShutdownCoordinator::new(
+            (*process_launcher).clone(),
+            (*event_bus).clone(),
         ));
         Self {
             event_bus,
@@ -96,6 +107,7 @@ impl AppState {
             plugin_manager,
             task_scheduler,
             process_launcher,
+            shutdown_coordinator,
         }
     }
 }

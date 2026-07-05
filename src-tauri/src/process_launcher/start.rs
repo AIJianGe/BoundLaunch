@@ -136,6 +136,11 @@ pub async fn check_port_available(host: &str, port: u16) -> Result<(), ProcessEr
 /// - 关闭 stdin（避免 ComfyUI 等待输入）
 /// - piped stdout/stderr（供 reader task 消费）
 /// - Windows 隐藏控制台窗口
+/// - **F24 进程组隔离**：
+///   - Unix：`setsid()` 创建新 session（也是新进程组），让 ComfyUI + 其 Python worker 子进程同组
+///     → 关闭 launcher 时用 `kill -<pgid>` 整体终止，避免 python worker 残留
+///   - Windows：`CREATE_NEW_PROCESS_GROUP` 让 ComfyUI 成为新进程组根
+///     → 关闭 launcher 时用 `taskkill /F /T /PID <pid>` 终止进程树（Windows 现有 /T 已覆盖）
 pub fn spawn_process(
     venv_python: &Path,
     comfyui_root: &Path,
@@ -148,13 +153,37 @@ pub fn spawn_process(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    // Windows 隐藏控制台窗口（避免黑窗口闪现）
+    // Windows 进程标志：CREATE_NO_WINDOW + CREATE_NEW_PROCESS_GROUP
     // 注：tokio::process::Command 在 Windows 上原生提供 `creation_flags` 方法
     // （无需 `use std::os::windows::process::CommandExt`，否则会触发 unused_import 警告）
     #[cfg(target_os = "windows")]
     {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        // CREATE_NEW_PROCESS_GROUP = 0x00000200
+        // 让 ComfyUI 成为新进程组的根，配合 taskkill /T 整体终止
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    // Unix 进程组隔离：spawn 后立即调 setsid()，让 ComfyUI + 其子进程归属新 session
+    // pre_exec 在 fork 之后、exec 之前执行，仍在子进程上下文中
+    // 失败返回 Err → spawn 失败向上传播
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // setsid() 在子进程内调用 → 创建新 session + 新进程组
+                // nix::unistd::setsid 返回 Result<Pid>，Err 时返回 std::io::Error
+                // 让 pre_exec 闭包返回 Err，spawn 阶段即可捕获
+                nix::unistd::setsid().map(|_| ()).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("setsid failed: {}", e),
+                    )
+                })
+            });
+        }
     }
 
     let child = cmd

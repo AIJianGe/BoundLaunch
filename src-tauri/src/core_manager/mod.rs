@@ -12,10 +12,12 @@ pub mod models;
 pub mod tags;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 
+use crate::config::ConfigService;
 use crate::error::CoreError;
 use crate::event_bus::{EventBus, SystemEvent};
 use crate::log_store::LogStoreService;
@@ -28,27 +30,38 @@ const TAGS_CACHE_TTL: Duration = Duration::from_secs(300); // 5 分钟
 /// 内部 tags 缓存
 struct TagsCache {
     tags: Vec<TagInfo>,
-    cached_at: Instant,
+    /// None 表示未缓存（启动状态 / 已失效），避免 `Instant::now() - duration` 在
+    /// Windows QPC 计数器较小时下溢出 panic（详见 run.bat 崩溃报告）
+    cached_at: Option<Instant>,
 }
 
 impl TagsCache {
     fn new() -> Self {
         Self {
             tags: Vec::new(),
-            cached_at: Instant::now() - TAGS_CACHE_TTL * 2, // 启动即过期
+            cached_at: None, // 启动即过期
         }
     }
 
     fn is_fresh(&self) -> bool {
-        self.cached_at.elapsed() < TAGS_CACHE_TTL
+        match self.cached_at {
+            Some(t) => t.elapsed() < TAGS_CACHE_TTL,
+            None => false,
+        }
     }
 }
 
 /// CoreManager 服务
+///
+/// **路径热加载**：所有 git 操作通过 `current_repo_path()` 从 `ConfigService`
+/// 读取最新的 `comfyui_root`，实现"修改 config 后无需重启立即生效"。
+///
+/// 详见 `PR/03-模块设计/03-CoreManager.md §4 服务接口`。
 pub struct CoreManagerService {
-    repo_path: PathBuf,
+    /// Config 共享引用（路径热加载的单一信息源）
+    config: Arc<ConfigService>,
     event_bus: EventBus,
-    log_store: std::sync::Arc<LogStoreService>,
+    log_store: Arc<LogStoreService>,
     /// 内存 tags 缓存
     tags_cache: RwLock<TagsCache>,
     /// 串行化所有 git 操作
@@ -56,13 +69,19 @@ pub struct CoreManagerService {
 }
 
 impl CoreManagerService {
+    /// 构造 CoreManagerService
+    ///
+    /// # 参数
+    /// - `config`：共享 ConfigService（提供 `paths.comfyui_root` 热读取）
+    /// - `event_bus`：事件总线（用于 emit `CoreVersionSwitched`）
+    /// - `log_store`：日志服务（用于持久化 tags 缓存）
     pub fn new(
-        repo_path: PathBuf,
+        config: Arc<ConfigService>,
         event_bus: EventBus,
-        log_store: std::sync::Arc<LogStoreService>,
+        log_store: Arc<LogStoreService>,
     ) -> Self {
         Self {
-            repo_path,
+            config,
             event_bus,
             log_store,
             tags_cache: RwLock::new(TagsCache::new()),
@@ -70,14 +89,19 @@ impl CoreManagerService {
         }
     }
 
-    /// 仓库是否已克隆
-    pub async fn is_cloned(&self) -> bool {
-        self.repo_path.join(".git").exists()
+    /// 读取当前 comfyui_root（每次调用读最新 config，无锁原子）
+    fn current_repo_path(&self) -> PathBuf {
+        self.config.get().paths.comfyui_root.clone()
     }
 
-    /// 仓库根路径
-    pub fn repo_path(&self) -> &Path {
-        &self.repo_path
+    /// 仓库是否已克隆
+    pub async fn is_cloned(&self) -> bool {
+        self.current_repo_path().join(".git").exists()
+    }
+
+    /// 仓库根路径（外部 API，仅暴露 &Path 借用）
+    pub fn repo_path(&self) -> PathBuf {
+        self.current_repo_path()
     }
 
     /// 克隆 ComfyUI 仓库
@@ -85,7 +109,8 @@ impl CoreManagerService {
     /// 长任务，调用方应通过 TaskScheduler 提交（Phase 10 后）
     pub async fn clone_repo(&self, url: &str) -> Result<(), CoreError> {
         let _guard = self.repo_lock.lock().await;
-        let repo_path = self.repo_path.clone();
+        // 在持锁状态下再读一次路径（防止持锁期间 config 变更导致前后不一致）
+        let repo_path = self.current_repo_path();
         let url = url.to_string();
 
         tokio::task::spawn_blocking(move || git_ops::clone_repo(&repo_path, &url))
@@ -130,7 +155,7 @@ impl CoreManagerService {
                 if let Ok(tags) = serde_json::from_str::<Vec<TagInfo>>(&json) {
                     let mut cache = self.tags_cache.write();
                     cache.tags = tags.clone();
-                    cache.cached_at = Instant::now();
+                    cache.cached_at = Some(Instant::now());
                     tracing::debug!(count = tags.len(), "loaded tags from persistent cache");
                     return Ok(tags);
                 }
@@ -139,7 +164,7 @@ impl CoreManagerService {
 
         // 实际 fetch
         let _guard = self.repo_lock.lock().await;
-        let repo_path = self.repo_path.clone();
+        let repo_path = self.current_repo_path();
 
         let repo = tokio::task::spawn_blocking(move || git_ops::open_repo(&repo_path))
             .await
@@ -160,8 +185,9 @@ impl CoreManagerService {
         }
 
         // 重新打开列 tag（fetch 消耗了 repo）
+        let repo_path = self.current_repo_path();
         let repo = tokio::task::spawn_blocking({
-            let repo_path = self.repo_path.clone();
+            let repo_path = repo_path;
             move || git_ops::open_repo(&repo_path)
         })
         .await
@@ -175,7 +201,7 @@ impl CoreManagerService {
         {
             let mut cache = self.tags_cache.write();
             cache.tags = tags.clone();
-            cache.cached_at = Instant::now();
+            cache.cached_at = Some(Instant::now());
         }
 
         // 持久化到 LogStore
@@ -197,7 +223,7 @@ impl CoreManagerService {
     /// 当前仓库状态
     pub async fn current_version(&self) -> Result<CoreStatus, CoreError> {
         let _guard = self.repo_lock.lock().await;
-        let repo_path = self.repo_path.clone();
+        let repo_path = self.current_repo_path();
 
         let repo = tokio::task::spawn_blocking(move || git_ops::open_repo(&repo_path))
             .await
@@ -208,7 +234,7 @@ impl CoreManagerService {
             .map_err(|e| CoreError::GitError(e.to_string()))??;
 
         // 重新打开取 commit + status
-        let repo_path = self.repo_path.clone();
+        let repo_path = self.current_repo_path();
         let repo = tokio::task::spawn_blocking(move || git_ops::open_repo(&repo_path))
             .await
             .map_err(|e| CoreError::GitError(e.to_string()))??;
@@ -217,7 +243,7 @@ impl CoreManagerService {
             .await
             .map_err(|e| CoreError::GitError(e.to_string()))??;
 
-        let repo_path = self.repo_path.clone();
+        let repo_path = self.current_repo_path();
         let has_local_changes =
             tokio::task::spawn_blocking(move || -> Result<bool, CoreError> {
                 let repo = git_ops::open_repo(&repo_path)?;
@@ -253,7 +279,7 @@ impl CoreManagerService {
         // 当前暂跳过此检查（ProcessLauncher 未实现）
 
         let _guard = self.repo_lock.lock().await;
-        let repo_path = self.repo_path.clone();
+        let repo_path = self.current_repo_path();
         let tag = tag.to_string();
 
         let repo = tokio::task::spawn_blocking(move || git_ops::open_repo(&repo_path))
@@ -302,7 +328,7 @@ impl CoreManagerService {
     /// 检查工作区是否有未提交改动
     pub async fn has_local_changes(&self) -> Result<bool, CoreError> {
         let _guard = self.repo_lock.lock().await;
-        let repo_path = self.repo_path.clone();
+        let repo_path = self.current_repo_path();
         let result = tokio::task::spawn_blocking(move || -> Result<bool, CoreError> {
             let repo = git_ops::open_repo(&repo_path)?;
             git_ops::has_local_changes(&repo)
@@ -315,22 +341,36 @@ impl CoreManagerService {
     /// 失效 tags 缓存（事件总线触发或手动调用）
     pub fn invalidate_tags_cache(&self) {
         let mut cache = self.tags_cache.write();
-        cache.cached_at = Instant::now() - TAGS_CACHE_TTL * 2;
+        cache.cached_at = None; // 失效缓存（避免 Instant 下溢出 panic）
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConfigService;
     use crate::event_bus::EventBus;
     use crate::log_store::LogStoreService;
 
+    /// 构造测试用 CoreManagerService（路径热加载版）
+    ///
+    /// 与 `new(config, event_bus, log_store)` 一致，
+    /// 但额外用 `config.update()` 把 `comfyui_root` 指向临时目录。
     async fn make_service(tmp: &tempfile::TempDir) -> CoreManagerService {
         let event_bus = EventBus::new();
         let log_store = std::sync::Arc::new(
             LogStoreService::new(None).await.expect("logstore init failed"),
         );
-        CoreManagerService::new(tmp.path().to_path_buf(), event_bus, log_store)
+        let config = std::sync::Arc::new(ConfigService::new_for_test(event_bus.clone()));
+        // 模拟"用户配置的 comfyui_root 指向临时目录"
+        config
+            .update(|cfg| {
+                cfg.paths.comfyui_root = tmp.path().to_path_buf();
+                Ok(())
+            })
+            .await
+            .expect("set comfyui_root");
+        CoreManagerService::new(config, event_bus, log_store)
     }
 
     #[tokio::test]
@@ -354,5 +394,39 @@ mod tests {
         let service = make_service(&tmp).await;
         let result = service.list_tags(false).await;
         assert!(matches!(result, Err(CoreError::NotCloned)));
+    }
+
+    /// 路径热加载测试：改 config 后立即生效，无需重建 service
+    #[tokio::test]
+    async fn test_hot_reload_repo_path() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+
+        let event_bus = EventBus::new();
+        let log_store = std::sync::Arc::new(
+            LogStoreService::new(None).await.expect("logstore init failed"),
+        );
+        let config = std::sync::Arc::new(ConfigService::new_for_test(event_bus.clone()));
+        config
+            .update(|cfg| {
+                cfg.paths.comfyui_root = tmp1.path().to_path_buf();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let service = CoreManagerService::new(config.clone(), event_bus, log_store);
+
+        // 初始路径
+        assert_eq!(service.repo_path(), tmp1.path().to_path_buf());
+
+        // 改 config → service 立即看到新路径（无需重建）
+        config
+            .update(|cfg| {
+                cfg.paths.comfyui_root = tmp2.path().to_path_buf();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(service.repo_path(), tmp2.path().to_path_buf());
     }
 }

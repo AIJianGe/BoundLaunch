@@ -18,6 +18,7 @@
  * | Ctrl+R | 刷新环境探查（启动页） |
  * | Ctrl+L | 切换到日志页 |
  * | Ctrl+, | 切换到设置页 |
+ * | Ctrl+Q | **F24 退出 launcher（弹确认 + 联动关闭 ComfyUI）** |
  * | Ctrl+1 ~ Ctrl+8 | 切换到对应页面 |
  * | Ctrl+F | 焦点搜索框（日志页/插件管理页） |
  * | F5 | 刷新当前页面（重新加载路由） |
@@ -40,6 +41,7 @@ import { onMounted, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
 import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
+import { useShutdown } from "@/composables/useShutdown";
 
 /** 8 个主导航路径，对应 Ctrl+1 ~ Ctrl+8 */
 const NAV_PATHS = [
@@ -59,6 +61,7 @@ export function useShortcuts() {
   const router = useRouter();
   const processStore = useProcessStore();
   const envStore = useEnvStore();
+  const shutdown = useShutdown();
 
   /** Ctrl+Enter：启动 ComfyUI（仅在启动页生效） */
   function onCtrlEnter() {
@@ -115,6 +118,14 @@ export function useShortcuts() {
     // Tauri 2 在开发模式下默认开启 DevTools（F12）
     // 这里通过自定义事件通知（main.ts 中可监听并调用 webview.open_devtools）
     window.dispatchEvent(new CustomEvent("shortcut:toggle-devtools"));
+  }
+
+  /** Ctrl+Q：F24 退出 launcher（弹确认 + 联动关闭 ComfyUI） */
+  function onCtrlQ(event: KeyboardEvent) {
+    event.preventDefault();
+    shutdown.requestExit("shortcut_ctrl_q").catch((e) =>
+      console.warn("[shortcut] shutdown failed:", e),
+    );
   }
 
   /** F5：刷新当前页面 */
@@ -185,6 +196,12 @@ export function useShortcuts() {
     // Ctrl+F
     if (ctrl && (event.key === "f" || event.key === "F")) {
       onCtrlF(event);
+      return;
+    }
+
+    // Ctrl+Q（F24 退出 launcher）
+    if (ctrl && !event.shiftKey && (event.key === "q" || event.key === "Q")) {
+      onCtrlQ(event);
       return;
     }
 

@@ -3,6 +3,8 @@
 //! 详见 `PR/03-模块设计/02-PythonEnvManager.md §1 模块职责` 中 verify_venv
 
 use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -10,6 +12,42 @@ use crate::env_inspector::scripts::{probe_torch_script, venv_python_path};
 use crate::error::EnvError;
 
 use super::models::EnvInfo;
+
+/// 探查 venv 中 Python 版本（v2.13）
+///
+/// 轻量探测：`python -c "import sys; print(sys.version.split()[0])"`，5s 超时。
+/// 返回 `Option<String>`：
+/// - `Some("3.11.10")` 成功
+/// - `None` 失败（python 不存在 / 超时 / 解析失败）
+pub async fn probe_python_version(python: &Path) -> Option<String> {
+    let script = "import sys; print(sys.version.split()[0])";
+    let child = tokio::process::Command::new(python)
+        .args(["-c", script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        child.wait_with_output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v = stdout.trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
 
 /// 校验 venv 完整性
 ///

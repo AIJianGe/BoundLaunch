@@ -18,6 +18,43 @@ pub struct EnvInfo {
     pub inspected_at: DateTime<Utc>,
 }
 
+/// 扁平环境快照（v2.13 前端 `env_inspect` 命令返回）
+///
+/// v2.10 之前 `env_inspect` 直接返回 `EnvInfo`（嵌套结构），
+/// 但前端 `EnvInfo` 类型假设的是扁平字段（`torch_installed` / `comfyui_cloned` /
+/// `last_updated` 等），导致前端读不到数据 → 显示「未安装 / 未配置」。
+///
+/// 改为返回本结构，扁平字段 + 直接对应前端类型：
+/// - `StatusCard.vue` 读 `envInfo.torch_installed / cuda_version / gpu_name` 等
+/// - 关键依赖列表读 `envInfo.dependencies`
+/// - 页脚读 `envInfo.venv_path / comfyui_cloned / last_updated`
+///
+/// 保留 `EnvInfo` 嵌套结构供模块内部其他消费者使用。
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvSnapshot {
+    // —— 路径 ——
+    pub python_path: String,
+    pub venv_path: String,
+    pub comfyui_root: String,
+
+    // —— Python / Torch 状态 ——
+    pub python_version: String,
+    pub torch_installed: bool,
+    pub torch_version: Option<String>,
+    pub cuda_available: bool,
+    pub cuda_version: Option<String>,
+    pub gpu_name: Option<String>,
+
+    // —— ComfyUI ——
+    pub comfyui_cloned: bool,
+
+    // —— 依赖 ——
+    pub dependencies: Vec<DependencyInfo>,
+
+    // —— 元信息 ——
+    pub last_updated: DateTime<Utc>,
+}
+
 /// torch 安装与 CUDA 信息
 #[derive(Debug, Clone, Serialize)]
 pub struct TorchInfo {

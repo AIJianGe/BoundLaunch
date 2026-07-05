@@ -41,7 +41,10 @@
 import { onMounted, onUnmounted } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useProcessStore } from "@/stores/process";
+import { useConfigStore } from "@/stores/config";
 import { useToast } from "@/composables/useToast";
+import { useShutdown } from "@/composables/useShutdown";
+import { devLog } from "@/composables/useDevLog";
 import { listen, type UnlistenFn } from "@/api";
 
 /** 托盘动作事件 payload */
@@ -51,7 +54,9 @@ interface TrayActionPayload {
 
 export function useTray() {
   const processStore = useProcessStore();
+  const configStore = useConfigStore();
   const toast = useToast();
+  const shutdown = useShutdown();
   const unlisteners: UnlistenFn[] = [];
 
   /** 显示主窗口 */
@@ -66,30 +71,19 @@ export function useTray() {
     }
   }
 
-  /** 退出应用 */
+  /**
+   * F24 退出 launcher
+   *
+   * 通过 `useShutdown.requestExit('tray_quit')` 走完整 F24 流程：
+   * 1. 弹确认对话框（未运行/运行中两种形态）
+   * 2. 调 `shutdown_all` Tauri command
+   * 3. 后端 ShutdownCoordinator 5 步事务
+   * 4. app.exit(0)
+   *
+   * 不再直接 `app.exit()` 避免 python worker 残留。
+   */
   async function quitApp() {
-    try {
-      // 提示用户：若 ComfyUI 运行中，会一并终止
-      if (processStore.isAlive) {
-        toast.info("正在停止 ComfyUI 并退出...");
-        await processStore.stop().catch((e) => {
-          console.warn("[tray] stop on quit failed:", e);
-        });
-      }
-      // 调用 Tauri 的 app.exit() 通过 Rust 端彻底退出
-      // 不要用 win.destroy() —— 与 Tauri 默认销毁流程冲突
-      const { exit } = await import("@tauri-apps/plugin-process");
-      await exit(0);
-    } catch (e) {
-      console.error("[tray] quit failed:", e);
-      // 兜底：作为最后手段，关闭 webview
-      try {
-        const win = getCurrentWindow();
-        await win.destroy();
-      } catch (e2) {
-        console.error("[tray] fallback destroy failed:", e2);
-      }
-    }
+    await shutdown.requestExit("tray_quit");
   }
 
   /** 处理托盘动作 */
@@ -126,41 +120,81 @@ export function useTray() {
     }
   }
 
-  /** 监听窗口关闭按钮：最小化到托盘（保活 ComfyUI 进程） */
+  /**
+   * 监听窗口关闭按钮
+   *
+   * F19b + F24 行为：
+   * - minimize_to_tray 开关=true 且 ComfyUI 在运行：保活 ComfyUI，仅隐藏窗口
+   * - 其他情况：弹确认对话框 → 走 F24 shutdown 流程
+   *
+   * 注：Tauri 2 `onCloseRequested` 回调必须是同步签名：
+   * 1) 同步 `preventDefault()`
+   * 2) 副作用延后到 `queueMicrotask`（避免与 Tauri 默认销毁流程 race）
+   */
   async function setupCloseToTray() {
     console.log("[tray] setupCloseToTray called");
+    devLog("[tray]", "setup_enter", {});
     try {
       const win = getCurrentWindow();
       console.log("[tray] got current window, label =", win.label);
-      // 关键：回调必须是同步函数（Tauri 2 的 onCloseRequested 需要在第一行同步
-      // 决定是否 preventDefault）。async 回调虽然第一行也是同步执行，但
-      // Tauri 内部会 await handler Promise，与默认 close 流程有 race condition。
-      // 所以：
-      //   1) 回调签名用 `(event) => void`（非 async）
-      //   2) preventDefault() 同步调用
-      //   3) win.hide() / win.destroy() 等副作用用 queueMicrotask 延后到下一个微任务
+      devLog("[tray]", "got_window", { label: win.label });
+
       const unlisten = await win.onCloseRequested((event) => {
-        const alive = processStore.isAlive;
-        console.log("[tray] close-requested event, isAlive =", alive);
-        if (alive) {
-          // 阻止默认关闭
-          event.preventDefault();
-          // 副作用延后：避免在 close-requested 流程未结束时调用窗口 API
-          queueMicrotask(async () => {
+        // F19b：读用户设置（默认 minimize_to_tray=false → 走 F24）
+        const minimizeToTray = configStore.config?.ui?.minimize_to_tray ?? false;
+        const isAlive = processStore.isAlive;
+        const cfgUi = configStore.config?.ui;
+        console.log(
+          "[tray] close-requested event, minimize_to_tray =",
+          minimizeToTray,
+          ", isAlive =",
+          isAlive,
+        );
+        devLog("[tray]", "handler_enter", {
+          minimizeToTray,
+          isAlive,
+          configUiExists: cfgUi !== undefined,
+          configUiRaw: cfgUi,
+        });
+
+        // 阻止默认关闭（无论走哪条路径都要拦截，因为要再走自定义逻辑）
+        event.preventDefault();
+        devLog("[tray]", "preventDefault_called", {});
+
+        // 副作用延后到下一个微任务
+        queueMicrotask(async () => {
+          devLog("[tray]", "microtask_enter", { minimizeToTray, isAlive });
+          // F19b 仅在 ComfyUI 在运行时生效：避免"未运行却最小化"的反直觉行为
+          // （minimizeToTray=true 但 ComfyUI 未运行 → 强制走 F24 弹确认关闭）
+          if (minimizeToTray && isAlive) {
+            devLog("[tray]", "decision_f19b", { action: "win.hide" });
+            // F19b 行为：仅隐藏窗口，ComfyUI 继续运行
             try {
               await win.hide();
+              devLog("[tray]", "action_done", { action: "win.hide", success: true });
               toast.info("ComfyUI 仍在运行，已最小化到托盘");
             } catch (e) {
+              devLog("[tray]", "error", { stage: "win.hide", msg: String(e) });
               console.warn("[tray] hide failed:", e);
             }
-          });
-        }
-        // else 分支：什么都不做，让 Tauri 默认流程关闭整个应用
-        // 不要调 win.destroy() —— 会与 Tauri 默认销毁流程冲突导致卡死
+          } else {
+            devLog("[tray]", "decision_f24", { action: "shutdown.requestExit" });
+            // F24 行为：弹确认 → shutdown_all → app.exit
+            try {
+              await shutdown.requestExit("window_close");
+              devLog("[tray]", "action_done", { action: "shutdown.requestExit", success: true });
+            } catch (e) {
+              devLog("[tray]", "error", { stage: "shutdown.requestExit", msg: String(e) });
+              console.error("[tray] shutdown failed:", e);
+            }
+          }
+        });
       });
       unlisteners.push(unlisten);
       console.log("[tray] onCloseRequested registered, total unlisteners =", unlisteners.length);
+      devLog("[tray]", "setup_done", { unlistenerCount: unlisteners.length });
     } catch (e) {
+      devLog("[tray]", "error", { stage: "setupCloseToTray", msg: String(e) });
       console.error("[tray] setup close-to-tray failed:", e);
     }
   }

@@ -8,11 +8,12 @@
  * - theme: light / dark / auto（跟随系统）
  * - language: zh-CN（本期仅 zh-CN，预留 en-US）
  * - auto_check_updates（启动时自动检查更新，本期 UI 预留字段，默认开启）
- * - minimize_to_tray（关闭窗口时最小化到托盘，本期预留）
+ * - minimize_to_tray（F19b：关闭窗口时最小化到托盘，默认关 → 走 F24 弹确认流程）
  *
  * 行为：
  * - theme 切换立即生效（themeStore 修改 → App.vue 响应）
  * - 其他字段调用 configStore.update
+ * - minimize_to_tray 切换后下次关闭窗口即生效（tray.ts onCloseRequested 读 config）
  */
 
 import { computed, watch, ref } from "vue";
@@ -43,7 +44,8 @@ const languageOptions = [
 const currentTheme = ref<Theme>("auto");
 const currentLanguage = ref("zh-CN");
 const autoCheckUpdates = ref(true);
-const minimizeToTray = ref(true);
+/** F19b：关闭窗口时最小化到托盘（默认 false → 走 F24 弹确认流程） */
+const minimizeToTray = ref(false);
 
 watch(
   () => configStore.config,
@@ -51,7 +53,11 @@ watch(
     if (cfg) {
       currentTheme.value = cfg.ui.theme;
       currentLanguage.value = cfg.ui.language;
-      // auto_check_updates / minimize_to_tray 字段在 UiConfig 中暂未实现，使用默认值
+      // F19b：从 Config 同步 minimize_to_tray 到本地 ref
+      if (typeof cfg.ui.minimize_to_tray === "boolean") {
+        minimizeToTray.value = cfg.ui.minimize_to_tray;
+      }
+      // auto_check_updates 字段在 UiConfig 中暂未实现，使用默认值
     }
   },
   { immediate: true },
@@ -77,15 +83,26 @@ async function onLanguageChange(value: string) {
   }
 }
 
-// 以下两个开关本期仅 UI 预留，实际行为未实现
+// 自动检查更新：本期仅 UI 预留
 async function onAutoCheckUpdates(value: boolean) {
   autoCheckUpdates.value = value;
   // TODO: 持久化到 UiConfig（需后端扩展字段）
 }
 
+/**
+ * F19b：关闭窗口时最小化到托盘
+ *
+ * 切换后立即持久化到 Config；下次点击窗口 [X] 时由 tray.ts onCloseRequested 读 config 决定：
+ * - true → 隐藏窗口，ComfyUI 继续运行
+ * - false → 走 F24 流程（弹确认 → shutdown_all → app.exit）
+ */
 async function onMinimizeToTray(value: boolean) {
   minimizeToTray.value = value;
-  // TODO: 持久化 + 接入 Tauri 窗口关闭事件
+  try {
+    await configStore.update({ ui: { minimize_to_tray: value } });
+  } catch (e) {
+    toast.error("保存失败", e);
+  }
 }
 </script>
 
@@ -121,7 +138,9 @@ async function onMinimizeToTray(value: boolean) {
 
       <NFormItem label="关闭窗口时最小化到托盘">
         <NSwitch :value="minimizeToTray" @update:value="onMinimizeToTray" />
-        <span class="form-hint">（预留功能，保活 ComfyUI）</span>
+        <span class="form-hint">
+          关闭 = 退出 launcher；开启 = 隐藏窗口，ComfyUI 继续运行
+        </span>
       </NFormItem>
     </NForm>
   </NCard>

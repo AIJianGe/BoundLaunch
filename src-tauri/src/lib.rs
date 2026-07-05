@@ -40,6 +40,7 @@ use crate::log_store::LogStoreService;
 use crate::model_path::ModelPathService;
 use crate::plugin_manager::PluginManagerService;
 use crate::process_launcher::ProcessLauncherService;
+use crate::process_launcher::ShutdownCoordinator;
 use crate::python_env::PythonEnvService;
 use crate::task_scheduler::TaskSchedulerService;
 
@@ -68,9 +69,11 @@ pub fn run() {
                 // Config 初始化
                 let config_path = paths::config_path();
                 tracing::info!(?config_path, "loading config");
-                let config = ConfigService::load(config_path, (*event_bus).clone())
-                    .await
-                    .expect("failed to load config");
+                let config = std::sync::Arc::new(
+                    ConfigService::load(config_path, (*event_bus).clone())
+                        .await
+                        .expect("failed to load config"),
+                );
 
                 // LogStore 初始化（WAL 模式 + 启动 7 天清理后台 task）
                 let log_db = paths::log_db_path();
@@ -81,16 +84,31 @@ pub fn run() {
                         .expect("failed to init LogStore"),
                 );
 
-                // EnvironmentInspector 初始化（30s 缓存 + 事件总线订阅）
-                let env_inspector =
-                    EnvironmentInspectorService::new((*event_bus).clone());
+                // uv sidecar 先发布到用户目录（同时供 PythonEnv + EnvironmentInspector 使用）
+                //
+                // v2.10：EnvironmentInspector 也需要 uv_binary 用于加速 pip list 探查
+                // （uv pip list 主路径 + python -m pip fallback）
+                let uv_path = uv_sidecar::ensure_released(&handle).await;
 
-                // PythonEnvManager 初始化：优先 sidecar uv，回退到 PATH
-                // 详见 uv_sidecar.rs
-                let python_env = match uv_sidecar::ensure_released(&handle).await {
-                    Some(uv_path) => {
-                        tracing::info!(?uv_path, "using bundled uv sidecar");
-                        PythonEnvService::new(uv_path, (*event_bus).clone())
+                // EnvironmentInspector 初始化（30s 缓存 + 事件总线订阅 + uv binary 注入）
+                let env_inspector = match &uv_path {
+                    Some(p) => {
+                        tracing::info!(?p, "EnvironmentInspector: injecting uv binary for pip list");
+                        EnvironmentInspectorService::new((*event_bus).clone(), p.clone())
+                    }
+                    None => {
+                        tracing::warn!(
+                            "EnvironmentInspector: uv sidecar not available, pip list will use python -m pip fallback"
+                        );
+                        EnvironmentInspectorService::new_for_test((*event_bus).clone())
+                    }
+                };
+
+                // PythonEnvManager 初始化：复用同一 uv_path
+                let python_env = match uv_path {
+                    Some(p) => {
+                        tracing::info!(?p, "using bundled uv sidecar");
+                        PythonEnvService::new(p, (*event_bus).clone())
                     }
                     None => {
                         tracing::warn!(
@@ -100,23 +118,19 @@ pub fn run() {
                     }
                 };
 
-                // CoreManager 初始化（comfyui_root 来自 Config，复用同一个 Arc<LogStoreService>）
-                let comfyui_root = std::path::PathBuf::from(&config.get().paths.comfyui_root);
+                // CoreManager 初始化（路径热加载：从 config 读 comfyui_root，无需重启即可生效）
                 let core_manager = CoreManagerService::new(
-                    comfyui_root.clone(),
+                    config.clone(),
                     (*event_bus).clone(),
                     log_store.clone(),
                 );
 
-                // ModelPathService 初始化（yaml 路径 = <comfyui_root>/extra_model_paths.yaml）
-                let model_path = ModelPathService::new(comfyui_root.clone());
+                // ModelPathService 初始化（yaml 路径 = <comfyui_root>/extra_model_paths.yaml，路径热加载）
+                let model_path = ModelPathService::new(config.clone());
 
-                // PluginManager 初始化（custom_nodes = <comfyui_root>/custom_nodes，venv 来自 Config）
-                let custom_nodes_path = comfyui_root.join("custom_nodes");
-                let venv_path = std::path::PathBuf::from(&config.get().paths.venv_path);
+                // PluginManager 初始化（custom_nodes + venv，路径热加载）
                 let plugin_manager = PluginManagerService::new(
-                    custom_nodes_path,
-                    venv_path.clone(),
+                    config.clone(),
                     (*event_bus).clone(),
                 );
 
@@ -131,22 +145,19 @@ pub fn run() {
                 );
 
                 // ProcessLauncher 初始化
-                // - 复用 comfyui_root / venv_path（来自 Config）
-                // - data_dir 用于存放 comfyui.pid（崩溃恢复用）
+                // - comfyui_root / venv_path 由 config 运行时提供（路径热加载）
+                // - data_dir 用于存放 comfyui.pid（崩溃恢复用），属于 app 状态不通过 config 改
                 let data_dir = paths::app_data_dir();
                 if let Err(e) = paths::ensure_dir(&data_dir).await {
                     tracing::warn!(?data_dir, error = %e, "failed to ensure data_dir");
                 }
                 let python_env_arc = std::sync::Arc::new(python_env);
                 let model_path_arc = std::sync::Arc::new(model_path);
-                let config_arc = std::sync::Arc::new(config);
                 let process_launcher = ProcessLauncherService::new(
                     python_env_arc.clone(),
                     model_path_arc.clone(),
                     log_store.clone(),
-                    config_arc.clone(),
-                    comfyui_root.clone(),
-                    venv_path.clone(),
+                    config.clone(),
                     data_dir,
                 );
 
@@ -159,9 +170,15 @@ pub fn run() {
                     launcher_for_stale.check_stale_process(&app_handle_for_stale).await;
                 });
 
+                // F24 退出流程：构造 ShutdownCoordinator（依赖 process_launcher + event_bus）
+                let shutdown_coordinator = std::sync::Arc::new(ShutdownCoordinator::new(
+                    process_launcher.clone(),
+                    (*event_bus).clone(),
+                ));
+
                 app_state::AppState {
                     event_bus,
-                    config: config_arc,
+                    config: config.clone(),
                     log_store,
                     env_inspector: std::sync::Arc::new(env_inspector),
                     python_env: python_env_arc,
@@ -170,6 +187,7 @@ pub fn run() {
                     plugin_manager: std::sync::Arc::new(plugin_manager),
                     task_scheduler: std::sync::Arc::new(task_scheduler),
                     process_launcher: std::sync::Arc::new(process_launcher),
+                    shutdown_coordinator,
                 }
             });
 
@@ -241,6 +259,9 @@ pub fn run() {
             commands::process_launcher::process_status,
             commands::process_launcher::process_tail_log,
             commands::process_launcher::process_kill_stale,
+            commands::process_launcher::shutdown_all,
+            // Dev 诊断
+            commands::dev_log::dev_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -138,6 +138,10 @@ pub enum StopReason {
     ExternalSignal,
     /// 父进程退出
     ParentExit,
+    /// F24 退出流程触发（由 ShutdownCoordinator 调用 stop 传此 reason）
+    ///
+    /// 与 UserRequested 的区别：会联动清理更多资源（关闭进程组、广播 AppExited）
+    Shutdown,
 }
 
 impl StopReason {
@@ -147,8 +151,31 @@ impl StopReason {
             Self::HealthCheckTimeout => "health_check_timeout",
             Self::ExternalSignal => "external_signal",
             Self::ParentExit => "parent_exit",
+            Self::Shutdown => "shutdown",
         }
     }
+}
+
+/// F24 退出流程结果报告（由 ShutdownCoordinator 5 步事务完成后产出）
+///
+/// 前端调用 `invoke('shutdown_all')` 时接收，载荷含 ComfyUI 运行时状态、
+/// 实际停止耗时、退出原因，便于审计 / 日志 / 遥测。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShutdownReport {
+    /// ComfyUI 是否在退出前处于运行中
+    ///
+    /// 由 ShutdownCoordinator 在 stop 之前查询 `process_launcher.is_running()` 决定。
+    /// false 表示未启动 ComfyUI 直接退出（无需 stop 流程）。
+    pub comfyui_was_running: bool,
+
+    /// ComfyUI 停止阶段耗时（毫秒）
+    ///
+    /// - comfyui_was_running=false：固定为 0
+    /// - comfyui_was_running=true：从 `process_launcher.stop()` 开始到 `child.wait()` 完成
+    pub stop_elapsed_ms: u64,
+
+    /// 退出原因（与 AppExiting 事件载荷对齐）
+    pub reason: crate::event_bus::ShutdownReason,
 }
 
 /// 健康检查结果

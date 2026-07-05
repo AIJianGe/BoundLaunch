@@ -66,6 +66,35 @@ impl UvRunner {
         }
     }
 
+    /// 获取 uv 版本字符串（v2.13）
+    ///
+    /// 执行 `uv --version`，解析输出格式：`uv <version> (<commit> <date>)`
+    /// 返回 `(version_string, is_available)` 元组：
+    /// - 可用 + 解析成功 → `(Some("0.4.18"), true)`
+    /// - 可用 + 解析失败 → `(None, true)`（输出格式未知时降级）
+    /// - 不可用 → `(None, false)`
+    pub async fn get_version(&self) -> (Option<String>, bool) {
+        let uv_bin = &self.uv_binary;
+        let is_absolute = uv_bin != &PathBuf::from("uv") && uv_bin.is_absolute();
+        if is_absolute && !uv_bin.exists() {
+            return (None, false);
+        }
+        match tokio::process::Command::new(uv_bin).arg("--version").output().await {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // 格式：`uv 0.4.18 (d3dc3a323 2024-11-21)`
+                // 取第二个空格分隔的 token
+                let version = stdout
+                    .trim()
+                    .split_whitespace()
+                    .nth(1)
+                    .map(|s| s.to_string());
+                (version, true)
+            }
+            _ => (None, false),
+        }
+    }
+
     /// 安装便携 Python
     ///
     /// `uv python install <version>`
@@ -84,7 +113,18 @@ impl UvRunner {
 
     /// 创建 venv
     ///
-    /// `uv venv <path> --python <version>`
+    /// `uv venv <path> --python <version> --seed`
+    ///
+    /// `--seed` 参数让 uv 在 venv 中安装 pip + setuptools + wheel，原因：
+    /// - uv venv 默认不装 pip（uv 自己是包管理器，不需要 pip）
+    /// - 但项目 inspect_dependencies / verify_venv 流程依赖 `python -m pip list`
+    /// - ComfyUI 运行时某些自定义节点可能用 pip 装依赖
+    ///
+    /// **v2.12：创建前清理已存在目录**
+    /// uv venv 不允许在已存在的目录上创建（即使目录不是合法 venv）。
+    /// 上次失败的 venv 创建可能留下不完整目录（如缺 pyvenv.cfg），
+    /// 导致用户重试时 uv 报 "exists, but it's not a virtual environment"。
+    /// 一律先删除，确保从干净状态开始。
     ///
     /// 错误处理：uv 不存在时直接返回 `UvNotFound`，避免把底层 `program not found`
     /// 错误归为 venv 创建失败。
@@ -97,9 +137,28 @@ impl UvRunner {
         if !self.is_available().await {
             return Err(EnvError::UvNotFound(self.uv_binary.to_string_lossy().into_owned()));
         }
+
+        // v2.12：创建前清理已存在的目录
+        //
+        // 场景：上次 create_venv 失败（超时 / kill / 中断）可能留下不完整目录，
+        // uv 检测到目录存在但不是合法 venv 时会直接报错退出。
+        // 这里无条件先删除，保证从干净状态开始。
+        if venv_path.exists() {
+            tracing::info!(
+                ?venv_path,
+                "create_venv: removing existing directory before creation"
+            );
+            tokio::fs::remove_dir_all(venv_path)
+                .await
+                .map_err(|e| EnvError::VenvCreateFailed(format!(
+                    "failed to remove existing venv directory: {}\nvenv 路径: {}\n提示: 可能有进程占用 venv 目录（如 python.exe 残留），请关闭相关程序后重试",
+                    e, venv_path.display()
+                )))?;
+        }
+
         let venv_str = venv_path.to_string_lossy().to_string();
         let python_arg = format!("--python={}", python_version);
-        let output = match self.run_cmd(&["venv", &venv_str, &python_arg]).await {
+        let output = match self.run_cmd(&["venv", &venv_str, &python_arg, "--seed"]).await {
             Ok(out) => out,
             Err(e) => {
                 return Err(EnvError::VenvCreateFailed(format!(

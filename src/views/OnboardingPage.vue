@@ -354,7 +354,9 @@ class InitStageError extends Error {
             ⚠ venv 路径不能与 ComfyUI 根目录相同
           </span>
           <span v-else>
-            venv 用于隔离 Python 依赖，建议放在 ComfyUI 根目录下的 venv 子目录。
+            venv 是 ComfyUI 专用的 Python 运行环境目录，程序会在此自动下载 Python
+            并安装所需依赖（如 torch）。请选择空文件夹或新路径（程序会自动创建），
+            请勿指向系统已有的 Python 安装目录。
           </span>
         </NAlert>
       </div>
