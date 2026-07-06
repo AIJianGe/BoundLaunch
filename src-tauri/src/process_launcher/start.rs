@@ -376,7 +376,8 @@ pub async fn remove_pid_file(path: &Path) {
 pub async fn is_comfyui_process(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
-        let output = tokio::process::Command::new("wmic")
+        // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
+        let output = crate::common::process_util::new_command("wmic")
             .args([
                 "process",
                 "where",
@@ -414,7 +415,8 @@ pub async fn is_comfyui_process(pid: u32) -> bool {
         // macOS 无 /proc 文件系统，改用 `ps -p <pid> -o command=` 查命令行
         // -p: 按 PID 过滤；-o command=: 仅输出命令列（无表头）
         let pid_str = pid.to_string();
-        let output = tokio::process::Command::new("ps")
+        // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW（macOS 无影响）
+        let output = crate::common::process_util::new_command("ps")
             .args(["-p", &pid_str, "-o", "command="])
             .output()
             .await;

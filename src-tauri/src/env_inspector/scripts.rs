@@ -151,7 +151,9 @@ pub async fn run_python_script(
     }
 
     // kill_on_drop(true)：超时 drop 时自动杀子进程，避免残留 python.exe 持有文件锁
-    let child = tokio::process::Command::new(&python)
+    //
+    // v3.3：使用 `new_command` 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
+    let child = crate::common::process_util::new_command(&python)
         .args(["-c", script])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -226,7 +228,9 @@ pub async fn run_pip_list(
                 "run_pip_list: trying uv pip list (primary)"
             );
             // kill_on_drop(true)：超时 drop 时自动杀子进程
-            let child = match tokio::process::Command::new(uv)
+            //
+            // v3.3：使用 `new_command` 在 Windows 上加 CREATE_NO_WINDOW
+            let child = match crate::common::process_util::new_command(uv)
                 .args(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -291,7 +295,9 @@ async fn run_pip_list_fallback(python: &Path) -> Result<String, EnvError> {
         "run_pip_list_fallback: trying python -m pip list"
     );
     // kill_on_drop(true)：超时 drop 时自动杀子进程
-    let child = tokio::process::Command::new(python)
+    //
+    // v3.3：使用 `new_command` 在 Windows 上加 CREATE_NO_WINDOW
+    let child = crate::common::process_util::new_command(python)
         .args(PIP_LIST_ARGS)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

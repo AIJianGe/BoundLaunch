@@ -21,7 +21,8 @@ use super::models::EnvInfo;
 /// - `None` 失败（python 不存在 / 超时 / 解析失败）
 pub async fn probe_python_version(python: &Path) -> Option<String> {
     let script = "import sys; print(sys.version.split()[0])";
-    let child = tokio::process::Command::new(python)
+    // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
+    let child = crate::common::process_util::new_command(python)
         .args(["-c", script])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

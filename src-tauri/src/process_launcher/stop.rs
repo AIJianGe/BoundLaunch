@@ -82,7 +82,8 @@ pub async fn terminate_process(pid: u32, force: bool) -> std::io::Result<()> {
         if force {
             args.push("/F");
         }
-        let output = tokio::process::Command::new("taskkill")
+        // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
+        let output = crate::common::process_util::new_command("taskkill")
             .args(&args)
             .output()
             .await?;

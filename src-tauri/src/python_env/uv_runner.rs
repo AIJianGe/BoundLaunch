@@ -43,9 +43,10 @@ impl UvRunner {
     /// 检测 uv 是否可用
     pub async fn is_available(&self) -> bool {
         let uv_bin = &self.uv_binary;
+        // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW
         if uv_bin == &PathBuf::from("uv") {
             // 通过 PATH 查找
-            tokio::process::Command::new(uv_bin)
+            crate::common::process_util::new_command(uv_bin)
                 .arg("--version")
                 .output()
                 .await
@@ -57,7 +58,7 @@ impl UvRunner {
                 return false;
             }
             // 用 --version 实际跑一遍确认可执行
-            tokio::process::Command::new(uv_bin)
+            crate::common::process_util::new_command(uv_bin)
                 .arg("--version")
                 .output()
                 .await
@@ -79,7 +80,8 @@ impl UvRunner {
         if is_absolute && !uv_bin.exists() {
             return (None, false);
         }
-        match tokio::process::Command::new(uv_bin).arg("--version").output().await {
+        // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW
+        match crate::common::process_util::new_command(uv_bin).arg("--version").output().await {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 // 格式：`uv 0.4.18 (d3dc3a323 2024-11-21)`
@@ -324,7 +326,8 @@ impl UvRunner {
         let python = venv_python_path(venv_path);
         if python.exists() {
             let verify = variant.verify_command();
-            let verify_output = tokio::process::Command::new(&python)
+            // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW
+            let verify_output = crate::common::process_util::new_command(&python)
                 .arg("-c")
                 .arg(verify)
                 .output()
@@ -425,10 +428,15 @@ impl UvRunner {
     }
 
     /// 执行 uv 子命令（带超时）
+    ///
+    /// v3.3：使用 `crate::common::process_util::new_command` 创建子进程，
+    /// Windows 上自动加 `CREATE_NO_WINDOW` flag，避免 Tauri release 模式弹 cmd 窗口。
     async fn run_cmd(&self, args: &[&str]) -> Result<std::process::Output, std::io::Error> {
         tokio::time::timeout(
             Duration::from_secs(UV_TIMEOUT_SECS),
-            tokio::process::Command::new(&self.uv_binary).args(args).output(),
+            crate::common::process_util::new_command(&self.uv_binary)
+                .args(args)
+                .output(),
         )
         .await
         .map_err(|e| {

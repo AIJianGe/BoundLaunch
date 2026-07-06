@@ -33,7 +33,8 @@ pub async fn terminate_process(pid: u32, force: bool) -> io::Result<()> {
         if force {
             args.push("/F".to_string());
         }
-        let status = tokio::process::Command::new("taskkill")
+        // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
+        let status = crate::common::process_util::new_command("taskkill")
             .args(&args)
             .status()
             .await?;
@@ -64,7 +65,8 @@ pub async fn terminate_process(pid: u32, force: bool) -> io::Result<()> {
 pub async fn process_exists(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
-        let output = tokio::process::Command::new("tasklist")
+        // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
+        let output = crate::common::process_util::new_command("tasklist")
             .args(["/FI", &format!("PID eq {}", pid), "/NH"])
             .output()
             .await;

@@ -151,11 +151,25 @@ impl DiagnoseReport {
 /// `python_env` 参数：v1.8 预留给需要访问 PythonEnvService 状态的高级诊断
 /// （如检查 install_lock）。当前实现只用 venv_path / comfyui_root，
 /// 保留参数用于未来扩展（如"上次安装是否失败"状态查询）。
+///
+/// **v1.8 / F36-Phase2 重要修复**：函数末尾 emit `RequirementsInstalled` 事件。
+/// 原因：diagnose 可能"治愈"了 env cache 的 stale 问题（例如 torch 之前被误判为未装，
+/// 现在 probe 看到 import 成功）。前端 `env_store.subscribe` 监听 `env_inspect_updated`
+/// → 拿到最新 EnvSnapshot → `torchBroken` 告警条立即消失，避免「检测说没问题但 UI 仍告警」的
+/// "幽灵告警"问题。
+///
+/// 为什么用 `RequirementsInstalled` 而不是新加事件：
+/// - `EnvironmentInspectorService` 已经订阅了 `RequirementsInstalled`
+/// - 内部走 `spawn_refresh` → emit Tauri Event `env_inspect_updated` → 前端自动更新 envInfo
+/// - 复用现有事件链，不增加新事件类型
+///
+/// venv 不存在时**不**emit（避免无意义的 cache 失效，下一次 envInspect 也会自然刷新）。
 #[allow(unused_variables)]
 pub async fn diagnose(
     python_env: &PythonEnvService,
     venv_path: &Path,
     comfyui_root: &Path,
+    event_bus: &EventBus,
 ) -> DiagnoseReport {
     let mut issues = Vec::new();
 
@@ -169,6 +183,7 @@ pub async fn diagnose(
             detail: Some(format!("路径: {}", venv_path.display())),
             suggested_action: RepairAction::RebuildVenv,
         });
+        // venv 都没有 → emit 也没意义，env cache 失效后 inspect 也会失败
         return DiagnoseReport {
             venv_exists,
             torch_import_ok: false,
@@ -273,6 +288,24 @@ pub async fn diagnose(
     }
 
     let (suggested_action, suggested_reason) = DiagnoseReport::compute_suggested_action(&issues);
+
+    // v1.8 / F36-Phase2 修复：diagnose 完成后 emit RequirementsInstalled
+    //
+    // 触发链路：RequirementsInstalled → EnvironmentInspectorService 标记 cache stale
+    //   → 下次 inspect_or_cached 触发 spawn_refresh → emit Tauri Event `env_inspect_updated`
+    //   → 前端 env_store.subscribe 收到新 EnvSnapshot → torchBroken 告警条立即消失
+    //
+    // 即使 diagnose 没找到问题也 emit（这是关键）：
+    // - "已装但显示未装"是 cache stale 的典型症状
+    // - 一次无副作用的 cache 失效可以让下一次 inspect 拿到真值
+    // - 用户点"诊断"动作就是"我想看到最新状态"的强信号，必须 invalidate
+    tracing::debug!(
+        torch_import_ok,
+        issue_count = issues.len(),
+        "env_diagnose: emitting RequirementsInstalled to refresh env cache"
+    );
+    event_bus.emit(crate::event_bus::SystemEvent::RequirementsInstalled);
+
     DiagnoseReport {
         venv_exists,
         torch_import_ok,
@@ -354,7 +387,8 @@ async fn check_packages(
         args.push((*pkg).to_string());
     }
     let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let output = tokio::process::Command::new(&python)
+    // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
+    let output = crate::common::process_util::new_command(&python)
         .args(&args_ref)
         .output()
         .await
@@ -549,11 +583,15 @@ pub async fn rebuild_repair(
 }
 
 /// 包装 uv 子进程调用（带超时）
+///
+/// v3.3：使用 `new_command` 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
 async fn uv_run_cmd(uv: &UvRunner, args: &[&str]) -> Result<std::process::Output, EnvError> {
     use std::time::Duration;
     let output = tokio::time::timeout(
         Duration::from_secs(300), // 5 分钟
-        tokio::process::Command::new(uv.binary_path()).args(args).output(),
+        crate::common::process_util::new_command(uv.binary_path())
+            .args(args)
+            .output(),
     )
     .await
     .map_err(|_| EnvError::RebuildFailed {

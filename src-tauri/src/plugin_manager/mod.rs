@@ -378,7 +378,8 @@ impl PluginManagerService {
         let venv_python = venv_python_binary(&venv_path);
         tracing::info!(name, ?requirements_file, "installing plugin requirements");
 
-        let output = tokio::process::Command::new(&venv_python)
+        // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
+        let output = crate::common::process_util::new_command(&venv_python)
             .args(["-m", "pip", "install", "-r"])
             .arg(&requirements_file)
             .output()

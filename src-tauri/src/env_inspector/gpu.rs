@@ -38,9 +38,10 @@ pub async fn detect_gpu() -> GpuInfo {
 
 /// 尝试调用 nvidia-smi
 async fn try_detect_nvidia() -> Option<GpuInfo> {
+    // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
     let output = tokio::time::timeout(
         Duration::from_secs(NVIDIA_SMI_TIMEOUT_SECS),
-        tokio::process::Command::new("nvidia-smi")
+        crate::common::process_util::new_command("nvidia-smi")
             .args(NVIDIA_SMI_ARGS)
             .output(),
     )
