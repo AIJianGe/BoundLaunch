@@ -74,14 +74,19 @@ export function coreListTagsClassified(
 }
 
 /**
- * 检查切换版本的前置条件（v3.1 / F26 决策 5）
+ * 检查切换版本的前置条件（v3.5 异步化）
+ *
+ * v3.5 改造：原同步命令可能因 git status 阻塞，改为提交 `CheckPrereq` 任务并立即返回 task_id。
+ * 前端通过 `useTaskProgress` 跟踪进度，从 `task_completed.payload` 拿 `SwitchPrerequisites`。
  *
  * 前端调用此命令判断是否允许切换：
  * - ComfyUI 运行中 → 拒绝
  * - 工作区有未提交改动 → 拒绝
+ *
+ * @returns task_id
  */
-export function coreCheckSwitchPrerequisites(): Promise<SwitchPrerequisites> {
-  return invoke<SwitchPrerequisites>("core_check_switch_prerequisites");
+export function coreCheckSwitchPrerequisites(): Promise<string> {
+  return invoke<string>("core_check_switch_prerequisites");
 }
 
 /**
@@ -239,11 +244,11 @@ export interface VersionCompatReport {
   recommendedReason: string;
 }
 
-/** F36：切版本前调用的兼容性预检 */
+/** F36：切版本前调用的兼容性预检（v3.5 异步化） */
 export function coreCheckVersionCompatibility(
   targetTag: string
-): Promise<VersionCompatReport> {
-  return invoke<VersionCompatReport>("core_check_version_compatibility", {
+): Promise<string> {
+  return invoke<string>("core_check_version_compatibility", {
     targetTag,
   });
 }

@@ -6,13 +6,15 @@
 //! 1. 优先调 `nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader`
 //! 2. 无 nvidia-smi → 从 torch.cuda 推断（GpuInfo::Nvidia 仅 name 已知）
 //! 3. 仍无 → GpuInfo::CpuOnly（从 cpu brand 推断）
+//!
+//! v3.6：用 `CancellationToken` 替代 `tokio::time::timeout`（原 5s 硬性超时），
+//! 用户可通过 token 主动取消。
 
-use std::time::Duration;
+use std::process::Stdio;
+
+use tokio_util::sync::CancellationToken;
 
 use super::models::GpuInfo;
-
-/// nvidia-smi 子进程超时（秒）
-const NVIDIA_SMI_TIMEOUT_SECS: u64 = 5;
 
 /// nvidia-smi 命令行参数
 const NVIDIA_SMI_ARGS: &[&str] = &[
@@ -23,8 +25,10 @@ const NVIDIA_SMI_ARGS: &[&str] = &[
 /// 检测 GPU
 ///
 /// 永远返回 GpuInfo（不报错），失败时降级为 CpuOnly / Unknown
-pub async fn detect_gpu() -> GpuInfo {
-    match try_detect_nvidia().await {
+///
+/// v3.6：透传 `CancellationToken`，nvidia-smi 卡住时可取消
+pub async fn detect_gpu(cancel: &CancellationToken) -> GpuInfo {
+    match try_detect_nvidia(cancel).await {
         Some(gpu) => gpu,
         None => {
             // 无 NVIDIA，目前不做 AMD/Intel 子进程检测（暂未实现），
@@ -37,17 +41,18 @@ pub async fn detect_gpu() -> GpuInfo {
 }
 
 /// 尝试调用 nvidia-smi
-async fn try_detect_nvidia() -> Option<GpuInfo> {
-    // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
-    let output = tokio::time::timeout(
-        Duration::from_secs(NVIDIA_SMI_TIMEOUT_SECS),
-        crate::common::process_util::new_command("nvidia-smi")
-            .args(NVIDIA_SMI_ARGS)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+///
+/// v3.6：用 `run_with_cancel` 替代 `tokio::time::timeout`，cancel 时返回 None
+async fn try_detect_nvidia(cancel: &CancellationToken) -> Option<GpuInfo> {
+    let mut cmd = crate::common::process_util::new_command("nvidia-smi");
+    cmd.args(NVIDIA_SMI_ARGS)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let output = crate::common::subprocess::run_with_cancel(&mut cmd, cancel)
+        .await
+        .ok()?;
 
     if !output.status.success() {
         return None;

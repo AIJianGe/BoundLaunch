@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use tauri::AppHandle;
 
+use crate::common::line_collector::LineCollector;
 use crate::config::{CudaVersion, Config, ConfigService};
 use crate::python_env::models::InstallProgress;
 use crate::python_env::recovery::{self, RepairAction};
@@ -59,7 +60,7 @@ pub fn make_create_venv_task(
 
                     // 主流程：create_venv
                     python_env
-                        .create_venv(&venv_path, &python_version)
+                        .create_venv(&venv_path, &python_version, &cancel)
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -124,7 +125,7 @@ pub fn make_install_torch_task(
 
                     // 主流程：install_torch（内部会 emit TorchInstalled 事件）
                     python_env
-                        .install_torch(&venv_path, cuda_version)
+                        .install_torch(&venv_path, cuda_version, &cancel)
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -210,7 +211,7 @@ pub fn make_switch_torch_variant_task(
                     progress.send_percent(60);
                     progress.send_message(format!("切换 torch: {}", variant_label));
                     python_env
-                        .switch_torch_variant(&venv_path, &variant)
+                        .switch_torch_variant(&venv_path, &variant, &cancel)
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -286,7 +287,7 @@ pub fn make_install_requirements_task(
 
                     // 主流程：install_requirements（内部会 emit RequirementsInstalled 事件）
                     python_env
-                        .install_requirements(&venv_path, &req_file)
+                        .install_requirements(&venv_path, &req_file, &cancel)
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -351,7 +352,7 @@ pub fn make_rebuild_venv_task(
                     progress.send_message("删除旧 venv + 创建新 venv + 安装 torch + 安装依赖...");
 
                     python_env
-                        .rebuild_venv(&config)
+                        .rebuild_venv(&config, &cancel)
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -422,7 +423,7 @@ pub fn make_switch_python_task(
 
                     // 调用 switch_python_version（内部会按 5 步上报进度）
                     let result = python_env
-                        .switch_python_version(&new_version, &config, tx)
+                        .switch_python_version(&new_version, &config, tx, &cancel)
                         .await
                         .map_err(|e| e.to_string());
 
@@ -566,8 +567,471 @@ pub fn make_env_repair_task(
 }
 
 // ====================================================================
-// 辅助函数
+// v3.6：环境诊断（Diagnose）
 // ====================================================================
+
+/// 构造「环境诊断」任务
+///
+/// v3.6：将 `env_diagnose` 从同步命令改为 TaskScheduler 任务，支持：
+/// - 用户主动取消（torch import 探针可能耗时 90s）
+/// - 进度推送（10% 开始 / 50% torch 探针 / 80% 依赖检查 / 100% 完成）
+/// - DiagnoseReport 作为 `TaskResult.payload` 返回，前端从 `task_completed` 事件取
+///
+/// **关键**：`recovery::diagnose` 内部已 emit `RequirementsInstalled` 事件，
+/// 触发 env_inspector cache 失效 + 后台刷新 + `env_inspect_updated` 事件，
+/// 前端 store 自动拿到最新 EnvSnapshot，无需额外处理。
+pub fn make_diagnose_task(
+    python_env: Arc<PythonEnvService>,
+    venv_path: PathBuf,
+    comfyui_root: PathBuf,
+) -> TaskDef {
+    TaskDef {
+        kind: TaskKind::Diagnose,
+        name: "环境诊断".to_string(),
+        priority: None,
+        action: Box::new(
+            move |cancel: CancellationToken, progress: ProgressSender| {
+                let python_env = python_env.clone();
+                let venv_path = venv_path.clone();
+                let comfyui_root = comfyui_root.clone();
+                Box::pin(async move {
+                    progress.send_percent(10);
+                    progress.send_message("开始环境诊断...".to_string());
+
+                    if cancel.is_cancelled() {
+                        return Err("任务已取消".to_string());
+                    }
+
+                    progress.send_percent(50);
+                    progress.send_message("torch 探针 + 依赖检查...".to_string());
+
+                    // diagnose 内部已 emit RequirementsInstalled 触发 cache 失效
+                    let report = recovery::diagnose(
+                        &python_env,
+                        &venv_path,
+                        &comfyui_root,
+                        python_env.event_bus_ref(),
+                        &cancel,
+                    )
+                    .await;
+
+                    progress.send_percent(100);
+                    let issue_count = report.issues.len();
+                    let summary = if issue_count == 0 {
+                        format!(
+                            "环境诊断完成：健康（torch={:?}）",
+                            report.torch_version
+                        )
+                    } else {
+                        format!("环境诊断完成：发现 {} 个问题", issue_count)
+                    };
+                    progress.send_message(summary.clone());
+
+                    // 序列化 DiagnoseReport 为 JSON payload，前端从 task_completed 事件取
+                    let payload = serde_json::to_value(&report)
+                        .map_err(|e| format!("序列化诊断报告失败: {}", e))?;
+
+                    Ok(TaskResult::new(summary).with_payload(payload))
+                })
+            },
+        ),
+    }
+}
+
+// ====================================================================
+// v3.5：嵌套子任务进度转发器（child_progress_forwarder）
+// ====================================================================
+
+/// 转发子任务 task_progress 事件到父任务的 ProgressSender
+///
+/// **用途**：版本切换的 11 步流程中，步骤 8/9/10（创建 venv / 装 torch / 装 requirements）
+/// 作为子任务提交。子任务的进度更新通过全局 `task_progress` 事件推送，
+/// 本函数 spawn 一个后台 task 监听全局事件，把子任务的进度映射到父任务进度段。
+///
+/// **行为**：
+/// 1. spawn 一次性后台 task
+/// 2. listen 全局 `task_progress` 事件
+/// 3. 过滤 `task_id == child_id` 的事件
+/// 4. 把子任务 `progress`（0..=100）映射到父任务 `progress_range`（如 (50, 60)）
+/// 5. 转发到 `parent_progress.send_percent`
+/// 6. 子任务结束（task_completed / failed / cancelled）后自动退出
+///
+/// **父任务取消的级联传播**：
+/// - 父任务被 cancel → parent_cancel.cancelled() 触发
+/// - 本 forwarder 收到 cancel 信号 → 主动 `task_scheduler.cancel(child_id)`
+/// - 父任务 wait() 收到 TaskError::WaitCancelled → 父任务也返回 Err
+/// - 父任务的错误处理路径（如 rollback_checkout）会执行
+///
+/// **子任务日志也转发**：子任务的 `task_log` 事件也转发到 `parent_log_collector`，
+/// 父任务失败时这些日志可作为错误上下文。
+///
+/// **参数**：
+/// - `app`: AppHandle（订阅全局事件）
+/// - `task_scheduler`: 父任务用于 cancel 子任务
+/// - `child_id`: 子任务 ID
+/// - `parent_progress`: 父任务的 ProgressSender
+/// - `parent_cancel`: 父任务的 CancellationToken（父 cancel 时级联取消子）
+/// - `parent_log_collector`: 父任务的 LineCollector（接收子任务日志）
+/// - `progress_range`: (起始段, 结束段)，子任务 0% 映射到 start，100% 映射到 end
+pub fn spawn_child_progress_forwarder(
+    app: AppHandle,
+    task_scheduler: Arc<crate::task_scheduler::TaskSchedulerService>,
+    child_id: crate::task_scheduler::TaskId,
+    parent_progress: ProgressSender,
+    parent_cancel: tokio_util::sync::CancellationToken,
+    parent_log_collector: Arc<LineCollector>,
+    progress_range: (u8, u8),
+) {
+    use tauri::Listener;
+
+    let (start, end) = progress_range;
+    let range_span = end.saturating_sub(start);
+
+    // 监听 task_progress 事件
+    let app_for_progress = app.clone();
+    let child_id_for_progress = child_id.clone();
+    let parent_progress_for_progress = parent_progress.clone();
+    let unlisten_progress: tauri::EventId = app_for_progress.listen(
+        "task_progress",
+        move |event| {
+            // 解析 payload
+            let payload: serde_json::Value = match serde_json::from_str(event.payload()) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let task_id = payload.get("task_id").and_then(|v| v.as_str());
+            if task_id != Some(&child_id_for_progress) {
+                return;
+            }
+            let sub_progress = payload.get("progress").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+            let mapped = start + (sub_progress as f32 * range_span as f32 / 100.0) as u8;
+            parent_progress_for_progress.send_percent(mapped.min(end));
+        },
+    );
+
+    // 监听 task_log 事件（子任务的实时日志 → 父任务 LineCollector）
+    let app_for_log = app.clone();
+    let child_id_for_log = child_id.clone();
+    let collector_for_log = parent_log_collector.clone();
+    let unlisten_log: tauri::EventId = app_for_log.listen("task_log", move |event| {
+        let payload: serde_json::Value = match serde_json::from_str(event.payload()) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let arr = match payload.as_array() {
+            Some(a) => a,
+            None => return,
+        };
+        for entry in arr {
+            let tid = entry.get("task_id").and_then(|v| v.as_str());
+            if tid != Some(&child_id_for_log) {
+                continue;
+            }
+            let source = entry
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("child")
+                .to_string();
+            let text = entry
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !text.is_empty() {
+                collector_for_log.push_with_source(source, text);
+            }
+        }
+    });
+
+    // 后台 task：父 cancel → 级联 cancel 子
+    let app_for_unlisten = app.clone();
+    let task_scheduler_for_cascade = task_scheduler.clone();
+    let child_id_for_cascade = child_id.clone();
+    let unlisten_progress_for_cleanup = unlisten_progress;
+    let unlisten_log_for_cleanup = unlisten_log;
+    tokio::spawn(async move {
+        // 父 cancel 时级联 cancel 子
+        tokio::select! {
+            _ = parent_cancel.cancelled() => {
+                tracing::info!(?child_id_for_cascade, "parent cancelled, cascading cancel to child");
+                let _ = task_scheduler_for_cascade.cancel(&child_id_for_cascade).await;
+            }
+            // 子任务完成后 forwarder 自然退出（listen 在子 task 终止时由 AppHandle 释放）
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60 * 60 * 24)) => {
+                tracing::warn!(?child_id_for_cascade, "forwarder timeout (24h), exit");
+            }
+        }
+        // 清理 listener（Tauri Listener::unlisten 接收 EventId 返回 ()）
+        use tauri::Listener;
+        app_for_unlisten.unlisten(unlisten_progress_for_cleanup);
+        app_for_unlisten.unlisten(unlisten_log_for_cleanup);
+    });
+}
+
+// ====================================================================
+// v3.5：check_compat 任务工厂（替换 core_check_version_compatibility 同步版本）
+// ====================================================================
+
+/// 构造「版本兼容性预检」任务（v3.5 异步化）
+///
+/// 异步执行 git show 读 target tag 的 requirements.txt，
+/// 避免大文件读取阻塞 UI 线程。
+///
+/// 进度细分：
+/// - 10%：开始
+/// - 30%：读取 current requirements
+/// - 60%：读取 target requirements（git show）
+/// - 90%：diff + 模式推荐
+/// - 100%：完成
+pub fn make_check_compat_task(
+    core_manager: Arc<crate::core_manager::CoreManagerService>,
+    config: Arc<ConfigService>,
+    python_env: Arc<PythonEnvService>,
+    target_tag: String,
+    app: AppHandle,
+) -> TaskDef {
+    TaskDef {
+        kind: TaskKind::CheckCompat,
+        name: format!("检查版本兼容性: {}", target_tag),
+        priority: None, // default = Low
+        action: Box::new(move |cancel, progress| {
+            let core_manager = core_manager.clone();
+            let config = config.clone();
+            let python_env = python_env.clone();
+            let target_tag = target_tag.clone();
+            Box::pin(async move {
+                use crate::core_manager::compat::{
+                    detect_current_torch_variant, diff_requirements, parse_requirements_simple,
+                    recommend_mode,
+                };
+
+                progress.send_percent(10);
+                progress.send_message(format!("检查 {} 兼容性...", target_tag));
+                if cancel.is_cancelled() {
+                    return Err("任务已取消".to_string());
+                }
+
+                let config_snapshot = config.get();
+                let comfyui_root = config_snapshot.paths.comfyui_root.clone();
+                let venv_path = config_snapshot.paths.venv_path.clone();
+                let target_python_version = config_snapshot.paths.python_version.clone();
+                let target_torch_variant = config_snapshot.torch.cuda_version.to_torch_index().to_string();
+                drop(config_snapshot);
+
+                // 1. venv 状态
+                progress.send_percent(20);
+                let venv_exists = venv_path.join("pyvenv.cfg").exists();
+                let current_python = if venv_exists {
+                    crate::python_env::verify::probe_python_version(
+                        &crate::python_env::uv_runner::venv_python_path(&venv_path),
+                        &cancel,
+                    )
+                    .await
+                } else {
+                    None
+                };
+                let current_torch_variant = detect_current_torch_variant(&venv_path).await;
+                let current_torch_installed = current_torch_variant.is_some();
+
+                // 2. 当前 tag
+                let current_tag = core_manager
+                    .current_version()
+                    .await
+                    .ok()
+                    .and_then(|s| s.current_version);
+
+                progress.send_percent(30);
+                if cancel.is_cancelled() {
+                    return Err("任务已取消".to_string());
+                }
+
+                // 3. 读 requirements.txt（async git show）
+                let read_reqs_for_tag = |tag: &str| -> Option<Vec<(String, String)>> {
+                    let req_path = comfyui_root.join("requirements.txt");
+                    if tag == current_tag.as_deref().unwrap_or("") {
+                        std::fs::read_to_string(&req_path)
+                            .ok()
+                            .map(|c| parse_requirements_simple(&c))
+                    } else {
+                        // 用 new_command_sync 避免弹 cmd 窗口（v3.4 已改造）
+                        let output = crate::common::process_util::new_command_sync("git")
+                            .args(["show", &format!("{}:requirements.txt", tag)])
+                            .current_dir(&comfyui_root)
+                            .output()
+                            .ok()?;
+                        if output.status.success() {
+                            let s = String::from_utf8_lossy(&output.stdout).to_string();
+                            Some(parse_requirements_simple(&s))
+                        } else {
+                            None
+                        }
+                    }
+                };
+
+                progress.send_percent(60);
+                let current_reqs = current_tag
+                    .as_ref()
+                    .and_then(|t| read_reqs_for_tag(t))
+                    .unwrap_or_default();
+                let target_reqs = read_reqs_for_tag(&target_tag).unwrap_or_default();
+                let requirements_diff = diff_requirements(&current_reqs, &target_reqs);
+
+                progress.send_percent(80);
+                let same_python = match (&current_python, &target_python_version) {
+                    (Some(cp), tp) => cp.starts_with(tp),
+                    (None, _) => false,
+                };
+                let same_torch_variant = match (&current_torch_variant, &target_torch_variant) {
+                    (Some(ctv), ttv) => ctv == ttv,
+                    (None, _) => false,
+                };
+
+                // 4. custom_nodes 数量
+                let custom_nodes_dir = comfyui_root.join("custom_nodes");
+                let custom_node_count = std::fs::read_dir(&custom_nodes_dir)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .filter(|e| e.path().join(".git").exists() || e.path().is_dir())
+                            .count()
+                    })
+                    .unwrap_or(0);
+
+                // 5. 推荐模式
+                let (recommended_mode, recommended_reason) = recommend_mode(
+                    same_python,
+                    same_torch_variant,
+                    venv_exists,
+                    &requirements_diff,
+                    current_torch_installed,
+                );
+
+                let report = crate::core_manager::compat::VersionCompatReport {
+                    current_tag,
+                    target_tag: target_tag.clone(),
+                    venv_exists,
+                    current_python,
+                    target_python: Some(target_python_version),
+                    current_torch_variant,
+                    target_torch_variant: Some(target_torch_variant),
+                    current_torch_installed,
+                    same_python,
+                    same_torch_variant,
+                    requirements_diff,
+                    custom_node_count,
+                    recommended_mode,
+                    recommended_reason,
+                };
+
+                progress.send_percent(100);
+                let _ = app;
+                let _ = python_env;
+                Ok(TaskResult {
+                    summary: format!("版本兼容性检查完成: {}", target_tag),
+                    payload: Some(serde_json::to_value(&report).map_err(|e| e.to_string())?),
+                })
+            })
+        }),
+    }
+}
+
+// ====================================================================
+// v3.5：check_prereq 任务工厂（替换 core_check_switch_prerequisites 同步版本）
+// ====================================================================
+
+/// 构造「切换前置条件检查」任务（v3.5 异步化）
+///
+/// 检查：
+/// - ComfyUI 进程状态（运行中 → 拒绝）
+/// - 工作区 dirty 状态（脏 → 拒绝）
+/// - 给出详细原因
+///
+/// 进度细分：
+/// - 10%：开始
+/// - 40%：检查 ComfyUI 状态
+/// - 70%：检查工作区
+/// - 100%：完成
+pub fn make_check_prereq_task(
+    core_manager: Arc<crate::core_manager::CoreManagerService>,
+    process_launcher: Arc<crate::process_launcher::ProcessLauncherService>,
+) -> TaskDef {
+    TaskDef {
+        kind: TaskKind::CheckPrereq,
+        name: "检查切换前置条件".to_string(),
+        priority: None, // default = High
+        action: Box::new(move |cancel, progress| {
+            let core_manager = core_manager.clone();
+            let process_launcher = process_launcher.clone();
+            Box::pin(async move {
+                progress.send_percent(10);
+                progress.send_message("检查切换前置条件...".to_string());
+                if cancel.is_cancelled() {
+                    return Err("任务已取消".to_string());
+                }
+
+                // 1. ComfyUI 状态
+                progress.send_percent(40);
+                let comfyui_running = process_launcher.status().await.is_alive();
+                if cancel.is_cancelled() {
+                    return Err("任务已取消".to_string());
+                }
+
+                // 2. 工作区状态
+                progress.send_percent(70);
+                let prereq = core_manager
+                    .check_switch_prerequisites(comfyui_running)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                progress.send_percent(100);
+                Ok(TaskResult {
+                    summary: if prereq.can_switch {
+                        "可以切换版本".to_string()
+                    } else {
+                        format!("不允许切换: {}", prereq.block_reason.as_deref().unwrap_or("未知原因"))
+                    },
+                    payload: Some(serde_json::to_value(&prereq).map_err(|e| e.to_string())?),
+                })
+            })
+        }),
+    }
+}
+
+// ====================================================================
+// v3.5：switch_version 任务工厂
+// ====================================================================
+
+/// 构造「切换 ComfyUI 版本」任务（v3.5 全面异步化）
+///
+/// 嵌套子任务 + 实时日志 + 失败回滚
+pub fn make_switch_version_task(
+    params: crate::core_manager::switcher::SwitchVersionParams,
+    ctx: crate::core_manager::switcher::SwitchContext,
+    app: AppHandle,
+) -> TaskDef {
+    use crate::core_manager::compat::SwitchMode;
+    let target_tag = params.target_tag.clone();
+    TaskDef {
+        kind: TaskKind::Checkout,
+        name: format!("切换 ComfyUI 版本到 {}", target_tag),
+        priority: None, // default = High
+        action: Box::new(move |cancel, progress| {
+            let params = params.clone();
+            let ctx = ctx;
+            let app = app.clone();
+            Box::pin(async move {
+                crate::core_manager::switcher::run_switch_version(
+                    params,
+                    ctx,
+                    app,
+                    cancel,
+                    progress,
+                )
+                .await
+            })
+        }),
+    }
+}
 
 /// 把 CudaVersion 转为可读字符串
 fn cuda_version_label(cuda: &CudaVersion) -> &'static str {

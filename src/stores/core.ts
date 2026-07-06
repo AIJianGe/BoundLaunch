@@ -3,7 +3,7 @@
  *
  * 设计模式：
  * - **Store (Flux)**：集中管理 ComfyUI 核心仓库状态
- * - **Observer**：监听 `core_version_switched` / `requirements_mismatch` 事件
+ * - **Observer**：监听 `core_version_switched` / `requirements_mismatch` / `task_completed` 事件
  *
  * 使用方式：
  * ```ts
@@ -17,6 +17,10 @@
  * - switchVersion（完整版本切换，11 步流程 + 全部回滚）
  * - checkSwitchPrerequisites（前置条件检查）
  * - ensureModelsLink（models 软链接管理）
+ *
+ * v3.5 改造：
+ * - coreCheckSwitchPrerequisites 改为异步 task，返回 task_id
+ * - store 内用 task 监听器填充 switchPrerequisites（不阻塞 UI）
  */
 
 import { defineStore } from "pinia";
@@ -45,6 +49,7 @@ import type {
   CheckoutResult,
   BackupInfo,
   SwitchRepoResult,
+  TaskTerminalEvent,
 } from "@/api/types";
 
 export const useCoreStore = defineStore("core", () => {
@@ -71,6 +76,8 @@ export const useCoreStore = defineStore("core", () => {
   const error = ref<string | null>(null);
   /** requirements 不匹配标记（来自后端 emit "requirements_mismatch"） */
   const requirementsMismatch = ref(false);
+  /** v3.5：前置条件检查任务 ID（用于追踪 SwitchPrerequisites 加载） */
+  const prerequisitesTaskId = ref<string | null>(null);
   const unlisteners: UnlistenFn[] = [];
 
   // ========== Getters ==========
@@ -90,8 +97,64 @@ export const useCoreStore = defineStore("core", () => {
   const isSwitching = computed(() => switchingTaskId.value !== null);
   /** 是否允许切换版本（前置条件） */
   const canSwitch = computed(() => switchPrerequisites.value?.can_switch ?? false);
+  /** v3.5：是否正在加载前置条件 */
+  const loadingPrerequisites = computed(() => prerequisitesTaskId.value !== null);
 
   // ========== Actions ==========
+
+  /**
+   * v3.5 异步化：提交前置条件检查任务并通过 task 事件填充 switchPrerequisites
+   *
+   * 不阻塞 UI：submit task → 返回 task_id → 后台等 task_completed → 解码 payload
+   *
+   * 多次调用：会覆盖式取消前一个未完成任务的监听（避免错乱填充）
+   *
+   * 依赖后端：mark_terminal 把 `TaskResult.payload` 写入 `task_completed` 事件。
+   */
+  async function refreshPrerequisites() {
+    try {
+      const taskId = await coreCheckSwitchPrerequisites();
+      // 取消前一个未完成任务的监听（通过 prereqTaskId 状态机）
+      if (prereqTaskUnlisten) {
+        prereqTaskUnlisten();
+        prereqTaskUnlisten = null;
+      }
+      prerequisitesTaskId.value = taskId;
+      // 监听 task_completed
+      prereqTaskUnlisten = await listen<TaskTerminalEvent & { payload?: unknown }>(
+        "task_completed",
+        (e) => {
+          if (e.payload.task_id !== taskId) return;
+          if (e.payload.status === "completed") {
+            // v3.5：从 task_completed 事件直接读 payload（后端已 emit）
+            const payload = (e.payload as unknown as { payload?: SwitchPrerequisites })
+              .payload;
+            if (payload) {
+              switchPrerequisites.value = payload;
+            }
+            prerequisitesTaskId.value = null;
+            if (prereqTaskUnlisten) {
+              prereqTaskUnlisten();
+              prereqTaskUnlisten = null;
+            }
+          } else {
+            // 失败 / 取消：清空
+            prerequisitesTaskId.value = null;
+            if (prereqTaskUnlisten) {
+              prereqTaskUnlisten();
+              prereqTaskUnlisten = null;
+            }
+          }
+        },
+      );
+    } catch (e) {
+      console.warn("[core] refreshPrerequisites failed:", e);
+      prerequisitesTaskId.value = null;
+    }
+  }
+
+  /** v3.5：前置条件检查任务的 unlisten 句柄 */
+  let prereqTaskUnlisten: UnlistenFn | null = null;
 
   /**
    * 刷新状态（status + tags classified）
@@ -99,7 +162,7 @@ export const useCoreStore = defineStore("core", () => {
    * 同时刷新：
    * - core_status：仓库当前状态
    * - core_list_tags_classified：分类 tag 列表
-   * - core_check_switch_prerequisites：前置条件
+   * - core_check_switch_prerequisites：异步任务，结果通过 task_completed 填充
    */
   async function refresh() {
     loading.value = true;
@@ -114,18 +177,16 @@ export const useCoreStore = defineStore("core", () => {
       prereleaseTags.value = classified.prerelease;
       // 兼容旧 API：合并为 tags
       tags.value = [...classified.stable, ...classified.prerelease];
-      // 前置条件容错刷新（失败不影响主流程）
-      try {
-        switchPrerequisites.value = await coreCheckSwitchPrerequisites();
-      } catch (e) {
-        console.warn("[core] refresh prerequisites failed:", e);
-      }
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e);
       throw e;
     } finally {
       loading.value = false;
     }
+    // 前置条件异步加载（不阻塞 refresh）
+    refreshPrerequisites().catch((e) =>
+      console.warn("[core] refresh prerequisites failed:", e),
+    );
   }
 
   /** 克隆 ComfyUI 仓库 */
@@ -165,12 +226,12 @@ export const useCoreStore = defineStore("core", () => {
   }
 
   /**
-   * 切换 ComfyUI 版本（v3.1 / F26 完整 11 步流程）
+   * 切换 ComfyUI 版本（v3.5 全面异步化）
    *
    * 行为：
    * 1. 后端提交任务，返回 task_id
    * 2. 前端记录 task_id，UI 进入"切换中"状态
-   * 3. 监听 task_progress / task_completed 事件
+   * 3. 监听 task_progress / task_completed / task_log 事件（通过 useTaskProgress）
    * 4. 完成后自动 refresh
    *
    * @param targetTag 目标 tag（如 "v0.3.10"）
@@ -180,14 +241,8 @@ export const useCoreStore = defineStore("core", () => {
     targetTag: string,
     mode: "Clean" | "Preserve" | "Skip" = "Preserve",
   ): Promise<string> {
-    // 前置二次检查（避免 UI 状态过期）
-    const prereq = await coreCheckSwitchPrerequisites();
-    switchPrerequisites.value = prereq;
-    if (!prereq.can_switch) {
-      throw new Error(prereq.block_reason ?? "当前不满足切换版本的前置条件");
-    }
-
     // F36：把 mode 传给后端
+    // （前置条件不在 store 检查，由 UI 层在确认切换前主动检查，避免双重 task 启动）
     const taskId = await coreSwitchVersionWithMode(targetTag, mode);
     switchingTaskId.value = taskId;
     return taskId;
@@ -249,15 +304,6 @@ export const useCoreStore = defineStore("core", () => {
     } catch (e) {
       console.warn("[core] refreshTags failed:", e);
       throw e;
-    }
-  }
-
-  /** 刷新前置条件（独立调用，用于 UI 实时提示） */
-  async function refreshPrerequisites() {
-    try {
-      switchPrerequisites.value = await coreCheckSwitchPrerequisites();
-    } catch (e) {
-      console.warn("[core] refreshPrerequisites failed:", e);
     }
   }
 
@@ -361,6 +407,10 @@ export const useCoreStore = defineStore("core", () => {
   function unsubscribe() {
     unlisteners.forEach((un) => un());
     unlisteners.length = 0;
+    if (prereqTaskUnlisten) {
+      prereqTaskUnlisten();
+      prereqTaskUnlisten = null;
+    }
   }
 
   return {
@@ -377,6 +427,8 @@ export const useCoreStore = defineStore("core", () => {
     loading,
     error,
     requirementsMismatch,
+    // v3.5
+    prerequisitesTaskId,
     // getters
     isCloned,
     currentVersion,
@@ -384,6 +436,7 @@ export const useCoreStore = defineStore("core", () => {
     hasLocalChanges,
     isSwitching,
     canSwitch,
+    loadingPrerequisites,
     // actions
     refresh,
     refreshTags,

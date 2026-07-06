@@ -151,6 +151,41 @@ export const useEnvStore = defineStore("env", () => {
     });
   }
 
+  /**
+   * 等待指定 task_id 完成并返回 payload（v3.6 新增）
+   *
+   * 与 `waitForTask` 类似，但 resolve 时返回后端 `TaskResult.payload`（任意 JSON）。
+   * 用于 `env_diagnose` 等需要从任务结果中提取业务数据的命令。
+   *
+   * @param taskId 任务 ID
+   * @returns payload（类型由调用方断言，如 `DiagnoseReport`）
+   */
+  function waitForTaskWithPayload<T>(taskId: string): Promise<T> {
+    return new Promise((resolve, reject) => {
+      let unlisten: UnlistenFn | null = null;
+      const cleanup = () => {
+        if (unlisten) unlisten();
+      };
+
+      listen<TaskTerminalEvent>("task_completed", (e) => {
+        if (e.payload.task_id !== taskId) return;
+        cleanup();
+        if (e.payload.status === "completed") {
+          resolve(e.payload.payload as T);
+        } else {
+          reject(
+            new Error(
+              e.payload.summary ??
+                `任务${e.payload.status === "failed" ? "失败" : "已取消"}`,
+            ),
+          );
+        }
+      }).then((un) => {
+        unlisten = un;
+      });
+    });
+  }
+
   // ========== Actions ==========
 
   /**
@@ -175,7 +210,8 @@ export const useEnvStore = defineStore("env", () => {
         lastUpdated.value = info.last_updated;
       }
       pythonEnvStatus.value = status;
-      dependencies.value = deps;
+      // v3.6: deps 可能为 null（首次启动 cache 为空），降级为空数组
+      dependencies.value = deps ?? [];
       // 同步 v3.0 torch 变体（从 Config 解析）
       const configStore = useConfigStore();
       const raw = configStore.config?.torch.torch_variant;
@@ -302,7 +338,12 @@ export const useEnvStore = defineStore("env", () => {
   /**
    * 环境诊断（v1.8 / F36-Phase2）
    *
-   * 不会修改任何后端状态，纯只读探测。
+   * v3.6 改造：从同步命令改为 TaskScheduler 任务。
+   * - 调 `envDiagnose()` 拿 task_id → `waitForTaskWithPayload<DiagnoseReport>` 等终态
+   * - 诊断完成后后端已 emit `RequirementsInstalled` → env cache 失效 →
+   *   `env_inspect_updated` 事件，store 的 subscribe 会自动更新 envInfo。
+   * - 为确保 UI 立即刷新（不等事件），这里显式调 `envInvalidateCache() + refresh()`。
+   *
    * 返回 `DiagnoseReport`：
    * - `venv_exists` / `torch_import_ok` / `torch_version`
    * - `issues[]`：诊断出的所有问题（按严重度排序）
@@ -310,8 +351,18 @@ export const useEnvStore = defineStore("env", () => {
    * - `suggested_reason`：建议原因（用户可读）
    */
   async function diagnose(): Promise<DiagnoseReport> {
-    const report = await envDiagnose();
+    const taskId = await envDiagnose();
+    const report = await waitForTaskWithPayload<DiagnoseReport>(taskId);
     lastDiagnose.value = report;
+    // v3.6：强制 invalidate + refresh，确保 UI 立即反映最新状态
+    // （后端虽已 emit RequirementsInstalled 触发后台刷新，
+    //   但显式 refresh 能让前端立即拿到最新数据，不依赖事件时序）
+    try {
+      await envInvalidateCache();
+      await refresh();
+    } catch (e) {
+      console.warn("[env] post-diagnose refresh failed:", e);
+    }
     return report;
   }
 

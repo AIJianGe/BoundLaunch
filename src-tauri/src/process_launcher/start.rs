@@ -107,7 +107,10 @@ pub async fn verify_preconditions(
     }
 
     // 4. verify_venv 完整性
-    let info = python_env.verify_venv(venv_path).await?;
+    //    v3.6：用本地不可取消 token（start() 方法暂未透传 cancel），
+    //    已移除 90s 硬超时，最坏情况是用户等 torch import 完成
+    let cancel = CancellationToken::new();
+    let info = python_env.verify_venv(venv_path, &cancel).await?;
     if !info.torch_installed {
         tracing::error!(?venv_path, "torch not installed after verify_venv");
         return Err(ProcessError::EnvironmentNotReady {

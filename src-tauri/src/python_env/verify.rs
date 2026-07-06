@@ -1,12 +1,14 @@
 //! venv 校验
 //!
 //! 详见 `PR/03-模块设计/02-PythonEnvManager.md §1 模块职责` 中 verify_venv
+//!
+//! v3.6：所有子进程调用用 `CancellationToken` 替代 `tokio::time::timeout`
 
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
 
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::env_inspector::scripts::{probe_torch_script, venv_python_path};
 use crate::error::EnvError;
@@ -15,28 +17,26 @@ use super::models::EnvInfo;
 
 /// 探查 venv 中 Python 版本（v2.13）
 ///
-/// 轻量探测：`python -c "import sys; print(sys.version.split()[0])"`，5s 超时。
+/// 轻量探测：`python -c "import sys; print(sys.version.split()[0])"`
+/// v3.6：用 `CancellationToken` 替代 5s timeout
+///
 /// 返回 `Option<String>`：
 /// - `Some("3.11.10")` 成功
-/// - `None` 失败（python 不存在 / 超时 / 解析失败）
-pub async fn probe_python_version(python: &Path) -> Option<String> {
+/// - `None` 失败（python 不存在 / 取消 / 解析失败）
+pub async fn probe_python_version(
+    python: &Path,
+    cancel: &CancellationToken,
+) -> Option<String> {
     let script = "import sys; print(sys.version.split()[0])";
-    // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
-    let child = crate::common::process_util::new_command(python)
-        .args(["-c", script])
+    let mut cmd = crate::common::process_util::new_command(python);
+    cmd.args(["-c", script])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .ok()?;
+        .kill_on_drop(true);
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(5),
-        child.wait_with_output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let output = crate::common::subprocess::run_with_cancel(&mut cmd, cancel)
+        .await
+        .ok()?;
 
     if !output.status.success() {
         return None;
@@ -55,7 +55,12 @@ pub async fn probe_python_version(python: &Path) -> Option<String> {
 /// - python 二进制存在
 /// - torch 可导入
 /// - 返回 EnvInfo（含 torch 版本与 CUDA 能力）
-pub async fn verify_venv(venv_path: &Path) -> Result<EnvInfo, EnvError> {
+///
+/// v3.6：透传 `CancellationToken` 给 `probe_torch_script`
+pub async fn verify_venv(
+    venv_path: &Path,
+    cancel: &CancellationToken,
+) -> Result<EnvInfo, EnvError> {
     let python_path = venv_python_path(venv_path);
 
     if !python_path.exists() {
@@ -66,7 +71,7 @@ pub async fn verify_venv(venv_path: &Path) -> Result<EnvInfo, EnvError> {
     }
 
     // 探查 torch
-    let stdout = probe_torch_script(venv_path).await?;
+    let stdout = probe_torch_script(venv_path, cancel).await?;
     let parsed: Value = serde_json::from_str(&stdout)
         .map_err(|e| EnvError::VerifyFailed(format!("torch script output not JSON: {}", e)))?;
 
@@ -108,7 +113,12 @@ pub async fn verify_venv(venv_path: &Path) -> Result<EnvInfo, EnvError> {
 }
 
 /// 快速判断 venv 是否就绪（不解析 torch 完整信息）
-pub async fn is_venv_ready(venv_path: &Path) -> bool {
+///
+/// v3.6：透传 `CancellationToken`
+pub async fn is_venv_ready(
+    venv_path: &Path,
+    cancel: &CancellationToken,
+) -> bool {
     if !venv_path.exists() {
         return false;
     }
@@ -117,7 +127,7 @@ pub async fn is_venv_ready(venv_path: &Path) -> bool {
         return false;
     }
     // 尝试 import torch（失败不算 venv 不可用，只是 torch 未装）
-    match verify_venv(venv_path).await {
+    match verify_venv(venv_path, cancel).await {
         Ok(info) => info.torch_installed,
         Err(_) => false,
     }
@@ -129,12 +139,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_venv_nonexistent_returns_err() {
-        let result = verify_venv(Path::new("/nonexistent/venv")).await;
+        let cancel = CancellationToken::new();
+        let result = verify_venv(Path::new("/nonexistent/venv"), &cancel).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_is_venv_ready_nonexistent_returns_false() {
-        assert!(!is_venv_ready(Path::new("/nonexistent/venv")).await);
+        let cancel = CancellationToken::new();
+        assert!(!is_venv_ready(Path::new("/nonexistent/venv"), &cancel).await);
     }
 }

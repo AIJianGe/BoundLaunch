@@ -19,11 +19,11 @@ use tauri::{AppHandle, State};
 use crate::app_state::AppState;
 use crate::config::CudaVersion;
 use crate::python_env::models::{CompatibilityReport, PythonEnvStatus};
-use crate::python_env::recovery::{self, DiagnoseReport, RepairAction};
+use crate::python_env::recovery::RepairAction;
 use crate::task_scheduler::factory::{
-    make_create_venv_task, make_env_repair_task, make_install_requirements_task,
-    make_install_torch_task, make_rebuild_venv_task, make_switch_python_task,
-    make_switch_torch_variant_task,
+    make_create_venv_task, make_diagnose_task, make_env_repair_task,
+    make_install_requirements_task, make_install_torch_task, make_rebuild_venv_task,
+    make_switch_python_task, make_switch_torch_variant_task,
 };
 
 // ====================================================================
@@ -32,25 +32,63 @@ use crate::task_scheduler::factory::{
 
 /// 查询当前 venv 状态（v2.13）
 ///
-/// 返回前端 `PythonEnvStatus` 接口对应的完整结构：
-/// uv 状态（uv_installed / uv_path / uv_version）+ venv 状态（venv_exists /
-/// venv_python_version / venv_torch_installed / venv_torch_version /
-/// venv_torch_cuda）。
+/// v3.6 改造：torch/python 信息从 `snapshot_cache` 提取（≤1ms），不再同步调
+/// `verify_venv`（90s 阻塞）。
+/// - uv 状态：仍走 `python_env.is_uv_available()` + `uv.get_version()`（<1s）
+/// - venv_exists：文件系统检查（<1ms）
+/// - venv_python_version / venv_torch_*：从 `EnvSnapshot` 提取
+///   - 无 snapshot 时返回 None / false（首次启动，前端等 `env_inspect_updated` 事件）
 ///
-/// 之前返回 `EnvInfo` 时（v2.10 之前），前端组件 `PythonVersionPanel.vue`
-/// 读 `envStore.pythonEnvStatus?.venv_python_version` 永远为 `undefined`，
-/// 因为 `EnvInfo` 不含 `venv_python_version` 字段 → 显示「未配置」。
-///
-/// 所有探测都是只读（不修改 venv），最坏情况 5-30s（verify_venv 的 probe_torch 90s 超时）。
+/// 返回类型保持 `PythonEnvStatus`（非 Option），uv/venv_exists 字段始终有值，
+/// torch/python 字段可能为 None/false（无 snapshot 时）。
 #[tauri::command]
 pub async fn env_status(state: State<'_, AppState>) -> Result<PythonEnvStatus, String> {
-    let config = state.config.get();
-    let venv_path = PathBuf::from(&config.paths.venv_path);
+    let (venv_path, comfyui_root) = {
+        let config = state.config.get();
+        (
+            PathBuf::from(&config.paths.venv_path),
+            PathBuf::from(&config.paths.comfyui_root),
+        )
+    };
 
-    Ok(state
-        .python_env
-        .get_status(&venv_path)
-        .await)
+    // 1. uv 状态（快速 <1s）
+    let uv = state.python_env.uv();
+    let (uv_version, uv_installed) = uv.get_version().await;
+    let uv_path = if uv_installed {
+        Some(uv.binary_path().to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
+    // 2. venv_exists（文件系统检查 <1ms）
+    let venv_exists = venv_path.exists();
+
+    // 3. 从 snapshot 提取 torch/python 信息（≤1ms，触发后台刷新）
+    let snapshot = state
+        .env_inspector
+        .inspect_or_cached(&venv_path, &comfyui_root);
+
+    let (venv_python_version, venv_torch_installed, venv_torch_version, venv_torch_cuda) =
+        match snapshot {
+            Some(s) => (
+                Some(s.python_version),
+                s.torch_installed,
+                s.torch_version,
+                s.cuda_available,
+            ),
+            None => (None, false, None, false),
+        };
+
+    Ok(PythonEnvStatus {
+        uv_installed,
+        uv_path,
+        uv_version,
+        venv_exists,
+        venv_python_version,
+        venv_torch_installed,
+        venv_torch_version,
+        venv_torch_cuda,
+    })
 }
 
 /// 检查 uv 是否可用
@@ -68,9 +106,11 @@ pub async fn env_check_compatibility(
     let venv_path = PathBuf::from(&config.paths.venv_path);
     let comfyui_root = PathBuf::from(&config.paths.comfyui_root);
 
+    // v3.6：探查类命令使用本地不可取消 token（兼容性检查是短操作）
+    let cancel = tokio_util::sync::CancellationToken::new();
     state
         .python_env
-        .check_requirements_compatibility(&venv_path, &comfyui_root)
+        .check_requirements_compatibility(&venv_path, &comfyui_root, &cancel)
         .await
         .map_err(|e| e.to_string())
 }
@@ -268,15 +308,25 @@ pub async fn env_rebuild_venv(
 /// 环境诊断（v1.8 / F36-Phase2 新增）
 ///
 /// **不会修改任何状态**，纯只读探测。前端可以无副作用地反复调用。
-/// 返回 `DiagnoseReport`：
+///
+/// 返回 task_id，实际诊断通过 TaskScheduler 调度：
+/// - 进度通过 `task_progress` 事件推送（10% 开始 / 50% torch 探针 / 100% 完成）
+/// - 完成后通过 `task_completed` 事件返回 `DiagnoseReport`（在 `payload` 字段）
+/// - 用户可通过 `task_cancel` 命令取消（torch 探针可能耗时 90s）
+///
+/// `DiagnoseReport` 字段：
 /// - `venv_exists` / `torch_import_ok` / `torch_version`
 /// - `issues[]`：诊断出的所有问题（按严重度排序）
 /// - `suggested_action`：综合建议（最严重 action）
 /// - `suggested_reason`：建议原因（用户可读）
 ///
-/// 对应后端：`python_env/recovery.rs::diagnose`
+/// **关键**：诊断完成后 `recovery::diagnose` 内部已 emit `RequirementsInstalled`，
+/// 触发 env_inspector cache 失效 + 后台刷新 + `env_inspect_updated` 事件，
+/// 前端 store 自动拿到最新 EnvSnapshot，无需额外调用 invalidate。
+///
+/// v3.6：从同步命令改为 TaskScheduler 任务（支持取消 + 进度）
 #[tauri::command]
-pub async fn env_diagnose(state: State<'_, AppState>) -> Result<DiagnoseReport, String> {
+pub async fn env_diagnose(state: State<'_, AppState>) -> Result<String, String> {
     let (venv_path, comfyui_root) = {
         let config = state.config.get();
         (
@@ -285,13 +335,12 @@ pub async fn env_diagnose(state: State<'_, AppState>) -> Result<DiagnoseReport, 
         )
     };
 
-    Ok(recovery::diagnose(
-        &state.python_env,
-        &venv_path,
-        &comfyui_root,
-        &state.event_bus,
-    )
-    .await)
+    let task_def = make_diagnose_task(state.python_env.clone(), venv_path, comfyui_root);
+    state
+        .task_scheduler
+        .submit(task_def)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// 环境修复（v1.8 / F36-Phase2 新增）

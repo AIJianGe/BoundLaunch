@@ -192,10 +192,15 @@ pub fn run() {
                     launcher_for_stale.check_stale_process(&app_handle_for_stale).await;
                 });
 
-                // F24 退出流程：构造 ShutdownCoordinator（依赖 process_launcher + event_bus）
+                // v3.5：把 TaskScheduler 包装为 Arc 复用（ShutdownCoordinator 和 AppState 各持一份）
+                let task_scheduler_arc = std::sync::Arc::new(task_scheduler);
+
+                // F24 退出流程：构造 ShutdownCoordinator（依赖 process_launcher + event_bus + task_scheduler）
+                // v3.5：新增 task_scheduler 参数，用于退出时取消阻塞的版本切换类任务
                 let shutdown_coordinator = std::sync::Arc::new(ShutdownCoordinator::new(
                     process_launcher.clone(),
                     (*event_bus).clone(),
+                    task_scheduler_arc.clone(),
                 ));
 
                 app_state::AppState {
@@ -207,7 +212,7 @@ pub fn run() {
                     core_manager: std::sync::Arc::new(core_manager),
                     model_path: model_path_arc,
                     plugin_manager: std::sync::Arc::new(plugin_manager),
-                    task_scheduler: std::sync::Arc::new(task_scheduler),
+                    task_scheduler: task_scheduler_arc,
                     process_launcher: std::sync::Arc::new(process_launcher),
                     shutdown_coordinator,
                 }

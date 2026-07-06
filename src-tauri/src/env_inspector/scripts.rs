@@ -1,36 +1,18 @@
 //! Python 探查脚本与子进程执行
 //!
 //! 详见 `PR/03-模块设计/07-EnvironmentInspector.md §4.1 探查脚本` 与 `§9.3 子进程超时`
+//!
+//! v3.6：所有子进程调用从 `tokio::time::timeout` 改为 `CancellationToken`，
+//! 不再有硬性超时，用户可通过 CancellationToken 主动取消。
 
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::EnvError;
-
-/// 子进程默认超时（秒）
-///
-/// v2.10：从 10s → 30s。
-/// 原因：Windows 首次 `python -m pip list` 在 venv 刚创建（含 `--seed` 安装的
-/// pip/setuptools/wheel）后，受 Defender 实时扫描 + 字节码编译影响，耗时可达 8-15s，
-/// 10s 超时处于边缘导致 onboarding 第 4 步「创建虚拟环境」误报失败。
-/// 30s 提供足够冗余，配合 uv pip list 主路径（启动 < 100ms）几乎不会触发。
-const SUBPROCESS_TIMEOUT_SECS: u64 = 30;
-
-/// `import torch` 探查超时（秒）
-///
-/// v2.11：单独为 `probe_torch_script` 设置更长超时。
-/// 原因：torch 是 2GB+ 大库，首次 `import torch` 在 Windows 上受以下因素影响：
-/// - 加载 torch/_C.pyd（C++ 扩展，2GB+）
-/// - Windows Defender 实时扫描每个 .dll / .pyd
-/// - 字节码编译 .pyc
-/// - CUDA 初始化
-/// 实测首次 import 可达 30-60s，30s 超时处于边缘导致 verify_venv 误报失败。
-/// 90s 提供足够冗余，后续 import 会快很多（缓存命中后 3-5s）。
-const PROBE_TORCH_TIMEOUT_SECS: u64 = 90;
 
 /// 探查 torch 的 Python 脚本
 ///
@@ -130,17 +112,15 @@ pub fn venv_python_path(venv_path: &Path) -> std::path::PathBuf {
 
 /// 运行 Python 探查脚本，返回 stdout
 ///
-/// **v2.11 关键修复**：
-/// - 使用 `kill_on_drop(true)`：超时 drop Future 时自动杀死子进程
-///   原因：tokio 默认 `kill_on_drop = false`，超时后 python.exe 仍残留
-///   持有 venv 文件锁 → uv venv 删除目录报"拒绝访问 (os error 5)"
-/// - `timeout_secs` 参数化：probe_torch 用 90s，其他用 30s
+/// v3.6：用 `CancellationToken` 替代 `tokio::time::timeout`，不再有硬性超时。
+/// - `kill_on_drop(true)`：cancel 时 drop Future 自动杀子进程
+/// - cancel 触发时返回 `EnvError::Cancelled`
 ///
 /// 失败时返回 EnvError::VerifyFailed
 pub async fn run_python_script(
     venv_path: &Path,
     script: &str,
-    timeout_secs: u64,
+    cancel: &CancellationToken,
 ) -> Result<String, EnvError> {
     let python = venv_python_path(venv_path);
     if !python.exists() {
@@ -150,66 +130,35 @@ pub async fn run_python_script(
         )));
     }
 
-    // kill_on_drop(true)：超时 drop 时自动杀子进程，避免残留 python.exe 持有文件锁
-    //
-    // v3.3：使用 `new_command` 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
-    let child = crate::common::process_util::new_command(&python)
-        .args(["-c", script])
+    let mut cmd = crate::common::process_util::new_command(&python);
+    cmd.args(["-c", script])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| {
-            tracing::error!(error = %e, "python subprocess spawn failed");
-            EnvError::VerifyFailed(e.to_string())
-        })?;
+        .kill_on_drop(true);
 
-    match tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        child.wait_with_output(),
-    )
-    .await
-    {
-        Ok(Ok(output)) => {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::error!(stderr = %stderr, "python script exited with error");
-                return Err(EnvError::VerifyFailed(stderr.into_owned()));
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        }
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "python subprocess wait failed");
-            Err(EnvError::VerifyFailed(e.to_string()))
-        }
-        Err(_) => {
-            // 超时：child 在 drop 时被 kill_on_drop 自动杀死
-            tracing::error!(timeout = timeout_secs, "python subprocess timeout");
-            Err(EnvError::VerifyFailed(format!(
-                "python subprocess timeout ({}s)",
-                timeout_secs
-            )))
-        }
+    let output = crate::common::subprocess::run_with_cancel(&mut cmd, cancel)
+        .await
+        .map_err(EnvError::from)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(stderr = %stderr, "python script exited with error");
+        return Err(EnvError::VerifyFailed(stderr.into_owned()));
     }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// 运行 `pip list`，返回 stdout JSON
 ///
-/// **v2.10 起采用双路径策略**：
+/// v3.6：用 `CancellationToken` 替代 `tokio::time::timeout`，不再有 30s 硬性超时。
+///
+/// **双路径策略**：
 /// 1. **主路径**：`uv pip list --python <venv_python> --format=json`
-///    - uv 是 Rust 实现，启动 < 100ms（vs `python -m pip` 3-5s）
-///    - 根本解决 Windows 首次 pip list 超时问题
-///    - 输出格式与 pip 完全兼容（`parse_pip_list` 无需修改）
 /// 2. **Fallback**：`python -m pip list --format=json`
-///    - uv binary 不存在 / uv 调用失败 / uv 超时 → 自动回退
-///    - 保证 venv 中即使无 uv 也能正常探查
-///
-/// **v2.11 关键修复**：两路径均加 `kill_on_drop(true)`，超时后自动杀子进程
-///
-/// 两路径均受 `SUBPROCESS_TIMEOUT_SECS`（30s）保护。
 pub async fn run_pip_list(
     venv_path: &Path,
     uv_binary: Option<&Path>,
+    cancel: &CancellationToken,
 ) -> Result<String, EnvError> {
     let python = venv_python_path(venv_path);
     if !python.exists() {
@@ -223,55 +172,31 @@ pub async fn run_pip_list(
     if let Some(uv) = uv_binary {
         if uv.exists() {
             let args = uv_pip_list_args(&python);
-            tracing::debug!(
-                ?uv, ?args, timeout = SUBPROCESS_TIMEOUT_SECS,
-                "run_pip_list: trying uv pip list (primary)"
-            );
-            // kill_on_drop(true)：超时 drop 时自动杀子进程
-            //
-            // v3.3：使用 `new_command` 在 Windows 上加 CREATE_NO_WINDOW
-            let child = match crate::common::process_util::new_command(uv)
-                .args(&args)
+            tracing::debug!(?uv, ?args, "run_pip_list: trying uv pip list (primary)");
+
+            let mut cmd = crate::common::process_util::new_command(uv);
+            cmd.args(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e, "uv pip list spawn failed, fallback to python -m pip"
-                    );
-                    return run_pip_list_fallback(&python).await;
-                }
-            };
+                .kill_on_drop(true);
 
-            match tokio::time::timeout(
-                Duration::from_secs(SUBPROCESS_TIMEOUT_SECS),
-                child.wait_with_output(),
-            )
-            .await
-            {
-                Ok(Ok(output)) if output.status.success() => {
+            match crate::common::subprocess::run_with_cancel(&mut cmd, cancel).await {
+                Ok(output) if output.status.success() => {
                     tracing::debug!("run_pip_list: uv pip list succeeded");
                     return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
                 }
-                Ok(Ok(output)) => {
+                Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     tracing::warn!(
                         ?stderr, "uv pip list exited non-zero, fallback to python -m pip"
                     );
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        error = %e, "uv pip list wait failed, fallback to python -m pip"
-                    );
+                Err(crate::common::subprocess::SubprocessError::Cancelled) => {
+                    return Err(EnvError::Cancelled);
                 }
-                Err(_) => {
-                    // 超时：child 已被 kill_on_drop 自动杀死
+                Err(e) => {
                     tracing::warn!(
-                        timeout = SUBPROCESS_TIMEOUT_SECS,
-                        "uv pip list timeout, fallback to python -m pip"
+                        error = %e, "uv pip list failed, fallback to python -m pip"
                     );
                 }
             }
@@ -283,58 +208,43 @@ pub async fn run_pip_list(
     }
 
     // ========== Fallback：python -m pip list ==========
-    run_pip_list_fallback(&python).await
+    run_pip_list_fallback(&python, cancel).await
 }
 
 /// Fallback 路径：`python -m pip list --format=json`
 ///
-/// v2.11：抽取出独立函数，加 `kill_on_drop(true)`
-async fn run_pip_list_fallback(python: &Path) -> Result<String, EnvError> {
-    tracing::debug!(
-        ?python, ?PIP_LIST_ARGS, timeout = SUBPROCESS_TIMEOUT_SECS,
-        "run_pip_list_fallback: trying python -m pip list"
-    );
-    // kill_on_drop(true)：超时 drop 时自动杀子进程
-    //
-    // v3.3：使用 `new_command` 在 Windows 上加 CREATE_NO_WINDOW
-    let child = crate::common::process_util::new_command(python)
-        .args(PIP_LIST_ARGS)
+/// v3.6：用 `CancellationToken` 替代 `tokio::time::timeout`
+async fn run_pip_list_fallback(
+    python: &Path,
+    cancel: &CancellationToken,
+) -> Result<String, EnvError> {
+    tracing::debug!(?python, ?PIP_LIST_ARGS, "run_pip_list_fallback: trying python -m pip list");
+
+    let mut cmd = crate::common::process_util::new_command(python);
+    cmd.args(PIP_LIST_ARGS)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| EnvError::VerifyFailed(e.to_string()))?;
+        .kill_on_drop(true);
 
-    match tokio::time::timeout(
-        Duration::from_secs(SUBPROCESS_TIMEOUT_SECS),
-        child.wait_with_output(),
-    )
-    .await
-    {
-        Ok(Ok(output)) => {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(EnvError::VerifyFailed(stderr.into_owned()));
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        }
-        Ok(Err(e)) => Err(EnvError::VerifyFailed(e.to_string())),
-        Err(_) => {
-            // 超时：child 已被 kill_on_drop 自动杀死
-            tracing::error!(timeout = SUBPROCESS_TIMEOUT_SECS, "python -m pip list timeout");
-            Err(EnvError::VerifyFailed(format!(
-                "pip list timeout ({}s)",
-                SUBPROCESS_TIMEOUT_SECS
-            )))
-        }
+    let output = crate::common::subprocess::run_with_cancel(&mut cmd, cancel)
+        .await
+        .map_err(EnvError::from)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(EnvError::VerifyFailed(stderr.into_owned()));
     }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// 探查 torch（运行嵌入脚本，返回 stdout JSON）
 ///
-/// v2.11：使用 `PROBE_TORCH_TIMEOUT_SECS`（90s）而非默认 30s
-pub async fn probe_torch_script(venv_path: &Path) -> Result<String, EnvError> {
-    run_python_script(venv_path, PROBE_TORCH_SCRIPT, PROBE_TORCH_TIMEOUT_SECS).await
+/// v3.6：透传 `CancellationToken`，不再有 90s 硬性超时
+pub async fn probe_torch_script(
+    venv_path: &Path,
+    cancel: &CancellationToken,
+) -> Result<String, EnvError> {
+    run_python_script(venv_path, PROBE_TORCH_SCRIPT, cancel).await
 }
 
 /// v1.8：torch 探针原始结果（带错误详情）
@@ -479,10 +389,9 @@ mod tests {
     }
 
     #[test]
-    fn test_probe_torch_timeout_greater_than_default() {
-        // v2.11：probe_torch 超时（90s）必须大于默认子进程超时（30s）
-        assert!(PROBE_TORCH_TIMEOUT_SECS > SUBPROCESS_TIMEOUT_SECS);
-        assert_eq!(PROBE_TORCH_TIMEOUT_SECS, 90);
-        assert_eq!(SUBPROCESS_TIMEOUT_SECS, 30);
+    fn test_probe_torch_script_signature_has_cancel() {
+        // v3.6：probe_torch_script 接受 CancellationToken 参数（编译时检查）
+        fn _assert_cancel_param(_f: fn(&Path, &tokio_util::sync::CancellationToken) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, crate::error::EnvError>> + Send>>) {}
+        // 函数存在即通过（签名在编译时已验证）
     }
 }

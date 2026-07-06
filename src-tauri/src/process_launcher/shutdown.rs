@@ -25,10 +25,22 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager, Runtime};
+use tokio_util::sync::CancellationToken;
 
 use crate::event_bus::{EventBus, ShutdownReason, SystemEvent};
 use crate::process_launcher::models::ShutdownReport;
 use crate::process_launcher::ProcessLauncherService;
+use crate::task_scheduler::{TaskKind, TaskSchedulerService};
+
+/// `cancel_blocking_version_tasks` 等待结果（v3.6 内部辅助枚举）
+enum WaitOutcome {
+    /// 所有任务已进入终态
+    Completed,
+    /// 5s sleep 到期（任务未全部完成）
+    TimedOut,
+    /// 调用方主动取消
+    Cancelled,
+}
 
 /// F24 退出流程总超时（30 秒）
 ///
@@ -39,6 +51,17 @@ pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// 步骤 4 等待 LogStore WAL checkpoint / 事件总线 unsubscribe / venv_locks 释放等。
 pub const RESOURCE_CLEANUP_WAIT: Duration = Duration::from_millis(500);
+
+/// 取消所有"阻塞退出"的版本切换类任务的最长等待时间（v3.5 新增）
+///
+/// 关联任务：
+/// - `Checkout`（v3.1 / F26 旧版兼容，现在主要走 `SwitchVersion` 任务链路）
+/// - `CheckCompat`（v3.5：版本兼容性预检）
+/// - `CheckPrereq`（v3.5：切换前置条件检查）
+/// - 任何名称含"切换"或"checkout"字样的 `Custom` 任务（兜底）
+///
+/// 5s 后未完成则继续后续退出步骤（不卡死 launcher）。
+pub const CANCEL_VERSION_TASKS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// ShutdownCoordinator - 退出流程编排器
 ///
@@ -57,6 +80,8 @@ struct Inner {
     process_launcher: ProcessLauncherService,
     /// 事件总线（用于广播 AppExiting / AppExited）
     event_bus: EventBus,
+    /// v3.5 新增：任务调度器（用于取消阻塞退出的版本切换类任务）
+    task_scheduler: Arc<TaskSchedulerService>,
     /// 防重入标志
     in_progress: AtomicBool,
     /// 缓存首次执行结果（OnceLock 只能 set_once，适合"幂等返回首次结果"语义）
@@ -65,14 +90,114 @@ struct Inner {
 
 impl ShutdownCoordinator {
     /// 构造 ShutdownCoordinator
-    pub fn new(process_launcher: ProcessLauncherService, event_bus: EventBus) -> Self {
+    ///
+    /// v3.5 扩展：新增 `task_scheduler` 参数，用于退出时取消阻塞任务。
+    pub fn new(
+        process_launcher: ProcessLauncherService,
+        event_bus: EventBus,
+        task_scheduler: Arc<TaskSchedulerService>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 process_launcher,
                 event_bus,
+                task_scheduler,
                 in_progress: AtomicBool::new(false),
                 cached_report: OnceLock::new(),
             }),
+        }
+    }
+
+    /// v3.5 新增：取消所有"阻塞退出"的版本切换类任务
+    ///
+    /// 退出 launcher 时如果有未完成的版本切换 / 兼容性预检 / 前置条件检查任务在跑，
+    /// 必须先取消它们（释放 git checkout lock / venv 删除 lock 等），否则后续退出流程可能死锁。
+    ///
+    /// 关联的 TaskKind：
+    /// - `Checkout`：`core_checkout` 旧版同步命令提交的任务（v3.1）
+    /// - `CheckCompat`：v3.5 兼容性预检
+    /// - `CheckPrereq`：v3.5 前置条件检查
+    ///
+    /// 注：`SwitchVersion` 是父任务，包含多个子任务；父任务的 `cancel` 会通过
+    /// `spawn_child_progress_forwarder` 级联取消所有子任务（见 `task_scheduler/factory.rs`）。
+    /// 因此只需取消父任务即可。
+    ///
+    /// ## 设计决策：同步取消 vs 异步等待
+    /// - 同步取消：仅调 `task_cancel`（设置 `CancellationToken`），不等待子任务终止。
+    /// - 异步等待：等待子任务自然结束（最长 5s），然后继续退出。
+    /// - 选择**异步等待**：避免 git checkout 半完成状态导致 git 锁未释放、venv 半删状态。
+    ///
+    /// v3.6：用 `tokio::select!` + `tokio::time::sleep` 替代 `tokio::time::timeout`。
+    /// 三路竞速：等待完成 / 5s sleep 到期 / cancel 触发（app 退出时跳过等待）。
+    async fn cancel_blocking_version_tasks(&self, cancel: &CancellationToken) {
+        // 1. 列出所有非终态任务
+        let active = self.inner.task_scheduler.list().await;
+        // 2. 过滤出"阻塞退出"的版本切换类任务
+        let blocking: Vec<_> = active
+            .into_iter()
+            .filter(|t| {
+                !t.status.is_terminal()
+                    && matches!(
+                        t.kind,
+                        TaskKind::Checkout | TaskKind::CheckCompat | TaskKind::CheckPrereq
+                    )
+            })
+            .collect();
+
+        if blocking.is_empty() {
+            tracing::info!("no blocking version-switch tasks to cancel");
+            return;
+        }
+
+        tracing::warn!(
+            count = blocking.len(),
+            ?blocking,
+            "found blocking version-switch tasks, cancelling them before shutdown"
+        );
+
+        // 3. 逐个 cancel（幂等，已终态任务返回 Ok）
+        for task in &blocking {
+            if let Err(e) = self.inner.task_scheduler.cancel(&task.id).await {
+                tracing::warn!(?task.id, error = %e, "failed to cancel blocking task");
+            }
+        }
+
+        // 4. 等待子任务自然结束（v3.6：tokio::select! 替代 tokio::time::timeout）
+        //    - 等待所有任务进入终态
+        //    - 5s sleep 到期 → 放弃等待（避免卡死 launcher）
+        //    - cancel 触发 → 立即放弃等待（app 急于退出）
+        let wait_result: WaitOutcome = tokio::select! {
+            _ = async {
+                for task in &blocking {
+                    // 循环查询 status，直到终态或超时
+                    loop {
+                        if let Some(info) = self.inner.task_scheduler.get(&task.id).await {
+                            if info.status.is_terminal() {
+                                break;
+                            }
+                        } else {
+                            // 任务已被淘汰出缓存
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            } => WaitOutcome::Completed,
+            _ = tokio::time::sleep(CANCEL_VERSION_TASKS_TIMEOUT) => {
+                tracing::warn!(
+                    timeout = ?CANCEL_VERSION_TASKS_TIMEOUT,
+                    "blocking version-switch tasks did not finish in time, continuing shutdown"
+                );
+                WaitOutcome::TimedOut
+            }
+            _ = cancel.cancelled() => {
+                tracing::warn!("cancel_blocking_version_tasks cancelled by caller, continuing shutdown");
+                WaitOutcome::Cancelled
+            }
+        };
+
+        if matches!(wait_result, WaitOutcome::Completed) {
+            tracing::info!("all blocking version-switch tasks cancelled");
         }
     }
 
@@ -91,6 +216,10 @@ impl ShutdownCoordinator {
     ///
     /// # 30s 超时兜底
     /// 事务未在 `SHUTDOWN_TIMEOUT` 内完成 → 强制 `std::process::exit(0)`（不返回）
+    ///
+    /// v3.6：用 `tokio::select!` + `tokio::time::sleep` 替代 `tokio::time::timeout`。
+    /// 同时创建本地 `CancellationToken` 透传给 `run_transaction` → `cancel_blocking_version_tasks`，
+    /// 让 30s sleep 到期时可通过 token 取消内部等待（语义等价于原 timeout）。
     pub async fn shutdown_all<R: Runtime>(
         &self,
         app: AppHandle<R>,
@@ -107,7 +236,7 @@ impl ShutdownCoordinator {
             tracing::info!(?reason, "shutdown_all already in progress, returning cached result");
             // 等待 OnceLock 填充（首次执行完成后会写入）
             // 简单做法：spin 等 50ms 后直接尝试 get
-            // 注：实际场景下，首次调用方在 await tokio::time::timeout(...).await，
+            // 注：实际场景下，首次调用方在等待事务完成（v3.6 改用 select! + sleep），
             //    二次调用方进入此处时首次大概率已 cached，但为了健壮性仍等一下
             tokio::time::sleep(Duration::from_millis(50)).await;
             if let Some(cached) = self.inner.cached_report.get() {
@@ -118,18 +247,20 @@ impl ShutdownCoordinator {
             return Err("shutdown_all already in progress".to_string());
         }
 
-        // 进入事务主体：30s 总超时包裹
+        // 进入事务主体（v3.6：tokio::select! 替代 tokio::time::timeout）
+        // - run_transaction 完成 → 正常返回结果
+        // - 30s sleep 到期 → 兜底强制退出（std::process::exit(0)）
         let start = Instant::now();
-        let result = tokio::time::timeout(SHUTDOWN_TIMEOUT, self.run_transaction(app.clone(), reason.clone())).await;
-
-        // 30s 超时：兜底强制退出（不返回，让 launcher 进程立即终止）
-        let report_result = match result {
-            Ok(r) => r,
-            Err(_) => {
+        let trans_cancel = CancellationToken::new();
+        let result = tokio::select! {
+            r = self.run_transaction(app.clone(), reason.clone(), &trans_cancel) => r,
+            _ = tokio::time::sleep(SHUTDOWN_TIMEOUT) => {
                 tracing::error!(
                     timeout = ?SHUTDOWN_TIMEOUT,
                     "shutdown_all timed out, force exit via std::process::exit(0)"
                 );
+                // 取消事务内部等待（cancel_blocking_version_tasks 的 5s 等待）
+                trans_cancel.cancel();
                 // OnceLock 缓存超时结果（便于二次调用返回一致结果）
                 let _ = self.inner.cached_report.set(Err(format!(
                     "shutdown timed out after {:?}",
@@ -144,22 +275,30 @@ impl ShutdownCoordinator {
         tracing::info!(?elapsed, "shutdown_all transaction completed");
 
         // 缓存结果（OnceLock 第一次 set 成功，后续 set 失败但不影响返回）
-        let _ = self.inner.cached_report.set(report_result.clone());
+        let _ = self.inner.cached_report.set(result.clone());
 
         // 成功后调用 app.exit(0)（让 Tauri 走正常退出流程）
-        if report_result.is_ok() {
+        if result.is_ok() {
             app.exit(0);
         }
 
-        report_result
+        result
     }
 
     /// 5 步事务主体（无超时，由 `shutdown_all` 包裹）
+    ///
+    /// v3.6：新增 `cancel: &CancellationToken` 参数，透传给 `cancel_blocking_version_tasks`。
     async fn run_transaction<R: Runtime>(
         &self,
         app: AppHandle<R>,
         reason: ShutdownReason,
+        cancel: &CancellationToken,
     ) -> Result<ShutdownReport, String> {
+        // ========== 步骤 1.5（v3.5 新增）：取消阻塞退出的版本切换类任务 ==========
+        // 在广播 AppExiting 之前完成，避免 AppExiting 监听者读到半完成状态
+        tracing::info!("step 1.5: cancel blocking version-switch tasks");
+        self.cancel_blocking_version_tasks(cancel).await;
+
         // ========== 步骤 2：广播 AppExiting ==========
         tracing::info!(?reason, "step 2: emit AppExiting");
         self.inner.event_bus.emit(SystemEvent::AppExiting {

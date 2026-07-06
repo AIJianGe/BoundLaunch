@@ -9,6 +9,7 @@
 
 pub mod compat;
 pub mod git_ops;
+pub mod git_ops_async;
 pub mod models;
 pub mod paths;
 pub mod repo_switcher;

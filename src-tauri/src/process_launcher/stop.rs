@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use tokio::process::Child;
+use tokio_util::sync::CancellationToken;
 
 use crate::common::process_util::decode_windows_bytes;
 use crate::error::ProcessError;
@@ -38,31 +39,42 @@ const INTERRUPT_BODY: &str = "{}";
 ///
 /// 失败不返回错误（best-effort）：可能 ComfyUI 已不响应，
 /// 后续的 SIGTERM 才是真正的"硬"停止。
-pub async fn post_interrupt(port: u16) {
+///
+/// v3.6：用 `CancellationToken` + `tokio::time::sleep` 替代 `tokio::time::timeout`。
+/// - `cancel.cancelled()`：调用方主动取消（如 Force Stop）→ 立即放弃 HTTP 请求
+/// - `tokio::time::sleep(INTERRUPT_TIMEOUT)`：保留 2s grace period 语义
+pub async fn post_interrupt(port: u16, cancel: &CancellationToken) {
     let url = format!("http://127.0.0.1:{}/interrupt", port);
     let client = reqwest::Client::new();
 
-    let result = tokio::time::timeout(
-        INTERRUPT_TIMEOUT,
-        client.post(&url).body(INTERRUPT_BODY).send(),
-    )
-    .await;
+    // v3.6：tokio::select! 三路竞速
+    // - HTTP 响应到达 → 正常处理
+    // - cancel 触发 → 立即放弃（用于 Force Stop / app 退出）
+    // - 2s sleep 到期 → 放弃慢请求（保留原 INTERRUPT_TIMEOUT 语义）
+    let result = tokio::select! {
+        r = client.post(&url).body(INTERRUPT_BODY).send() => r,
+        _ = cancel.cancelled() => {
+            tracing::warn!("POST /interrupt cancelled by caller");
+            return;
+        }
+        _ = tokio::time::sleep(INTERRUPT_TIMEOUT) => {
+            tracing::warn!(
+                timeout_ms = INTERRUPT_TIMEOUT.as_millis(),
+                "POST /interrupt timed out, will proceed to SIGTERM"
+            );
+            return;
+        }
+    };
 
     match result {
-        Ok(Ok(resp)) => {
+        Ok(resp) => {
             tracing::info!(
                 status = %resp.status(),
                 "POST /interrupt responded",
             );
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             tracing::warn!(error = %e, "POST /interrupt request failed");
-        }
-        Err(_) => {
-            tracing::warn!(
-                timeout_ms = INTERRUPT_TIMEOUT.as_millis(),
-                "POST /interrupt timed out, will proceed to SIGTERM"
-            );
         }
     }
 }
@@ -200,27 +212,34 @@ pub async fn terminate_process_group(pid: u32, force: bool) -> std::io::Result<(
     }
 }
 
-/// 完整停止流程：interrupt → 进程组 SIGTERM → 进程组 SIGKILL
+/// 完整停止流程：interrupt → 进程组 SIGTERM → 进程组 SIGKILL（跨平台）
 ///
 /// 返回子进程退出状态。
 ///
 /// # 流程
-/// 1. POST /interrupt（best-effort，2s 超时）
+/// 1. POST /interrupt（best-effort，2s 超时或 cancel 触发时放弃）
 /// 2. 进程组 SIGTERM（`terminate_process_group` force=false）
-/// 3. wait child.wait() 5s
+/// 3. wait child.wait() 5s（或 cancel 触发时立即升级）
 /// 4. 仍存活 → 进程组 SIGKILL（`terminate_process_group` force=true）
-/// 5. wait child.wait() 2s
+/// 5. wait child.wait() 2s（或 cancel 触发时立即返回 StopFailed）
 /// 6. 仍存活 → 返回 `StopFailed`
 ///
 /// F24 进程组隔离配套：步骤 2/4 用 `terminate_process_group` 而非单进程 `terminate_process`，
 /// 确保 ComfyUI + 其 Python worker 子进程被整体终止，避免 launcher 退出后 python 残留。
+///
+/// v3.6：用 `CancellationToken` + `tokio::time::sleep` 替代 `tokio::time::timeout`。
+/// - `cancel.cancelled()`：调用方主动取消（如 Force Stop / app 退出）
+///   - SIGTERM 等待阶段触发 → 立即升级到 SIGKILL
+///   - SIGKILL 等待阶段触发 → 立即返回 StopFailed（SIGKILL 已发出，无法更强）
+/// - `tokio::time::sleep(SIGTERM_WAIT/SIGKILL_WAIT)`：保留原 grace period 语义
 pub async fn stop_with_grace(
     mut child: Child,
     pid: u32,
     port: u16,
+    cancel: &CancellationToken,
 ) -> Result<std::process::ExitStatus, ProcessError> {
     // 阶段 1：POST /interrupt（best-effort）
-    post_interrupt(port).await;
+    post_interrupt(port, cancel).await;
 
     // 阶段 2：进程组 SIGTERM（force=false）
     tracing::info!(pid, "sending SIGTERM to process group");
@@ -228,19 +247,33 @@ pub async fn stop_with_grace(
         tracing::warn!(pid, error = %e, "process group SIGTERM failed, will try SIGKILL");
     }
 
-    // 阶段 3：wait 5s
-    match tokio::time::timeout(SIGTERM_WAIT, child.wait()).await {
-        Ok(Ok(status)) => {
+    // 阶段 3：wait 5s（v3.6：tokio::select! 替代 tokio::time::timeout）
+    // - child.wait() 完成 → 返回退出状态
+    // - 5s sleep 到期 → 升级到 SIGKILL
+    // - cancel 触发 → 立即升级到 SIGKILL
+    let sigterm_exit: Option<Result<std::process::ExitStatus, std::io::Error>> = tokio::select! {
+        status = child.wait() => Some(status),
+        _ = tokio::time::sleep(SIGTERM_WAIT) => {
+            tracing::warn!(pid, timeout = ?SIGTERM_WAIT, "process did not exit after SIGTERM, escalating to SIGKILL");
+            None
+        }
+        _ = cancel.cancelled() => {
+            tracing::warn!(pid, "stop cancelled during SIGTERM wait, escalating to SIGKILL");
+            None
+        }
+    };
+    match sigterm_exit {
+        Some(Ok(status)) => {
             tracing::info!(pid, ?status, "process exited after SIGTERM");
             return Ok(status);
         }
-        Ok(Err(e)) => {
+        Some(Err(e)) => {
             // child.wait() 出错：可能进程已退出但 wait 失败
             tracing::warn!(pid, error = %e, "child.wait() returned error after SIGTERM");
             return Err(ProcessError::Io(e.to_string()));
         }
-        Err(_) => {
-            tracing::warn!(pid, timeout = ?SIGTERM_WAIT, "process did not exit after SIGTERM, escalating to SIGKILL");
+        None => {
+            // timeout 或 cancel：继续升级到 SIGKILL
         }
     }
 
@@ -251,18 +284,29 @@ pub async fn stop_with_grace(
         return Err(ProcessError::StopFailed);
     }
 
-    // 阶段 5：wait 2s
-    match tokio::time::timeout(SIGKILL_WAIT, child.wait()).await {
-        Ok(Ok(status)) => {
+    // 阶段 5：wait 2s（v3.6：tokio::select! 替代 tokio::time::timeout）
+    let sigkill_exit: Option<Result<std::process::ExitStatus, std::io::Error>> = tokio::select! {
+        status = child.wait() => Some(status),
+        _ = tokio::time::sleep(SIGKILL_WAIT) => {
+            tracing::error!(pid, "process did not exit after SIGKILL, reporting StopFailed");
+            None
+        }
+        _ = cancel.cancelled() => {
+            tracing::warn!(pid, "stop cancelled during SIGKILL wait, SIGKILL already sent");
+            None
+        }
+    };
+    match sigkill_exit {
+        Some(Ok(status)) => {
             tracing::info!(pid, ?status, "process exited after SIGKILL");
             Ok(status)
         }
-        Ok(Err(e)) => {
+        Some(Err(e)) => {
             tracing::warn!(pid, error = %e, "child.wait() returned error after SIGKILL");
             Err(ProcessError::Io(e.to_string()))
         }
-        Err(_) => {
-            tracing::error!(pid, "process did not exit after SIGKILL, reporting StopFailed");
+        None => {
+            // timeout 或 cancel：SIGKILL 已发出但进程仍未退出
             Err(ProcessError::StopFailed)
         }
     }

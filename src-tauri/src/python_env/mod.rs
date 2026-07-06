@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, CudaVersion};
 use crate::error::EnvError;
@@ -84,7 +85,14 @@ impl PythonEnvService {
     ///
     /// 所有探测都是只读，不会修改任何状态。
     /// 用于前端 `envStatus` 命令（设置页「Python 版本切换」当前版本显示）。
-    pub async fn get_status(&self, venv_path: &Path) -> PythonEnvStatus {
+    ///
+    /// v3.6：接 `CancellationToken`，透传给 `probe_python_version` 和 `verify_venv`
+    /// 注：env_status 命令已改为从 snapshot 提取，本方法当前无调用方（保留备用）
+    pub async fn get_status(
+        &self,
+        venv_path: &Path,
+        cancel: &CancellationToken,
+    ) -> PythonEnvStatus {
         // 1. uv 状态
         let (uv_version, uv_installed) = self.uv.get_version().await;
         let uv_path = if uv_installed {
@@ -124,12 +132,12 @@ impl PythonEnvService {
         }
 
         // 4. 探查 python 版本（轻量：`python -c "import sys; print(sys.version.split()[0])"`，5s 超时）
-        let venv_python_version = probe_python_version(&python).await;
+        let venv_python_version = probe_python_version(&python, cancel).await;
 
         // 5. 探查 torch（用现有 verify_venv 逻辑，但 venv_python_version 已拿到）
         //    注意：verify_venv 会调 probe_torch_script（90s 超时），失败时降级
         let (torch_installed, torch_version, torch_cuda) =
-            match verify_venv(venv_path).await {
+            match verify_venv(venv_path, cancel).await {
                 Ok(info) => (info.torch_installed, info.torch_version, info.cuda_available),
                 Err(e) => {
                     tracing::warn!(
@@ -152,31 +160,43 @@ impl PythonEnvService {
     }
 
     /// 创建 venv
+    ///
+    /// v3.6：接 `CancellationToken`，透传给 `uv.create_venv`
     pub async fn create_venv(
         &self,
         venv_path: &Path,
         python_version: &str,
+        cancel: &CancellationToken,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
-        self.uv.create_venv(venv_path, python_version).await
+        self.uv.create_venv(venv_path, python_version, cancel).await
     }
 
     /// 安装便携 Python
-    pub async fn install_portable_python(&self, version: &str) -> Result<(), EnvError> {
+    ///
+    /// v3.6：接 `CancellationToken`，透传给 `uv.install_python`
+    pub async fn install_portable_python(
+        &self,
+        version: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
-        self.uv.install_python(version).await
+        self.uv.install_python(version, cancel).await
     }
 
     /// 安装 torch
     ///
     /// 完成后通过事件总线广播 `TorchInstalled`
+    ///
+    /// v3.6：接 `CancellationToken`，透传给 `uv.install_torch`
     pub async fn install_torch(
         &self,
         venv_path: &Path,
         cuda_version: CudaVersion,
+        cancel: &CancellationToken,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
-        self.uv.install_torch(venv_path, &cuda_version).await?;
+        self.uv.install_torch(venv_path, &cuda_version, cancel).await?;
 
         // 通知其他模块（EnvironmentInspector 失效缓存，ProcessLauncher 重置 dirty 标记）
         self.event_bus
@@ -201,6 +221,7 @@ impl PythonEnvService {
         &self,
         venv_path: &Path,
         variant: &TorchVariant,
+        cancel: &CancellationToken,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
 
@@ -211,7 +232,7 @@ impl PythonEnvService {
             )));
         }
 
-        self.uv.install_torch_variant(venv_path, variant).await?;
+        self.uv.install_torch_variant(venv_path, variant, cancel).await?;
 
         // 通知其他模块
         self.event_bus
@@ -236,10 +257,11 @@ impl PythonEnvService {
         &self,
         venv_path: &Path,
         requirements_file: &Path,
+        cancel: &CancellationToken,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
         let constraints = self.prepare_freeze_constraints(venv_path).await?;
-        self.uv.install_requirements(venv_path, requirements_file, Some(&constraints)).await?;
+        self.uv.install_requirements(venv_path, requirements_file, Some(&constraints), cancel).await?;
 
         // v3.2：通知 EnvironmentInspector 失效 30s 缓存
         self.event_bus.emit(SystemEvent::RequirementsInstalled);
@@ -253,15 +275,18 @@ impl PythonEnvService {
     /// 让 pip 按新 requirements.txt 升级/降级包版本，避免 venv 残留旧版本。
     ///
     /// v1.8：自动应用 freeze constraints 防止 numpy 等包装到坏版本。
+    ///
+    /// v3.6：接 `CancellationToken`，透传给 `uv.install_requirements_upgrade`
     pub async fn install_requirements_upgrade(
         &self,
         venv_path: &Path,
         requirements_file: &Path,
+        cancel: &CancellationToken,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
         // 写入 constraints 到 venv（如已存在则覆盖更新）
         let constraints = self.prepare_freeze_constraints(venv_path).await?;
-        self.uv.install_requirements_upgrade(venv_path, requirements_file, Some(&constraints)).await?;
+        self.uv.install_requirements_upgrade(venv_path, requirements_file, Some(&constraints), cancel).await?;
 
         // v3.2：通知 EnvironmentInspector 失效 30s 缓存
         self.event_bus.emit(SystemEvent::RequirementsInstalled);
@@ -292,27 +317,38 @@ impl PythonEnvService {
     }
 
     /// 校验 venv 完整性
-    pub async fn verify_venv(&self, venv_path: &Path) -> Result<EnvInfo, EnvError> {
-        verify_venv(venv_path).await
+    ///
+    /// v3.6：接 `CancellationToken`，透传给 `verify::verify_venv`
+    pub async fn verify_venv(
+        &self,
+        venv_path: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<EnvInfo, EnvError> {
+        verify_venv(venv_path, cancel).await
     }
 
     /// venv 是否就绪
-    pub async fn is_venv_ready(&self, venv_path: &Path) -> bool {
-        is_venv_ready(venv_path).await
+    ///
+    /// v3.6：接 `CancellationToken`，透传给 `verify::is_venv_ready`
+    pub async fn is_venv_ready(&self, venv_path: &Path, cancel: &CancellationToken) -> bool {
+        is_venv_ready(venv_path, cancel).await
     }
 
     /// 比对 venv 已装依赖 vs requirements.txt
     ///
     /// v2.10：注入 uv_binary 用于加速 pip list（uv pip list 主路径）
+    /// v3.6：透传 CancellationToken
     pub async fn check_requirements_compatibility(
         &self,
         venv_path: &Path,
         comfyui_root: &Path,
+        cancel: &CancellationToken,
     ) -> Result<CompatibilityReport, EnvError> {
         compatibility::check_requirements_compatibility(
             venv_path,
             comfyui_root,
             Some(self.uv.binary_path()),
+            cancel,
         )
         .await
     }
@@ -327,6 +363,7 @@ impl PythonEnvService {
     pub async fn rebuild_venv(
         &self,
         config: &Config,
+        cancel: &CancellationToken,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
         let venv_path = PathBuf::from(&config.paths.venv_path);
@@ -344,20 +381,20 @@ impl PythonEnvService {
         }
 
         // 2. 创建 venv
-        self.uv.create_venv(&venv_path, python_version).await?;
+        self.uv.create_venv(&venv_path, python_version, cancel).await?;
 
         // 3. 装 torch
-        self.uv.install_torch(&venv_path, &cuda_version).await?;
+        self.uv.install_torch(&venv_path, &cuda_version, cancel).await?;
 
         // 4. 装 requirements
         let req_file = comfyui_root.join("requirements.txt");
         if req_file.exists() {
             let constraints = self.prepare_freeze_constraints(&venv_path).await?;
-            self.uv.install_requirements(&venv_path, &req_file, Some(&constraints)).await?;
+            self.uv.install_requirements(&venv_path, &req_file, Some(&constraints), cancel).await?;
         }
 
         // 5. 校验
-        let info = verify_venv(&venv_path).await?;
+        let info = verify_venv(&venv_path, cancel).await?;
         if !info.torch_installed {
             return Err(EnvError::RebuildFailed {
                 detail: "torch not installed after rebuild".to_string(),
@@ -388,6 +425,7 @@ impl PythonEnvService {
         new_version: &str,
         config: &Config,
         progress_tx: mpsc::Sender<InstallProgress>,
+        cancel: &CancellationToken,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
         let venv_path = PathBuf::from(&config.paths.venv_path);
@@ -402,7 +440,7 @@ impl PythonEnvService {
                 percent: Some(10),
             })
             .await;
-        self.uv.install_python(new_version).await?;
+        self.uv.install_python(new_version, cancel).await?;
 
         // Step 2: 备份旧 venv
         let backup_path = backup_venv(&venv_path).await?;
@@ -415,7 +453,7 @@ impl PythonEnvService {
                 percent: Some(30),
             })
             .await;
-        if let Err(e) = self.uv.create_venv(&venv_path, new_version).await {
+        if let Err(e) = self.uv.create_venv(&venv_path, new_version, cancel).await {
             restore_backup(&venv_path, &backup_path).await;
             return Err(e);
         }
@@ -428,7 +466,7 @@ impl PythonEnvService {
                 percent: Some(50),
             })
             .await;
-        if let Err(e) = self.uv.install_torch(&venv_path, &cuda_version).await {
+        if let Err(e) = self.uv.install_torch(&venv_path, &cuda_version, cancel).await {
             restore_backup(&venv_path, &backup_path).await;
             return Err(e);
         }
@@ -445,7 +483,7 @@ impl PythonEnvService {
         if req_file.exists() {
             if let Err(e) = self
                 .uv
-                .install_requirements(&venv_path, &req_file, None)
+                .install_requirements(&venv_path, &req_file, None, cancel)
                 .await
             {
                 restore_backup(&venv_path, &backup_path).await;
@@ -461,7 +499,7 @@ impl PythonEnvService {
                 percent: Some(90),
             })
             .await;
-        match verify_venv(&venv_path).await {
+        match verify_venv(&venv_path, cancel).await {
             Ok(info) if info.torch_installed => {
                 // 删除备份
                 if backup_path.exists() {

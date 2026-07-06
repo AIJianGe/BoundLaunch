@@ -84,6 +84,9 @@ pub enum EnvError {
     RebuildFailed { detail: String },
     #[error("verify_venv 失败: {0}")]
     VerifyFailed(String),
+    /// v3.6：用户主动取消（CancellationToken 触发）
+    #[error("操作已取消")]
+    Cancelled,
 }
 
 #[derive(Debug, Error, Serialize)]
@@ -198,3 +201,20 @@ pub enum TaskError {
 
 /// 通用 Result 别名
 pub type AppResult<T> = Result<T, AppError>;
+
+/// v3.6：SubprocessError → EnvError 转换
+///
+/// `Cancelled` → `EnvError::Cancelled`（而非 `VerifyFailed`，语义更清晰）
+impl From<crate::common::subprocess::SubprocessError> for EnvError {
+    fn from(e: crate::common::subprocess::SubprocessError) -> Self {
+        match e {
+            crate::common::subprocess::SubprocessError::Cancelled => EnvError::Cancelled,
+            crate::common::subprocess::SubprocessError::Io(e) => {
+                EnvError::VerifyFailed(e.to_string())
+            }
+            crate::common::subprocess::SubprocessError::Exit { code, stderr } => {
+                EnvError::VerifyFailed(format!("exit {}: {}", code, stderr))
+            }
+        }
+    }
+}

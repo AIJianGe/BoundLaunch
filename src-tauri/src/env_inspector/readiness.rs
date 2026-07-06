@@ -15,6 +15,7 @@
 use std::path::Path;
 
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::core_manager::CoreManagerService;
@@ -82,7 +83,10 @@ pub async fn check_readiness(
     let uv_available = python_env.is_uv_available().await;
 
     // 4. torch 是否安装
-    let env_info: EnvInfo = match env_inspector.inspect_all(venv_path, comfyui_root).await {
+    //    readiness::check_readiness 是死代码（无调用方），用本地不可取消 token
+    //    前端实际走 env_readiness_check 命令（基于 inspect_or_cached 快速返回）
+    let cancel = CancellationToken::new();
+    let env_info: EnvInfo = match env_inspector.inspect_all(venv_path, comfyui_root, &cancel).await {
         Ok(info) => info,
         Err(e) => {
             tracing::warn!(error = %e, "env_inspect failed during readiness check");

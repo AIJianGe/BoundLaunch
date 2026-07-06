@@ -91,10 +91,12 @@ impl AppState {
             config.clone(),
             data_dir,
         ));
-        // F24 退出流程：构造 ShutdownCoordinator（依赖 process_launcher + event_bus）
+        // F24 退出流程：构造 ShutdownCoordinator（依赖 process_launcher + event_bus + task_scheduler）
+        // v3.5：新增 task_scheduler 参数，用于退出时取消阻塞的版本切换类任务
         let shutdown_coordinator = Arc::new(ShutdownCoordinator::new(
             (*process_launcher).clone(),
             (*event_bus).clone(),
+            task_scheduler.clone(),
         ));
         Self {
             event_bus,

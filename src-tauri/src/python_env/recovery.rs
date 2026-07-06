@@ -170,6 +170,7 @@ pub async fn diagnose(
     venv_path: &Path,
     comfyui_root: &Path,
     event_bus: &EventBus,
+    cancel: &CancellationToken,
 ) -> DiagnoseReport {
     let mut issues = Vec::new();
 
@@ -195,7 +196,7 @@ pub async fn diagnose(
     }
 
     // 2. torch 探针（带错误详情）
-    let torch_result = crate::env_inspector::scripts::probe_torch_script(venv_path).await;
+    let torch_result = crate::env_inspector::scripts::probe_torch_script(venv_path, cancel).await;
     let (torch_import_ok, torch_version, error_info) = match torch_result {
         Ok(json) => {
             let probe = crate::env_inspector::scripts::parse_torch_probe(&json);
@@ -254,7 +255,7 @@ pub async fn diagnose(
     let critical_deps = ["torch", "torchvision", "torchaudio"];
     if torch_import_ok {
         // torch 能 import → 检查 torchaudio 是否一致
-        if let Ok(versions) = check_packages(venv_path, &critical_deps).await {
+        if let Ok(versions) = check_packages(venv_path, &critical_deps, cancel).await {
             for (pkg, ver_opt) in versions {
                 if ver_opt.is_none() {
                     issues.push(Issue {
@@ -271,7 +272,7 @@ pub async fn diagnose(
 
     // 5. requirements.txt 是否都装好
     if comfyui_root.join("requirements.txt").exists() {
-        if let Ok(report) = check_requirements_match(venv_path, comfyui_root).await {
+        if let Ok(report) = check_requirements_match(venv_path, comfyui_root, cancel).await {
             if !report.all_ok {
                 issues.push(Issue {
                     severity: IssueSeverity::Warning,
@@ -367,9 +368,12 @@ fn is_numpy_known_bad(version: &str) -> bool {
 }
 
 /// 检查多个包是否已装
+///
+/// v3.6：接 `CancellationToken`
 async fn check_packages(
     venv_path: &Path,
     packages: &[&str],
+    cancel: &CancellationToken,
 ) -> Result<Vec<(String, Option<String>)>, EnvError> {
     let python = crate::python_env::uv_runner::venv_python_path(venv_path);
     if !python.exists() {
@@ -387,12 +391,15 @@ async fn check_packages(
         args.push((*pkg).to_string());
     }
     let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
-    let output = crate::common::process_util::new_command(&python)
-        .args(&args_ref)
-        .output()
+    let mut cmd = crate::common::process_util::new_command(&python);
+    cmd.args(&args_ref)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let output = crate::common::subprocess::run_with_cancel(&mut cmd, cancel)
         .await
-        .map_err(|e| EnvError::VerifyFailed(e.to_string()))?;
+        .map_err(EnvError::from)?;
     if !output.status.success() {
         // pip show 在部分包缺失时返回非零
         // 解析 stderr 不太有意义，直接用 stdout 部分
@@ -428,6 +435,7 @@ struct RequirementsMatchReport {
 async fn check_requirements_match(
     venv_path: &Path,
     comfyui_root: &Path,
+    cancel: &CancellationToken,
 ) -> Result<RequirementsMatchReport, EnvError> {
     let req_file = comfyui_root.join("requirements.txt");
     if !req_file.exists() {
@@ -441,7 +449,7 @@ async fn check_requirements_match(
         .await
         .unwrap_or_default();
     // 跑 pip list 拿已装包（不带 uv_binary 参数：fallback 到 python -m pip）
-    let pip_list_json = crate::env_inspector::scripts::run_pip_list(venv_path, None).await?;
+    let pip_list_json = crate::env_inspector::scripts::run_pip_list(venv_path, None, cancel).await?;
     let installed = crate::env_inspector::deps::parse_pip_list(&pip_list_json)?;
     let deps = crate::env_inspector::deps::build_dependency_list(&installed, &required);
     let mut mismatched = Vec::new();
@@ -494,7 +502,7 @@ pub async fn quick_repair_numpy(
     let args: Vec<&str> = vec![
         "pip", "install", "--upgrade", &venv_arg, "-c", &constraints_arg, "numpy<2.3",
     ];
-    let output = uv_run_cmd(uv, &args).await?;
+    let output = uv_run_cmd(uv, &args, cancel).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(EnvError::RebuildFailed {
@@ -504,7 +512,7 @@ pub async fn quick_repair_numpy(
 
     progress.send_percent(70);
     progress.send_message("验证 torch import...".to_string());
-    uv.smoke_test_torch(venv_path).await?;
+    uv.smoke_test_torch(venv_path, cancel).await?;
 
     progress.send_percent(100);
     progress.send_message("numpy 降级完成，torch import 已恢复".to_string());
@@ -527,25 +535,23 @@ pub async fn quick_repair_reinstall(
     }
     progress.send_percent(10);
     progress.send_message(format!("重装 torch ({})...", cuda_version.display_name()));
-    uv.install_torch(venv_path, cuda_version).await?;
+    uv.install_torch(venv_path, cuda_version, cancel).await?;
 
     progress.send_percent(50);
     let req_file = comfyui_root.join("requirements.txt");
     if req_file.exists() {
         progress.send_message("重装 requirements.txt...".to_string());
-        // 走 mod.rs 的 install_requirements（自动应用 freeze constraints）
-        // 这里直接调用 uv 避免循环依赖
         let constraints = freeze::write_constraints_to_venv(venv_path).map_err(|e| {
             EnvError::RebuildFailed {
                 detail: format!("写 constraints 失败: {}", e),
             }
         })?;
-        uv.install_requirements(venv_path, &req_file, Some(&constraints)).await?;
+        uv.install_requirements(venv_path, &req_file, Some(&constraints), cancel).await?;
     }
 
     progress.send_percent(90);
     progress.send_message("smoke test...".to_string());
-    uv.smoke_test_torch(venv_path).await?;
+    uv.smoke_test_torch(venv_path, cancel).await?;
 
     progress.send_percent(100);
     progress.send_message("重装完成".to_string());
@@ -571,36 +577,44 @@ pub async fn rebuild_repair(
     progress.send_message("重建 venv（5 步事务：删 → 建 → 装 torch → 装依赖 → 验证）".to_string());
 
     // 复用现有 rebuild_venv（已经是经过验证的事务）
-    python_env.rebuild_venv(config).await?;
+    python_env.rebuild_venv(config, cancel).await?;
 
     progress.send_percent(90);
     progress.send_message("smoke test...".to_string());
-    python_env.uv().smoke_test_torch(venv_path).await?;
+    python_env.uv().smoke_test_torch(venv_path, cancel).await?;
 
     progress.send_percent(100);
     progress.send_message("venv 重建完成".to_string());
     Ok(())
 }
 
-/// 包装 uv 子进程调用（带超时）
+/// 包装 uv 子进程调用（带 CancellationToken）
 ///
-/// v3.3：使用 `new_command` 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
-async fn uv_run_cmd(uv: &UvRunner, args: &[&str]) -> Result<std::process::Output, EnvError> {
-    use std::time::Duration;
-    let output = tokio::time::timeout(
-        Duration::from_secs(300), // 5 分钟
-        crate::common::process_util::new_command(uv.binary_path())
-            .args(args)
-            .output(),
-    )
-    .await
-    .map_err(|_| EnvError::RebuildFailed {
-        detail: "uv 子进程超时（5 分钟）".to_string(),
-    })?
-    .map_err(|e| EnvError::RebuildFailed {
-        detail: format!("uv 子进程启动失败: {}", e),
-    })?;
-    Ok(output)
+/// v3.6：用 `subprocess::run_with_cancel` 替代 `tokio::time::timeout`（300s）
+async fn uv_run_cmd(
+    uv: &UvRunner,
+    args: &[&str],
+    cancel: &CancellationToken,
+) -> Result<std::process::Output, EnvError> {
+    let mut cmd = crate::common::process_util::new_command(uv.binary_path());
+    cmd.args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    crate::common::subprocess::run_with_cancel(&mut cmd, cancel)
+        .await
+        .map_err(|e| match e {
+            crate::common::subprocess::SubprocessError::Cancelled => EnvError::Cancelled,
+            crate::common::subprocess::SubprocessError::Io(e) => EnvError::RebuildFailed {
+                detail: format!("uv 子进程启动失败: {}", e),
+            },
+            crate::common::subprocess::SubprocessError::Exit { code, stderr } => {
+                EnvError::RebuildFailed {
+                    detail: format!("uv 子进程退出码 {}: {}", code, stderr),
+                }
+            }
+        })
 }
 
 /// v1.8 一次性迁移：检查并降级 numpy 2.4.x → 2.2.x
@@ -625,7 +639,8 @@ pub async fn run_startup_numpy_migration(
         return Ok(());
     }
     // 2. 探测 torch 是否能 import（能 → 无需迁移）
-    let probe_json = crate::env_inspector::scripts::probe_torch_script(venv_path)
+    let cancel = CancellationToken::new();
+    let probe_json = crate::env_inspector::scripts::probe_torch_script(venv_path, &cancel)
         .await
         .map_err(|e| format!("probe_torch 失败: {}", e))?;
     let probe = crate::env_inspector::scripts::parse_torch_probe(&probe_json);
@@ -656,7 +671,6 @@ pub async fn run_startup_numpy_migration(
     );
     let cuda = config.torch.cuda_version;
     let dummy_progress = ProgressSender::no_op();
-    let cancel = CancellationToken::new();
     let uv = python_env.uv();
     if let Err(e) = quick_repair_numpy(uv, venv_path, &dummy_progress, &cancel).await {
         let msg = format!("numpy 启动迁移失败（{}）: {}", ver, e);

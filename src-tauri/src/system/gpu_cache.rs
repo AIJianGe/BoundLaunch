@@ -1,4 +1,4 @@
-//! GPU 检测结果缓存（v3.0 新增）
+//! GPU 检测结果缓存（v3.0 新增，v3.6 改用 CancellationToken）
 //!
 //! 5 分钟 TTL，避免每次设置页打开都重新调外部工具。
 //! 用 Mutex<Vec<GpuInfo>> + 时间戳实现（无锁全局状态用 OnceCell，可选）
@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use super::gpu::{detect_gpus, GpuInfo};
 
@@ -35,8 +36,12 @@ pub fn get_cached_gpus() -> Option<Vec<GpuInfo>> {
 }
 
 /// 检测 GPU 并写入缓存
+///
+/// v3.6：detect_gpus 现在需要 CancellationToken，这里创建一个本地非可取消 token
+/// （调用方不持有 token，意味着此检测不可被外部取消）。
 pub async fn detect_and_cache() -> Vec<GpuInfo> {
-    let gpus = detect_gpus().await;
+    let cancel = CancellationToken::new();
+    let gpus = detect_gpus(&cancel).await;
     *cache_cell().lock() = Some(CacheEntry {
         gpus: gpus.clone(),
         cached_at: Instant::now(),

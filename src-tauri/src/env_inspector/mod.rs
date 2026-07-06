@@ -30,6 +30,7 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::EnvError;
 use crate::event_bus::{EventBus, SystemEvent};
@@ -74,6 +75,13 @@ pub struct EnvironmentInspectorService {
     /// - invoke 立即返回 snapshot_cache 中的 stale 值
     /// - spawn_refresh 调完整 inspect_snapshot 后更新 snapshot_cache
     snapshot_cache: Arc<RwLock<Option<EnvSnapshot>>>,
+    /// v3.6 新增：后台刷新任务的 CancellationToken
+    ///
+    /// `spawn_refresh` 每次创建新 token：
+    /// - 先取消旧的（取消上次未完成的刷新任务）
+    /// - 把新 token 存入此字段，传给 `inspect_snapshot` → 各子探针
+    /// - AppExiting 时取消该 token，确保退出时不再有子进程残留
+    refresh_cancel: Arc<RwLock<Option<CancellationToken>>>,
 }
 
 impl EnvironmentInspectorService {
@@ -125,6 +133,7 @@ impl EnvironmentInspectorService {
             refreshing: Arc::new(AtomicBool::new(false)),
             app_handle,
             snapshot_cache: Arc::new(RwLock::new(None)),
+            refresh_cancel: Arc::new(RwLock::new(None)),
         };
         service.spawn_event_listener();
         service
@@ -139,6 +148,7 @@ impl EnvironmentInspectorService {
     fn spawn_event_listener(&self) {
         let mut rx = self.event_bus.subscribe();
         let cache = self.cache.clone(); // EnvCache 内部用 Arc，可安全 clone
+        let refresh_cancel = self.refresh_cancel.clone();
         tokio::spawn(async move {
             while let Ok(event) = rx.recv().await {
                 match event {
@@ -150,6 +160,11 @@ impl EnvironmentInspectorService {
                         tracing::debug!(?event, "env cache invalidated by event");
                     }
                     SystemEvent::AppExiting { .. } => {
+                        // 取消正在进行的后台刷新任务，避免退出后子进程残留
+                        if let Some(token) = refresh_cancel.write().take() {
+                            token.cancel();
+                            tracing::debug!("refresh_cancel triggered on app exit");
+                        }
                         cache.clear();
                         tracing::debug!(?event, "env cache cleared on app exit");
                     }
@@ -162,10 +177,14 @@ impl EnvironmentInspectorService {
     /// 完整环境探查
     ///
     /// 5 个子任务并行执行，部分失败返回部分结果
+    ///
+    /// v3.6：接 `CancellationToken`，透传给 `probe_torch` 和 `inspect_dependencies`。
+    /// 缓存命中时立即返回（不检查 cancel）。
     pub async fn inspect_all(
         &self,
         venv_path: &Path,
         comfyui_root: &Path,
+        cancel: &CancellationToken,
     ) -> Result<EnvInfo, EnvError> {
         // 1. 缓存命中检查
         if self.cache.is_fresh(venv_path) {
@@ -179,10 +198,11 @@ impl EnvironmentInspectorService {
         //    TODO: 未来可引入 DashMap<InspectKey, watch::Sender> 实现精确去重
 
         // 3. 并行执行 5 个子任务（tokio::join!）
+        //    v3.6：cancel 透传给所有子探针（含 detect_gpu，nvidia-smi 可卡住）
         let (torch, dependencies, gpu) = tokio::join!(
-            self.probe_torch(venv_path),
-            self.inspect_dependencies(venv_path, comfyui_root),
-            detect_gpu(),
+            self.probe_torch(venv_path, cancel),
+            self.inspect_dependencies(venv_path, comfyui_root, cancel),
+            detect_gpu(cancel),
         );
 
         // 部分失败容错：torch 失败 → not_installed；deps 失败 → 空列表
@@ -229,9 +249,10 @@ impl EnvironmentInspectorService {
         &self,
         venv_path: &Path,
         comfyui_root: &Path,
+        cancel: &CancellationToken,
     ) -> Result<EnvSnapshot, EnvError> {
         // 1. 复用 inspect_all 拿嵌套数据（走 30s 缓存）
-        let inner = self.inspect_all(venv_path, comfyui_root).await?;
+        let inner = self.inspect_all(venv_path, comfyui_root, cancel).await?;
 
         // 2. python 路径
         let python_path = venv_python_path(venv_path);
@@ -243,7 +264,7 @@ impl EnvironmentInspectorService {
         // 4. python_version 提取
         //    优先用 probe_torch 输出的 platform.release（已有数据，无额外探测成本）
         //    备选用 static "unknown"
-        let python_version = python_version_from_torch_probe(venv_path).await
+        let python_version = python_version_from_torch_probe(venv_path, cancel).await
             .unwrap_or_else(|| "unknown".to_string());
 
         // 5. 扁平化
@@ -329,7 +350,16 @@ impl EnvironmentInspectorService {
             return;
         }
 
-        // 2. clone self 进 task（EnvironmentInspectorService 已 derive Clone）
+        // 2. 创建新的 CancellationToken，取消旧的
+        //    - 取消旧 token 会让旧 spawn_refresh 内的所有子探针尽快返回 Cancelled
+        //    - 取旧 token 取出后置 None，避免重复取消
+        let new_cancel = CancellationToken::new();
+        if let Some(old) = self.refresh_cancel.write().replace(new_cancel.clone()) {
+            tracing::debug!("cancelling previous env refresh task");
+            old.cancel();
+        }
+
+        // 3. clone self 进 task（EnvironmentInspectorService 已 derive Clone）
         let service = self.clone();
         let venv = venv_path.clone();
         let comfyui = comfyui_root.clone();
@@ -337,7 +367,7 @@ impl EnvironmentInspectorService {
         tokio::spawn(async move {
             tracing::info!("env background refresh started");
 
-            let result = service.inspect_snapshot(&venv, &comfyui).await;
+            let result = service.inspect_snapshot(&venv, &comfyui, &new_cancel).await;
 
             match result {
                 Ok(snapshot) => {
@@ -378,7 +408,13 @@ impl EnvironmentInspectorService {
     }
 
     /// 探查 venv 中的 torch
-    pub async fn probe_torch(&self, venv_path: &Path) -> Result<TorchInfo, EnvError> {
+    ///
+    /// v3.6：接 `CancellationToken`，透传给 `probe_torch_script`
+    pub async fn probe_torch(
+        &self,
+        venv_path: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<TorchInfo, EnvError> {
         if !venv_exists(venv_path) {
             return Err(EnvError::VerifyFailed(format!(
                 "venv not found at {}",
@@ -386,7 +422,7 @@ impl EnvironmentInspectorService {
             )));
         }
 
-        let stdout = probe_torch_script(venv_path).await?;
+        let stdout = probe_torch_script(venv_path, cancel).await?;
         let parsed: Value = serde_json::from_str(&stdout)
             .map_err(|e| EnvError::VerifyFailed(format!("torch script output not JSON: {}", e)))?;
 
@@ -432,10 +468,13 @@ impl EnvironmentInspectorService {
     }
 
     /// 列出关键依赖
+    ///
+    /// v3.6：接 `CancellationToken`，透传给 `run_pip_list`
     pub async fn inspect_dependencies(
         &self,
         venv_path: &Path,
         comfyui_root: &Path,
+        cancel: &CancellationToken,
     ) -> Result<Vec<DependencyInfo>, EnvError> {
         if !venv_exists(venv_path) {
             return Err(EnvError::VerifyFailed(format!(
@@ -445,7 +484,7 @@ impl EnvironmentInspectorService {
         }
 
         // 1. pip list（v2.10：uv pip list 主路径 + python -m pip fallback）
-        let pip_json = run_pip_list(venv_path, self.uv_binary.as_deref()).await?;
+        let pip_json = run_pip_list(venv_path, self.uv_binary.as_deref(), cancel).await?;
         let installed = deps::parse_pip_list(&pip_json)?;
 
         // 2. requirements.txt（不存在则跳过版本比对）
@@ -462,16 +501,24 @@ impl EnvironmentInspectorService {
     }
 
     /// GPU 检测（直接转调 gpu::detect_gpu，永不报错）
-    pub async fn detect_gpu(&self) -> GpuInfo {
-        detect_gpu().await
+    ///
+    /// v3.6：接 `CancellationToken`，nvidia-smi 卡住时可取消
+    pub async fn detect_gpu(&self, cancel: &CancellationToken) -> GpuInfo {
+        detect_gpu(cancel).await
     }
 
     /// 验证 venv 是否可用（python + torch + 关键包存在性）
-    pub async fn verify_venv(&self, venv_path: &Path) -> Result<bool, EnvError> {
+    ///
+    /// v3.6：接 `CancellationToken`，透传给 `probe_torch`
+    pub async fn verify_venv(
+        &self,
+        venv_path: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<bool, EnvError> {
         if !venv_exists(venv_path) {
             return Ok(false);
         }
-        let torch = self.probe_torch(venv_path).await?;
+        let torch = self.probe_torch(venv_path, cancel).await?;
         Ok(torch.installed)
     }
 
@@ -519,12 +566,17 @@ fn gpu_display_name(gpu: &GpuInfo) -> Option<String> {
 /// 复用现有 `PROBE_TORCH_SCRIPT` 中的 `platform.release` 字段（其实是 OS release，
 /// 不是 python 版本）。真正的 Python 版本需要单独探测，但为避免重复跑脚本，
 /// 我们重新跑一个轻量探测（5s 超时）。
-async fn python_version_from_torch_probe(venv_path: &Path) -> Option<String> {
+///
+/// v3.6：接 `CancellationToken`，透传给 `probe_python_version`
+async fn python_version_from_torch_probe(
+    venv_path: &Path,
+    cancel: &CancellationToken,
+) -> Option<String> {
     let python = venv_python_path(venv_path);
     if !python.exists() {
         return None;
     }
-    crate::python_env::verify::probe_python_version(&python).await
+    crate::python_env::verify::probe_python_version(&python, cancel).await
 }
 
 #[cfg(test)]
@@ -539,15 +591,21 @@ mod tests {
     #[tokio::test]
     async fn test_probe_torch_missing_venv() {
         let service = make_service();
-        let result = service.probe_torch(Path::new("/nonexistent/venv")).await;
+        let cancel = CancellationToken::new();
+        let result = service.probe_torch(Path::new("/nonexistent/venv"), &cancel).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_inspect_dependencies_missing_venv() {
         let service = make_service();
+        let cancel = CancellationToken::new();
         let result = service
-            .inspect_dependencies(Path::new("/nonexistent/venv"), Path::new("/nonexistent/comfyui"))
+            .inspect_dependencies(
+                Path::new("/nonexistent/venv"),
+                Path::new("/nonexistent/comfyui"),
+                &cancel,
+            )
             .await;
         assert!(result.is_err());
     }
@@ -555,14 +613,16 @@ mod tests {
     #[tokio::test]
     async fn test_verify_venv_missing_returns_false() {
         let service = make_service();
-        let result = service.verify_venv(Path::new("/nonexistent/venv")).await;
+        let cancel = CancellationToken::new();
+        let result = service.verify_venv(Path::new("/nonexistent/venv"), &cancel).await;
         assert_eq!(result.unwrap(), false);
     }
 
     #[tokio::test]
     async fn test_detect_gpu_returns_value() {
         let service = make_service();
-        let _gpu = service.detect_gpu().await;
+        let cancel = CancellationToken::new();
+        let _gpu = service.detect_gpu(&cancel).await;
         // 不验证具体值，只验证不 panic
     }
 }

@@ -61,32 +61,34 @@ pub async fn env_inspect(state: State<'_, AppState>) -> Result<Option<EnvSnapsho
 
 /// 仅列出关键依赖（前端依赖列表刷新用）
 ///
-/// v2.10 起命令层容错：探查失败时返回空列表 + warn 日志，不阻塞前端流程。
+/// v3.6 改造：从 `snapshot_cache` 提取 `dependencies`（不调子进程）
+/// - **有 stale snapshot**：立即返回 `Some(dependencies)`（≤1ms）
+/// - **无 stale snapshot**（首次启动或 `clear()` 后）：返回 `None`
+///   前端应等待 `env_inspect_updated` 事件后从 `EnvSnapshot.dependencies` 拿数据
 ///
-/// 原因：onboarding 第 4 步 `createVenv` → `refresh()` → `Promise.all([...,
-/// envListDependencies()])`，任一失败即整体失败，导致「venv 已创建但前端误报失败」。
-/// 依赖列表失败本身不阻塞 onboarding 流程（torch 已装就能进入下一步），容错更合理。
+/// 改造原因：原实现同步调 `inspect_dependencies`（5-30s 阻塞），
+/// 与 F32「探查类命令立即返回」模式不一致。
 ///
-/// F32 注：本命令仍走同步 `inspect_dependencies`（5-30s），不在 F32 改造范围。
-/// 前端可通过 `env_inspect` 返回的 `EnvSnapshot.dependencies` 字段获取相同数据（推荐）。
+/// 兼容性：返回 `Option<Vec<DependencyInfo>>`，前端需适配 null 场景
 #[tauri::command]
 pub async fn env_list_dependencies(
     state: State<'_, AppState>,
-) -> Result<Vec<DependencyInfo>, String> {
-    let config = state.config.get();
-    let venv = PathBuf::from(&config.paths.venv_path);
-    let comfyui = PathBuf::from(&config.paths.comfyui_root);
+) -> Result<Option<Vec<DependencyInfo>>, String> {
+    let venv_path = {
+        let config = state.config.get();
+        PathBuf::from(&config.paths.venv_path)
+    };
+    let comfyui_root = {
+        let config = state.config.get();
+        PathBuf::from(&config.paths.comfyui_root)
+    };
 
-    match state.env_inspector.inspect_dependencies(&venv, &comfyui).await {
-        Ok(deps) => Ok(deps),
-        Err(e) => {
-            tracing::warn!(
-                error = %e, venv = ?venv,
-                "env_list_dependencies failed, returning empty list (non-blocking)"
-            );
-            Ok(vec![])
-        }
-    }
+    // 从 snapshot_cache 提取（同时触发后台刷新）
+    let snapshot = state
+        .env_inspector
+        .inspect_or_cached(&venv_path, &comfyui_root);
+
+    Ok(snapshot.map(|s| s.dependencies))
 }
 
 /// 主动失效缓存（前端用户手动刷新时调用）

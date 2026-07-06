@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 核心版本页（v3.1 / F26 重构）
+ * 核心版本页（v3.1 / F26 重构 → v3.5 异步化 + 实时日志）
  *
  * 详见 `PR/06-界面设计.md §5.1 核心版本页`
  *
@@ -8,7 +8,7 @@
  * 1. 当前版本大字显示（顶部居中）+ 检查更新按钮
  * 2. 状态告警条（运行中 / 工作区脏 / 依赖不匹配）
  * 3. NTab 双分类（stable / prerelease）+ NDataTable 版本列表
- * 4. 切换中进度条（任务进行时）
+ * 4. 切换中进度条 + 实时日志面板（v3.5：useSwitchVersion 注入）
  * 5. 切换确认对话框（SwitchVersionDialog）
  *
  * 决策对应：
@@ -20,13 +20,20 @@
  * - loading：初次加载
  * - ready：可切换
  * - running：ComfyUI 运行中（禁用切换）
- * - switching：版本切换任务进行中
+ * - switching：版本切换任务进行中（v3.5：实时日志 + 进度 + 取消）
  * - dirty：工作区有未提交改动（禁用切换）
  * - requirements_mismatch：切换后依赖需更新
  *
+ * v3.5 关键改造：
+ * - 用 `useSwitchVersion` composable 替代 v3.4 的 listen 模式
+ * - 实时日志通过 `task_log` 事件累积（最大 500 行）
+ * - 进度条 + 折叠日志面板（<details>）
+ * - 取消按钮调 `useSwitchVersion.cancel()` → `task_cancel` 命令
+ * - 不再有 timeout：用户主动取消才退出
+ *
  * 设计模式：
  * - **State Machine**：UI 状态基于 coreStore + processStore 派生
- * - **Observer**：监听 task_progress / task_completed / core_version_switched 事件
+ * - **Observer**：通过 useTaskProgress 订阅 task_progress / task_completed / task_log
  * - **Facade**：本页面整合 core + process + task store
  */
 
@@ -49,6 +56,7 @@ import { useCoreStore } from "@/stores/core";
 import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
 import { useToast } from "@/composables/useToast";
+import { useSwitchVersion } from "@/composables/useSwitchVersion";
 import {
   coreStatus,
   coreResetStaged,
@@ -58,11 +66,7 @@ import {
   type SwitchMode,
 } from "@/api/core";
 import { listen, type UnlistenFn } from "@/api";
-import type {
-  TagInfo,
-  TaskProgressEvent,
-  TaskTerminalEvent,
-} from "@/api/types";
+import type { TagInfo } from "@/api/types";
 import VersionTable from "@/components/core/VersionTable.vue";
 import SwitchVersionDialog from "@/components/core/SwitchVersionDialog.vue";
 import RepairWizard from "@/components/settings/RepairWizard.vue";
@@ -72,6 +76,14 @@ const processStore = useProcessStore();
 const envStore = useEnvStore();
 const toast = useToast();
 
+// ========== v3.5：版本切换 composable（实时进度 + 实时日志 + 取消） ==========
+const switcher = useSwitchVersion();
+
+/** v3.5：实时日志面板展开状态 */
+const showLogPanel = ref(false);
+/** v3.5：自动滚动 DOM ref */
+const logContainer = ref<HTMLElement | null>(null);
+
 // ========== 本地状态 ==========
 /** 当前选中的 tab（stable / prerelease） */
 const activeTab = ref<"stable" | "prerelease">("stable");
@@ -79,10 +91,6 @@ const activeTab = ref<"stable" | "prerelease">("stable");
 const dialogShow = ref(false);
 /** 切换确认对话框中的目标 tag */
 const targetTag = ref<TagInfo | null>(null);
-/** 切换任务进度（0-100） */
-const switchProgress = ref(0);
-/** 切换任务当前步骤描述 */
-const switchStepText = ref("");
 /** 监听器清理函数 */
 const unlisteners: UnlistenFn[] = [];
 /** F35-A+：工作区脏的详细原因（null = 干净或未知） */
@@ -102,7 +110,12 @@ const hasLocalChanges = computed(() => coreStore.hasLocalChanges);
 const hasUpdates = computed(() => coreStore.hasUpdates);
 
 const isRunning = computed(() => processStore.isAlive);
-const isSwitching = computed(() => coreStore.isSwitching);
+
+/** v3.5：切换状态从 composable 派生（替代 v3.4 的 coreStore.isSwitching） */
+const isSwitching = computed(() => switcher.isRunning.value);
+const switchProgress = computed(() => switcher.progress.value);
+const switchMessage = computed(() => switcher.message.value);
+const switchLogs = computed(() => switcher.logs.value);
 const requirementsMismatch = computed(() => coreStore.requirementsMismatch);
 
 /** 切换按钮禁用状态（运行中 / 切换中 / 工作区脏） */
@@ -125,32 +138,38 @@ const currentVersionType = computed(() => {
   return tag.is_stable ? "stable" : "prerelease";
 });
 
+/** v3.5：进度阶段文本（用于进度条上方） */
+const switchStepText = computed(() => {
+  if (switcher.isCancelled.value) return "已取消";
+  if (switcher.isCompleted.value) return "完成";
+  if (switcher.isFailed.value) return "失败";
+  return switchMessage.value || "切换版本中...";
+});
+
+/** v3.5：进度条状态（info / success / error / warning） */
+const progressStatus = computed<"info" | "success" | "error" | "warning">(() => {
+  if (switcher.isFailed.value) return "error";
+  if (switcher.isCancelled.value) return "warning";
+  if (switcher.isCompleted.value) return "success";
+  return "info";
+});
+
 // ========== 生命周期 ==========
 onMounted(async () => {
-  // 订阅事件
+  // 订阅 core_version_switched 事件（v3.1 / F26）
   unlisteners.push(
-    // 任务进度事件（切换版本任务）
-    // 后端 payload: ProgressEvent { task_id, progress, message, status }
-    await listen<TaskProgressEvent>(
-      "task_progress",
+    await listen<{ from: string | null; to: string }>(
+      "core_version_switched",
       (e) => {
-        if (e.payload.task_id === coreStore.switchingTaskId) {
-          if (e.payload.progress !== undefined) {
-            switchProgress.value = e.payload.progress;
-          }
-          if (e.payload.status === "running") {
-            switchStepText.value = "切换版本中...";
-          }
-        }
+        console.info(
+          `[core] version switched: ${e.payload.from} → ${e.payload.to}`,
+        );
+        // v3.5：不在这里 clearSwitchingTask，由 useSwitchVersion.onComplete 处理
+        coreStore.refresh().catch((err) =>
+          console.warn("[core] refresh after switch failed:", err),
+        );
       },
     ),
-    // 任务完成事件
-    // 后端 payload: TerminalEvent { task_id, status, summary }
-    await listen<TaskTerminalEvent>("task_completed", (e) => {
-      if (e.payload.task_id === coreStore.switchingTaskId) {
-        handleSwitchComplete(e.payload);
-      }
-    }),
   );
 
   // 初次加载
@@ -170,20 +189,20 @@ onMounted(async () => {
 onUnmounted(() => {
   unlisteners.forEach((un) => un());
   unlisteners.length = 0;
+  // 清理 composable
+  switcher.reset();
 });
 
-// 切换任务 ID 变化时重置进度
+// v3.5：实时日志累积时自动滚动到底部
 watch(
-  () => coreStore.switchingTaskId,
-  (newId, oldId) => {
-    if (newId && !oldId) {
-      // 新任务开始
-      switchProgress.value = 0;
-      switchStepText.value = "提交切换任务...";
-    } else if (!newId) {
-      // 任务结束
-      switchProgress.value = 0;
-      switchStepText.value = "";
+  () => switchLogs.value.length,
+  () => {
+    if (showLogPanel.value) {
+      setTimeout(() => {
+        if (logContainer.value) {
+          logContainer.value.scrollTop = logContainer.value.scrollHeight;
+        }
+      }, 10);
     }
   },
 );
@@ -214,32 +233,51 @@ function onSwitchClick(tag: TagInfo) {
   dialogShow.value = true;
 }
 
-/** 确认切换（F36：带 mode 参数） */
+/** 确认切换（F36：带 mode 参数）— v3.5 走 useSwitchVersion 异步流程 */
 async function onConfirmSwitch(mode: SwitchMode) {
   if (!targetTag.value) return;
   const tag = targetTag.value;
   dialogShow.value = false;
+  // 自动展开日志面板（用户更关心实时进度）
+  showLogPanel.value = true;
 
-  try {
-    const taskId = await coreStore.switchVersion(tag.name, mode);
-    toast.info(
-      `已提交切换任务: ${tag.name}（模式: ${modeLabel(mode)}）`,
-    );
-    console.info(`[core] switch task submitted: ${taskId} (mode=${mode})`);
-  } catch (e) {
-    toast.error("切换失败", e);
-    coreStore.clearSwitchingTask();
-  }
+  // v3.5：调 composable 的 start 方法，传入完整回调
+  // 注意：start 内部已经处理了 task_id 跟踪，UI 不用自己 listen
+  await switcher.start(tag.name, mode, {
+    onComplete: (summary) => {
+      const msg = summary || "已切换到目标版本";
+      toast.success(`版本切换完成: ${msg}`);
+      // 刷新 store 状态
+      coreStore.refresh().catch((e) =>
+        console.warn("[core] refresh after switch complete failed:", e),
+      );
+      coreStore.refreshPrerequisites();
+    },
+    onError: (summary) => {
+      const msg = summary || "未知错误";
+      if (switcher.isCancelled.value) {
+        toast.info("版本切换已取消");
+      } else {
+        toast.error("版本切换失败", msg);
+        // 失败时后端会自动回滚，提示用户
+        toast.warn("已回滚到原版本，请检查环境状态");
+      }
+      // 失败/取消后也刷新状态（确保 UI 与后端一致）
+      coreStore.refresh().catch((e) =>
+        console.warn("[core] refresh after switch error failed:", e),
+      );
+    },
+  });
 }
 
-function modeLabel(mode: SwitchMode): string {
-  switch (mode) {
-    case "Clean":
-      return "全部清除";
-    case "Preserve":
-      return "升/降版本";
-    case "Skip":
-      return "不动环境";
+/** v3.5：取消当前切换 */
+async function onCancelSwitching() {
+  if (!isSwitching.value) return;
+  try {
+    await switcher.cancel();
+    toast.info("正在取消版本切换...");
+  } catch (e) {
+    toast.error("取消失败", e);
   }
 }
 
@@ -247,39 +285,6 @@ function modeLabel(mode: SwitchMode): string {
 function onCancelSwitch() {
   dialogShow.value = false;
   targetTag.value = null;
-}
-
-/**
- * 切换任务完成处理
- *
- * TerminalEvent payload 仅含 { task_id, status, summary }：
- * - status: "completed" / "failed" / "cancelled"
- * - summary: 后端 TaskResult.summary（failed 时为错误描述）
- */
-function handleSwitchComplete(evt: TaskTerminalEvent) {
-  switchProgress.value = 0;
-  switchStepText.value = "";
-
-  if (evt.status === "completed") {
-    toast.success(
-      `版本切换完成: ${evt.summary || "已切换到目标版本"}`,
-    );
-  } else if (evt.status === "failed") {
-    const errMsg = evt.summary || "未知错误";
-    toast.error("版本切换失败", errMsg);
-    // 失败时后端会自动回滚，提示用户
-    toast.warn("已回滚到原版本，请检查环境状态");
-  } else if (evt.status === "cancelled") {
-    toast.info("版本切换已取消");
-  }
-
-  coreStore.clearSwitchingTask();
-  // 刷新状态（core_version_switched 事件也会触发 refresh，这里冗余调用保证 UI 及时更新）
-  coreStore.refresh().catch((e) =>
-    console.warn("[core] refresh after switch complete failed:", e),
-  );
-  // 刷新前置条件
-  coreStore.refreshPrerequisites();
 }
 
 /** 点击"停止并切换"（运行中告警条） */
@@ -529,7 +534,7 @@ async function onForceClean() {
           <template v-else-if="dirtyReason?.kind === 'untracked'">
             <span><strong>{{ dirtyReason.count }} 个</strong> untracked 文件/目录（git 不知道的新文件）。</span>
             <code class="git-cmd">git clean -fd &nbsp;&nbsp;&nbsp;&nbsp; # 清理 untracked（不删被忽略的）</code>
-            <code class="git-cmd">git clean -fdx &nbsp;&nbsp;&nbsp; # 清理所有 untracked + 被忽略的</code>
+            <code class="git-cmd">git clean -fdx &nbsp;&nbsp;&nbsp;&nbsp; # 清理所有 untracked + 被忽略的</code>
           </template>
           <template v-else>
             <span>请执行以下任一操作后再切换：</span>
@@ -592,11 +597,17 @@ async function onForceClean() {
         </NButton>
       </NAlert>
 
-      <!-- 切换中进度条 -->
-      <NCard v-if="isSwitching" class="switch-progress" :bordered="true" size="small">
+      <!-- v3.5：切换中进度条 + 实时日志面板（useSwitchVersion 驱动） -->
+      <NCard v-if="isSwitching || switcher.isCompleted.value || switcher.isFailed.value" class="switch-progress" :bordered="true" size="small">
         <div class="progress-content">
           <div class="progress-header">
-            <span class="progress-title">{{ switchStepText || "切换版本中..." }}</span>
+            <span class="progress-title">
+              <span v-if="switcher.isCompleted.value">✅ 切换完成</span>
+              <span v-else-if="switcher.isCancelled.value">⚠ 已取消</span>
+              <span v-else-if="switcher.isFailed.value">❌ 切换失败</span>
+              <span v-else>🔄 切换版本中...</span>
+              <span class="progress-stage">{{ switchStepText }}</span>
+            </span>
             <span class="progress-percent">{{ switchProgress }}%</span>
           </div>
           <NProgress
@@ -604,11 +615,58 @@ async function onForceClean() {
             :percentage="switchProgress"
             :show-indicator="false"
             :height="8"
-            status="info"
+            :status="progressStatus"
           />
-          <div class="progress-hint">
-            切换过程中请勿关闭应用或停止 ComfyUI。预计耗时 3-15 分钟。
+          <div class="progress-meta">
+            <span class="progress-hint">
+              <template v-if="switcher.isCompleted.value">
+                版本切换成功，可继续操作。
+              </template>
+              <template v-else-if="switcher.isCancelled.value">
+                切换已取消，环境已回滚（或正在回滚）。
+              </template>
+              <template v-else-if="switcher.isFailed.value">
+                切换失败：{{ switcher.errorSummary.value || "未知错误" }}
+              </template>
+              <template v-else>
+                切换过程中请勿关闭应用或停止 ComfyUI。点击「取消」可立即中止。
+              </template>
+            </span>
+            <NButton
+              v-if="isSwitching"
+              size="tiny"
+              type="error"
+              :ghost="true"
+              @click="onCancelSwitching"
+            >
+              ✕ 取消
+            </NButton>
           </div>
+
+          <!-- 实时日志面板（v3.5：可折叠 + 自动滚动） -->
+          <details
+            class="log-details"
+            :open="showLogPanel"
+            @toggle="(e: any) => (showLogPanel = e.target.open)"
+          >
+            <summary class="log-summary">
+              📋 实时日志（{{ switchLogs.length }} 行）
+              <span class="log-hint">点击展开 / 折叠</span>
+            </summary>
+            <div class="log-panel" ref="logContainer">
+              <div
+                v-for="(line, idx) in switchLogs"
+                :key="idx"
+                class="log-line"
+              >
+                <span class="log-source">[{{ line.source }}]</span>
+                <span class="log-text">{{ line.text }}</span>
+              </div>
+              <div v-if="switchLogs.length === 0" class="log-empty">
+                等待日志输出...
+              </div>
+            </div>
+          </details>
         </div>
       </NCard>
 
@@ -673,7 +731,7 @@ async function onForceClean() {
 
       <!-- 切换后插件兼容性提示 -->
       <NAlert
-        v-if="currentVersion && !requirementsMismatch && !isSwitching"
+        v-if="currentVersion && !requirementsMismatch && !isSwitching && !switcher.isCompleted.value"
         type="info"
         :bordered="false"
         class="status-alert"
@@ -687,7 +745,7 @@ async function onForceClean() {
       :show="dialogShow"
       :target-tag="targetTag"
       :current-version="currentVersion"
-      :switching="false"
+      :switching="isSwitching"
       @confirm="onConfirmSwitch"
       @cancel="onCancelSwitch"
     />
@@ -850,6 +908,7 @@ async function onForceClean() {
   font-size: 12px;
 }
 
+/* v3.5：切换进度面板（带实时日志） */
 .switch-progress .progress-content {
   padding: 4px 0;
 }
@@ -859,12 +918,30 @@ async function onForceClean() {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 8px;
+  gap: 12px;
 }
 
 .progress-title {
   font-size: 13px;
   font-weight: 600;
   color: var(--app-text, #333);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.progress-stage {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--app-text-muted, #666);
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
 }
 
 .progress-percent {
@@ -872,12 +949,106 @@ async function onForceClean() {
   font-weight: 600;
   color: var(--app-primary, #18a058);
   font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  flex-shrink: 0;
+}
+
+.progress-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 8px;
+  gap: 12px;
 }
 
 .progress-hint {
-  margin-top: 8px;
   font-size: 12px;
   color: var(--app-text-muted, #999);
   line-height: 1.5;
+  flex: 1;
+}
+
+/* v3.5：实时日志面板（折叠） */
+.log-details {
+  margin-top: 12px;
+  border: 1px solid var(--app-border, #e0e0e0);
+  border-radius: 6px;
+  background: var(--app-bg-soft, #fafbfc);
+}
+
+.log-summary {
+  cursor: pointer;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--app-text, #333);
+  user-select: none;
+  list-style: none;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.log-summary::-webkit-details-marker {
+  display: none;
+}
+
+.log-summary::before {
+  content: "▶";
+  display: inline-block;
+  margin-right: 6px;
+  font-size: 10px;
+  color: var(--app-text-muted, #999);
+  transition: transform 0.2s;
+}
+
+.log-details[open] .log-summary::before {
+  transform: rotate(90deg);
+}
+
+.log-hint {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--app-text-muted, #999);
+}
+
+.log-panel {
+  margin: 0 8px 8px 8px;
+  max-height: 300px;
+  overflow-y: auto;
+  background: #1e1e1e;
+  border-radius: 4px;
+  padding: 8px;
+  font-family: "JetBrains Mono", "Consolas", "Cascadia Code", monospace;
+  font-size: 11px;
+  color: #d4d4d4;
+  scroll-behavior: smooth;
+}
+
+.log-line {
+  display: flex;
+  gap: 8px;
+  padding: 1px 0;
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+.log-source {
+  color: #569cd6;
+  flex-shrink: 0;
+  font-weight: 600;
+  min-width: 90px;
+}
+
+.log-text {
+  flex: 1;
+  color: #d4d4d4;
+  white-space: pre-wrap;
+}
+
+.log-empty {
+  color: #6a6a6a;
+  font-style: italic;
+  padding: 8px 0;
+  text-align: center;
 }
 </style>

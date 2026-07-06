@@ -217,6 +217,15 @@ impl TaskSchedulerService {
             // 6.3-6.5 执行 action（catch_unwind + cancel 传播）
             let outcome: FinalOutcome = run_action(app.clone(), task_id_for_spawn.clone(), def, cancel_token).await;
 
+            // v3.5：保存 payload 到 TaskHandle.final_result（再调 mark_terminal 时 emit 给前端）
+            // 只在 Ok 状态下保留 payload，Err 状态不携带 payload
+            if let Ok(ref tr) = outcome {
+                let mut tasks = inner.tasks.write();
+                if let Some(h) = tasks.get_mut(&task_id_for_spawn) {
+                    h.final_result = Some(Ok(tr.clone()));
+                }
+            }
+
             // 6.6 根据结果更新状态
             let (final_status, summary) = match &outcome {
                 Ok(result) => {
@@ -376,22 +385,45 @@ impl Inner {
         summary: Option<String>,
     ) {
         // 1. 更新 TaskHandle
-        let info_snapshot = {
+        let (info_snapshot, payload) = {
             let mut tasks = inner.tasks.write();
             if let Some(h) = tasks.get_mut(task_id) {
                 h.info.status = status.clone();
                 h.info.completed_at = Some(chrono::Utc::now());
                 h.cancel_token = None;
                 // 缓存 final_result 供 wait 调用
-                h.final_result = Some(match &status {
+                let mut task_result = match &status {
                     TaskStatus::Completed => Ok(TaskResult::new(summary.clone().unwrap_or_default())),
                     TaskStatus::Failed { error } => Err(FinalErr::ActionFailed(error.clone())),
                     TaskStatus::Cancelled => Err(FinalErr::Cancelled),
                     _ => Ok(TaskResult::new("(unexpected)")),
+                };
+                // v3.5：保留原本 final_result 中的 payload（run_action 后已写入）
+                let final_payload = h
+                    .final_result
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|r| r.payload.clone());
+                if let Ok(ref mut tr) = task_result.as_mut() {
+                    if tr.payload.is_none() {
+                        tr.payload = final_payload;
+                    }
+                }
+                h.final_result = Some(match &task_result {
+                    Ok(tr) => Ok(tr.clone()),
+                    Err(FinalErr::ActionFailed(msg)) => Err(FinalErr::ActionFailed(msg.clone())),
+                    Err(FinalErr::Cancelled) => Err(FinalErr::Cancelled),
+                    Err(FinalErr::Panicked(msg)) => Err(FinalErr::Panicked(msg.clone())),
                 });
-                Some(h.info.clone())
+                // v3.5：从 final_result 取 payload 用于 emit
+                let emit_payload = h
+                    .final_result
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|r| r.payload.clone());
+                (Some(h.info.clone()), emit_payload)
             } else {
-                None
+                (None, None)
             }
         };
 
@@ -405,6 +437,7 @@ impl Inner {
                 &info.id,
                 info.status.as_str(),
                 summary.as_deref(),
+                payload.as_ref(),
             );
         }
 

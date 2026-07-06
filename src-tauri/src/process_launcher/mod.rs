@@ -660,7 +660,12 @@ async fn stop_impl_generic<R: tauri::Runtime>(
     let child = inner.child.lock().await.take();
     if let Some(child) = child {
         tracing::info!(pid, port, reason = ?reason, "stopping ComfyUI process");
-        match stop_with_grace(child, pid, port).await {
+        // v3.6：stop_with_grace 接受 CancellationToken 用于「Force Stop」场景。
+        // 此处创建本地非可取消 token：保持原 grace period 语义（5s SIGTERM + 2s SIGKILL）。
+        // 注：inner.cancel_token 已在上方 cancel()（用于停 health_check/monitor），不能复用。
+        // 未来如需「Force Stop」按钮，可在此注入可取消 token。
+        let stop_cancel = CancellationToken::new();
+        match stop_with_grace(child, pid, port, &stop_cancel).await {
             Ok(exit_status) => {
                 let next = status_from_exit(exit_status, reason);
                 *inner.state.write() = next.clone();

@@ -1,8 +1,15 @@
 //! CoreManager Tauri commands（门面层）
 //!
 //! 详见 `PR/03-模块设计/03-CoreManager.md §3 接口签名` 末尾的 `#[tauri::command]` 定义
+//!
+//! **v3.5 异步化改造**：
+//! - `core_check_version_compatibility` / `core_check_switch_prerequisites`：
+//!   原本是同步执行（git show 读文件可能阻塞），现在返回 task_id，
+//!   进度通过 `task_progress` 事件推送，结果通过 `task_completed` 事件 payload 返回
+//! - `core_switch_version`：通过 `factory::make_switch_version_task` 构造，
+//!   完整支持嵌套子任务 + 实时日志 + 失败回滚 + 取消传播
 
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::app_state::AppState;
 use crate::core_manager::compat::{
@@ -13,7 +20,7 @@ use crate::core_manager::models::{
     BackupInfo, CheckoutResult, ClassifiedTags, CoreStatus, SwitchPrerequisites, SwitchRepoResult,
     TagInfo,
 };
-use crate::core_manager::switcher::{build_switch_task, SwitchContext, SwitchVersionParams};
+use crate::core_manager::switcher::{SwitchContext, SwitchVersionParams};
 use crate::task_scheduler::TaskId;
 
 /// 克隆 ComfyUI 仓库
@@ -74,24 +81,40 @@ pub async fn core_list_tags_classified(
         .map_err(|e| e.to_string())
 }
 
-/// 检查切换版本的前置条件（v3.1 / F26 决策 5）
+/// 检查切换版本的前置条件（v3.5 异步化）
+///
+/// **v3.5 改造**：原本同步执行（git status 可能阻塞），现在通过 TaskScheduler 提交任务，
+/// 立即返回 task_id。前端通过 listen('task_progress'/'task_completed') 接收结果：
+/// - `task_completed` 事件的 `summary` 字段为阻塞语义：外部调用方通过 waitForTask 等待
+/// - 实际 SwitchPrerequisites 放在 `task_completed` 的 `payload` 字段（JSON）
 ///
 /// 前端调用此命令判断是否允许切换：
 /// - ComfyUI 运行中 → 拒绝
 /// - 工作区有未提交改动 → 拒绝
 #[tauri::command]
 pub async fn core_check_switch_prerequisites(
+    _app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<SwitchPrerequisites, String> {
-    let comfyui_running = state.process_launcher.status().await.is_alive();
+) -> Result<TaskId, String> {
+    let task = crate::task_scheduler::factory::make_check_prereq_task(
+        state.core_manager.clone(),
+        state.process_launcher.clone(),
+    );
     state
-        .core_manager
-        .check_switch_prerequisites(comfyui_running)
+        .task_scheduler
+        .submit(task)
         .await
         .map_err(|e| e.to_string())
 }
 
-/// 切换 ComfyUI 版本（v3.1 / F26 决策 1-12 完整实现）
+/// 切换 ComfyUI 版本（v3.5 全面异步化）
+///
+/// **v3.5 改造**：
+/// - 走 `factory::make_switch_version_task` 工厂构造（带 AppHandle 注入）
+/// - 11 步流程中，步骤 8/9/10（venv / torch / requirements）作为子任务提交
+/// - 进度通过 `task_progress` 事件推送（父任务进度 + 子任务进度聚合）
+/// - 子任务实时日志通过 `task_log` 事件推送到前端
+/// - 用户取消 → 级联取消所有子任务 + git 回滚
 ///
 /// 行为（11 步流程 + 全部回滚）：
 /// 1. 前置检查：ComfyUI 已停止 + 工作区干净
@@ -110,13 +133,12 @@ pub async fn core_check_switch_prerequisites(
 /// 失败时全部回滚（决策 6）：force_checkout 回原 tag + 恢复 models 链接。
 /// venv 状态可能不一致（已删除但未重建成功），由用户在 UI 重新初始化。
 ///
-/// 返回 task_id，前端通过 listen('task_progress'/'task_completed') 接收进度。
-///
-/// v1.8 / F36 新增 `mode` 参数：用户在对话框选择的切换模式
+/// 返回 task_id，前端通过 listen('task_progress'/'task_completed'/'task_log') 接收进度。
 #[tauri::command]
 pub async fn core_switch_version(
     target_tag: String,
     mode: Option<String>,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TaskId, String> {
     // 解析 mode 字符串为 enum
@@ -131,9 +153,10 @@ pub async fn core_switch_version(
         log_store: state.log_store.clone(),
         python_env: state.python_env.clone(),
         process_launcher: state.process_launcher.clone(),
+        task_scheduler: state.task_scheduler.clone(),
     };
     let params = SwitchVersionParams { target_tag, mode };
-    let def = build_switch_task(params, ctx);
+    let def = crate::task_scheduler::factory::make_switch_version_task(params, ctx, app);
     state
         .task_scheduler
         .submit(def)
@@ -141,114 +164,35 @@ pub async fn core_switch_version(
         .map_err(|e| e.to_string())
 }
 
-/// v1.8 / F36：版本切换兼容性预检
+/// v1.8 / F36 → v3.5 异步化：版本切换兼容性预检
+///
+/// **v3.5 改造**：原本是同步命令（git show 读 target tag 的 requirements.txt 可能阻塞），
+/// 现在通过 TaskScheduler 提交 `CheckCompat` 任务，立即返回 task_id。
+///
+/// 前端调用方式：
+/// 1. 调 `core_check_version_compatibility` → 拿到 task_id
+/// 2. listen('task_progress') 显示进度条
+/// 3. listen('task_completed')，从 payload 取 VersionCompatReport
 ///
 /// 切版本前前端调用，弹对话框显示该报告
 #[tauri::command]
 pub async fn core_check_version_compatibility(
     target_tag: String,
+    app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<VersionCompatReport, String> {
-    let config = state.config.get();
-    let comfyui_root = config.paths.comfyui_root.clone();
-    let venv_path = config.paths.venv_path.clone();
-    let target_python_version = config.paths.python_version.clone();
-    let target_torch_variant = config.torch.cuda_version.to_torch_index().to_string();
-
-    // 1. 读 venv 状态
-    let venv_exists = venv_path.join("pyvenv.cfg").exists();
-    let current_python = if venv_exists {
-        crate::python_env::verify::probe_python_version(
-            &crate::python_env::uv_runner::venv_python_path(&venv_path),
-        )
-        .await
-    } else {
-        None
-    };
-    let current_torch_variant = detect_current_torch_variant(&venv_path).await;
-    let current_torch_installed = current_torch_variant.is_some();
-
-    // 2. 读当前 HEAD tag
-    let current_tag = state.core_manager.current_version().await.ok().and_then(|s| s.current_version);
-
-    // 3. 读两个 tag 的 requirements.txt 并 diff
-    let read_reqs_for_tag = |tag: &str| -> Option<Vec<(String, String)>> {
-        let req_path = comfyui_root.join("requirements.txt");
-        // 当前 tag：从工作树读（HEAD 已 checkout）
-        // target tag：从 git show tag:requirements.txt 读
-        if tag == current_tag.as_deref().unwrap_or("") {
-            std::fs::read_to_string(&req_path)
-                .ok()
-                .map(|c| parse_requirements_simple(&c))
-        } else {
-            // 通过 git show 读指定 tag 的 requirements.txt
-            // v3.4：用 process_util::new_command_sync 避免 Windows 上弹 cmd 窗口
-            let output = crate::common::process_util::new_command_sync("git")
-                .args(["show", &format!("{}:requirements.txt", tag)])
-                .current_dir(&comfyui_root)
-                .output()
-                .ok()?;
-            if output.status.success() {
-                let s = String::from_utf8_lossy(&output.stdout).to_string();
-                Some(parse_requirements_simple(&s))
-            } else {
-                None
-            }
-        }
-    };
-    let current_reqs = current_tag
-        .as_ref()
-        .and_then(|t| read_reqs_for_tag(t))
-        .unwrap_or_default();
-    let target_reqs = read_reqs_for_tag(&target_tag).unwrap_or_default();
-    let requirements_diff = diff_requirements(&current_reqs, &target_reqs);
-
-    // 4. 算 same_python / same_torch_variant
-    let same_python = match (&current_python, &target_python_version) {
-        (Some(cp), tp) => cp.starts_with(tp),
-        (None, _) => false, // venv 不存在 → 算不一致（必须 Clean）
-    };
-    let same_torch_variant = match (&current_torch_variant, &target_torch_variant) {
-        (Some(ctv), ttv) => ctv == ttv,
-        (None, _) => false,
-    };
-
-    // 5. custom_nodes 数量
-    let custom_nodes_dir = comfyui_root.join("custom_nodes");
-    let custom_node_count = std::fs::read_dir(&custom_nodes_dir)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().join(".git").exists() || e.path().is_dir())
-                .count()
-        })
-        .unwrap_or(0);
-
-    // 6. 推荐模式
-    let (recommended_mode, recommended_reason) = recommend_mode(
-        same_python,
-        same_torch_variant,
-        venv_exists,
-        &requirements_diff,
-        current_torch_installed,
-    );
-
-    Ok(VersionCompatReport {
-        current_tag,
+) -> Result<TaskId, String> {
+    let task = crate::task_scheduler::factory::make_check_compat_task(
+        state.core_manager.clone(),
+        state.config.clone(),
+        state.python_env.clone(),
         target_tag,
-        venv_exists,
-        current_python,
-        target_python: Some(target_python_version),
-        current_torch_variant,
-        target_torch_variant: Some(target_torch_variant),
-        current_torch_installed,
-        same_python,
-        same_torch_variant,
-        requirements_diff,
-        custom_node_count,
-        recommended_mode,
-        recommended_reason,
-    })
+        app,
+    );
+    state
+        .task_scheduler
+        .submit(task)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// 切换到指定 tag

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 版本切换确认对话框（v1.8 / F36 重构）
+ * 版本切换确认对话框（v1.8 / F36 重构 → v3.5 异步化）
  *
  * v3.1 / F26 旧版：直接显示 11 步流程，固定"删 venv + 重建"
  * v1.8 / F36 新版：
@@ -13,9 +13,15 @@
  *   - 推荐模式（recommend_mode 自动选），用户可改
  *   - 记忆选择（checkbox 写到 localStorage）
  *
+ * v3.5 改造：
+ *   - 兼容性预检走异步 task（useCheckCompat）
+ *   - 加载时显示进度条 + 实时日志（底部可折叠面板）
+ *   - 不阻塞 UI，超时由用户取消触发
+ *
  * ## 设计模式
  * - **Presentational**：纯展示 + emit confirm/cancel
  * - **Adapter**：将复杂的兼容性问题简化为用户可读的描述
+ * - **Template Method**：复用 useCheckCompat 的"提交-跟踪-完成"流程
  */
 
 import { ref, computed, watch } from "vue";
@@ -32,13 +38,11 @@ import {
   NCheckbox,
   NSpin,
   NIcon,
+  NProgress,
 } from "naive-ui";
 import type { TagInfo } from "@/api/types";
-import {
-  coreCheckVersionCompatibility,
-  type SwitchMode,
-  type VersionCompatReport,
-} from "@/api/core";
+import { type SwitchMode, type VersionCompatReport } from "@/api/core";
+import { useCheckCompat } from "@/composables/useSwitchVersion";
 
 const STORAGE_KEY = "switch-mode-preference";
 
@@ -60,22 +64,11 @@ const emit = defineEmits<{
   (e: "cancel"): void;
 }>();
 
-// ========== 兼容报告加载 ==========
-const report = ref<VersionCompatReport | null>(null);
-const loadingReport = ref(false);
-const reportError = ref<string | null>(null);
+// ========== 兼容报告加载（v3.5 异步化） ==========
+const compat = useCheckCompat();
 
 async function loadReport(tagName: string) {
-  loadingReport.value = true;
-  reportError.value = null;
-  try {
-    report.value = await coreCheckVersionCompatibility(tagName);
-  } catch (e) {
-    reportError.value = String(e);
-    report.value = null;
-  } finally {
-    loadingReport.value = false;
-  }
+  await compat.check(tagName);
 }
 
 watch(
@@ -84,7 +77,7 @@ watch(
     if (show && tagName) {
       await loadReport(tagName);
     } else {
-      report.value = null;
+      compat.reset();
     }
   },
   { immediate: true },
@@ -96,7 +89,7 @@ const rememberChoice = ref(false);
 
 // 加载报告后默认选推荐模式
 watch(
-  () => report.value?.recommendedMode,
+  () => compat.report.value?.recommendedMode,
   (mode) => {
     if (mode) {
       // 检查用户是否记忆了选择
@@ -117,7 +110,7 @@ const isPrerelease = computed(
 );
 
 const diffSummary = computed(() => {
-  const r = report.value;
+  const r = compat.report.value;
   if (!r) return "";
   switch (r.requirementsDiff.kind) {
     case "Identical":
@@ -131,7 +124,16 @@ const diffSummary = computed(() => {
   }
 });
 
-const modeDesc: Record<SwitchMode, { title: string; duration: string; pros: string; cons: string; type: "warning" | "info" | "default" }> = {
+const modeDesc: Record<
+  SwitchMode,
+  {
+    title: string;
+    duration: string;
+    pros: string;
+    cons: string;
+    type: "warning" | "info" | "default";
+  }
+> = {
   Clean: {
     title: "全部清除（100% 干净）",
     duration: "2-5 分钟",
@@ -163,8 +165,30 @@ function onConfirm() {
 }
 
 function onCancel() {
+  compat.reset();
   emit("cancel");
 }
+
+// ========== 实时日志面板状态 ==========
+const showLogPanel = ref(false);
+
+// 自动滚动到日志末尾
+const logContainer = ref<HTMLElement | null>(null);
+function scrollToBottom() {
+  if (logContainer.value) {
+    logContainer.value.scrollTop = logContainer.value.scrollHeight;
+  }
+}
+
+watch(
+  () => compat.logs.value.length,
+  () => {
+    if (showLogPanel.value) {
+      // 等待 DOM 更新
+      setTimeout(scrollToBottom, 10);
+    }
+  },
+);
 </script>
 
 <template>
@@ -226,32 +250,46 @@ function onCancel() {
         <!-- 兼容性分析（F36） -->
         <div class="section">
           <div class="section-title">📊 兼容性分析</div>
-          <NSpin :show="loadingReport">
-            <div v-if="reportError" class="compat-error">
+          <NSpin :show="compat.loading.value">
+            <div v-if="compat.error.value" class="compat-error">
               <NAlert type="error" :bordered="false">
-                加载兼容性报告失败: {{ reportError }}
+                加载兼容性报告失败: {{ compat.error.value }}
               </NAlert>
             </div>
-            <div v-else-if="report" class="compat-grid">
+            <div v-else-if="compat.report.value" class="compat-grid">
               <div class="compat-row">
                 <span class="compat-label">Python</span>
                 <span class="compat-value">
-                  {{ report.currentPython || "未安装" }}
+                  {{ compat.report.value.currentPython || "未安装" }}
                   <span class="compat-arrow">→</span>
-                  <span :class="report.samePython ? 'compat-ok' : 'compat-warn'">
-                    {{ report.targetPython }}
-                    {{ report.samePython ? "✓" : "⚠" }}
+                  <span
+                    :class="
+                      compat.report.value.samePython
+                        ? 'compat-ok'
+                        : 'compat-warn'
+                    "
+                  >
+                    {{ compat.report.value.targetPython }}
+                    {{ compat.report.value.samePython ? "✓" : "⚠" }}
                   </span>
                 </span>
               </div>
               <div class="compat-row">
                 <span class="compat-label">torch</span>
                 <span class="compat-value">
-                  {{ report.currentTorchVariant || "未安装" }}
+                  {{ compat.report.value.currentTorchVariant || "未安装" }}
                   <span class="compat-arrow">→</span>
-                  <span :class="report.sameTorchVariant ? 'compat-ok' : 'compat-warn'">
-                    {{ report.targetTorchVariant }}
-                    {{ report.sameTorchVariant ? "✓" : "⚠" }}
+                  <span
+                    :class="
+                      compat.report.value.sameTorchVariant
+                        ? 'compat-ok'
+                        : 'compat-warn'
+                    "
+                  >
+                    {{ compat.report.value.targetTorchVariant }}
+                    {{
+                      compat.report.value.sameTorchVariant ? "✓" : "⚠"
+                    }}
                   </span>
                 </span>
               </div>
@@ -261,19 +299,57 @@ function onCancel() {
               </div>
               <div class="compat-row">
                 <span class="compat-label">custom_nodes</span>
-                <span class="compat-value">{{ report.customNodeCount }} 个</span>
+                <span class="compat-value">
+                  {{ compat.report.value.customNodeCount }} 个
+                </span>
               </div>
               <NAlert
-                v-if="report.recommendedMode !== selectedMode"
+                v-if="
+                  compat.report.value.recommendedMode !== selectedMode
+                "
                 type="info"
                 :bordered="false"
                 size="small"
                 class="recommend-hint"
               >
-                💡 建议：{{ report.recommendedReason }}
+                💡 建议：{{ compat.report.value.recommendedReason }}
               </NAlert>
             </div>
           </NSpin>
+        </div>
+
+        <!-- v3.5：兼容性预检进度 + 实时日志（折叠面板） -->
+        <div v-if="compat.loading.value || compat.logs.value.length > 0" class="compat-progress-section">
+          <div class="compat-progress-header" @click="showLogPanel = !showLogPanel">
+            <span class="compat-progress-title">
+              {{ showLogPanel ? "▼" : "▶" }} 预检进度 ({{ compat.progress.value }}%)
+            </span>
+            <span class="compat-progress-message">
+              {{ compat.message.value || "分析中..." }}
+            </span>
+          </div>
+          <NProgress
+            v-if="compat.loading.value"
+            type="line"
+            :percentage="compat.progress.value"
+            :height="6"
+            :show-indicator="false"
+            status="info"
+          />
+          <!-- 实时日志面板（可折叠） -->
+          <div v-if="showLogPanel" class="log-panel" ref="logContainer">
+            <div
+              v-for="(line, idx) in compat.logs.value"
+              :key="idx"
+              class="log-line"
+            >
+              <span class="log-source">[{{ line.source }}]</span>
+              <span class="log-text">{{ line.text }}</span>
+            </div>
+            <div v-if="compat.logs.value.length === 0" class="log-empty">
+              等待日志输出...
+            </div>
+          </div>
         </div>
 
         <NDivider />
@@ -281,7 +357,11 @@ function onCancel() {
         <!-- 切换模式选择（F36） -->
         <div class="section">
           <div class="section-title">⚙ 选择切换模式</div>
-          <NRadioGroup v-model:value="selectedMode" :disabled="switching" class="mode-radio-group">
+          <NRadioGroup
+            v-model:value="selectedMode"
+            :disabled="switching"
+            class="mode-radio-group"
+          >
             <NSpace vertical :size="12">
               <div
                 v-for="(desc, key) in modeDesc"
@@ -289,7 +369,7 @@ function onCancel() {
                 class="mode-option"
                 :class="{
                   selected: selectedMode === key,
-                  recommended: report?.recommendedMode === key,
+                  recommended: compat.report.value?.recommendedMode === key,
                 }"
                 @click="selectedMode = key as SwitchMode"
               >
@@ -299,7 +379,7 @@ function onCancel() {
                     <span class="mode-title">
                       {{ desc.title }}
                       <NTag
-                        v-if="report?.recommendedMode === key"
+                        v-if="compat.report.value?.recommendedMode === key"
                         size="tiny"
                         type="success"
                         class="mode-tag"
@@ -332,7 +412,7 @@ function onCancel() {
           <NButton
             :type="modeDesc[selectedMode].type === 'warning' ? 'warning' : 'primary'"
             :loading="switching"
-            :disabled="loadingReport"
+            :disabled="compat.loading.value"
             @click="onConfirm"
           >
             确认切换
@@ -455,6 +535,80 @@ function onCancel() {
 .recommend-hint {
   margin-top: 12px;
   font-size: 12px;
+}
+
+/* v3.5：兼容性预检进度 + 实时日志 */
+.compat-progress-section {
+  margin: 12px 0;
+  border: 1px solid var(--app-border, #e0e0e0);
+  border-radius: 6px;
+  padding: 8px 12px;
+  background: var(--app-bg-soft, #fafbfc);
+}
+
+.compat-progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+  padding: 4px 0;
+}
+
+.compat-progress-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--app-text, #333);
+}
+
+.compat-progress-message {
+  font-size: 11px;
+  color: var(--app-text-muted, #999);
+  font-family: "JetBrains Mono", monospace;
+  flex: 1;
+  margin-left: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-panel {
+  margin-top: 8px;
+  max-height: 200px;
+  overflow-y: auto;
+  background: #1e1e1e;
+  border-radius: 4px;
+  padding: 8px;
+  font-family: "JetBrains Mono", "Consolas", "Cascadia Code", monospace;
+  font-size: 11px;
+  color: #d4d4d4;
+  scroll-behavior: smooth;
+}
+
+.log-line {
+  display: flex;
+  gap: 8px;
+  padding: 1px 0;
+  word-break: break-all;
+}
+
+.log-source {
+  color: #569cd6;
+  flex-shrink: 0;
+  font-weight: 600;
+}
+
+.log-text {
+  flex: 1;
+  color: #d4d4d4;
+  white-space: pre-wrap;
+}
+
+.log-empty {
+  color: #6a6a6a;
+  font-style: italic;
+  padding: 8px 0;
+  text-align: center;
 }
 
 .mode-radio-group {

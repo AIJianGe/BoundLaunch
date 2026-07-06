@@ -27,7 +27,6 @@ import type {
   ConflictReport,
   TorchVariant,
   GpuInfo,
-  DiagnoseReport,
   RepairAction,
 } from "./types";
 
@@ -53,9 +52,15 @@ export function envInspect(): Promise<EnvInfo | null> {
   return invoke<EnvInfo | null>("env_inspect");
 }
 
-/** 列出 requirements.txt 中的依赖及安装状态 */
-export function envListDependencies(): Promise<DependencyInfo[]> {
-  return invoke<DependencyInfo[]>("env_list_dependencies");
+/**
+ * 列出 requirements.txt 中的依赖及安装状态
+ *
+ * v3.6：返回 `DependencyInfo[] | null`
+ * - 非 null：从 EnvSnapshot 缓存提取（立即返回，不阻塞）
+ * - null：首次启动或 cache 为空，前端应等 `env_inspect_updated` 事件后重新调用
+ */
+export function envListDependencies(): Promise<DependencyInfo[] | null> {
+  return invoke<DependencyInfo[] | null>("env_list_dependencies");
 }
 
 /** 强制清除环境信息缓存（下次 env_inspect 重新检测） */
@@ -226,17 +231,18 @@ export function systemRecommendTorch(): Promise<TorchVariant> {
 /**
  * 环境诊断（v1.8 / F36-Phase2）
  *
- * 不会修改任何后端状态，纯只读探测。
- * 返回 `DiagnoseReport`：
- * - `venv_exists` / `torch_import_ok` / `torch_version`
- * - `issues[]`：诊断出的所有问题（按严重度排序）
- * - `suggested_action`：综合建议（最严重 action）
- * - `suggested_reason`：建议原因（用户可读）
+ * v3.6 改造：从同步命令改为 TaskScheduler 任务，返回 task_id。
+ * - 进度通过 `task_progress` 事件推送（10% 开始 / 50% torch 探针 / 100% 完成）
+ * - 完成后通过 `task_completed` 事件返回 `DiagnoseReport`（在 `payload` 字段）
+ * - 用户可通过 `task_cancel` 命令取消（torch 探针可能耗时 90s）
  *
- * 用法：用户在「环境检查」页看到 torch 未安装时，点「诊断」按钮触发。
+ * 诊断完成后后端自动 emit `RequirementsInstalled` → env cache 失效 →
+ * `env_inspect_updated` 事件，前端 store 自动拿到最新 EnvSnapshot。
+ *
+ * @returns task_id，前端通过 `waitForTask` 等待完成并从 payload 取 DiagnoseReport
  */
-export function envDiagnose(): Promise<DiagnoseReport> {
-  return invoke<DiagnoseReport>("env_diagnose");
+export function envDiagnose(): Promise<string> {
+  return invoke<string>("env_diagnose");
 }
 
 /**

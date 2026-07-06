@@ -22,6 +22,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::common::ansi::strip_ansi;
 use crate::log_store::LogStoreService;
 use crate::log_store::repository::{LogEntry, LogLevel};
 
@@ -92,11 +93,17 @@ impl LogPipeline {
     /// 推送一行日志（无锁，仅 mpsc send）
     ///
     /// 失败说明后台 task 已退出（例如进程停止后 LogPipeline 被 drop），忽略
+    ///
+    /// v3.4.2：清洗 ANSI 转义序列
+    /// - ComfyUI 用 loguru 输出带颜色的日志：`\x1b[32m[INFO]\x1b[0m xxx`
+    /// - Windows 上 `\x1b` 常被吞掉，残留 `[32m` / `[0m` 显示成乱码
+    /// - push 时统一清洗，前端 / RingBuffer / LogStore 收到的都是纯文本
     pub fn push(&self, source: &str, line: String) {
+        let clean_line = strip_ansi(&line);
         let _ = self.tx.send(PendingLine {
             source: source.to_string(),
             ts: Utc::now(),
-            line,
+            line: clean_line,
         });
     }
 

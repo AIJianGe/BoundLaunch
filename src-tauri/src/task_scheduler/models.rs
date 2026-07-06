@@ -42,6 +42,15 @@ pub enum TaskKind {
     /// v3.4：启动 ComfyUI 主进程（spawn + 健康检查）
     /// 由 `process_start` command 提交，action 内部调 `service.start(args, app, &sender)`
     StartComfyUI,
+    /// v3.5：版本切换前的兼容性检查（git show tag:requirements.txt + probe_python）
+    /// 由 `core_check_version_compatibility` command 提交
+    CheckCompat,
+    /// v3.5：版本切换前的前置条件检查（git status + ComfyUI 进程状态）
+    /// 由 `core_check_switch_prerequisites` command 提交
+    CheckPrereq,
+    /// v3.6：环境诊断（torch probe + pip list + requirements 比对）
+    /// 由 `env_diagnose` command 提交，返回 DiagnoseReport 作为 payload
+    Diagnose,
 }
 
 impl TaskKind {
@@ -61,13 +70,20 @@ impl TaskKind {
             | TaskKind::SwitchPython
             | TaskKind::EnvRepair
             | TaskKind::StartComfyUI => TaskPriority::High, // v3.4：启动 ComfyUI 也是用户主动触发
+            // v3.5：版本切换的检查任务
+            // CheckPrereq 与 Checkout 一同点击，High 优先
+            TaskKind::CheckPrereq => TaskPriority::High,
             TaskKind::CloneRepo
             | TaskKind::FetchTags
             | TaskKind::InstallRequirements
             | TaskKind::PluginInstall
             | TaskKind::PluginUpdate
             | TaskKind::Custom => TaskPriority::Normal,
+            // CheckCompat 是 dialog 打开时的查询，Low 优先
+            TaskKind::CheckCompat => TaskPriority::Low,
             TaskKind::ScanModels => TaskPriority::Low,
+            // v3.6：环境诊断是探查类，Normal 优先（可能耗时 90s，但非阻塞安装）
+            TaskKind::Diagnose => TaskPriority::Normal,
         }
     }
 
@@ -91,6 +107,11 @@ impl TaskKind {
             TaskKind::EnvRepair => "env_repair",
             // v3.4
             TaskKind::StartComfyUI => "start_comfyui",
+            // v3.5
+            TaskKind::CheckCompat => "check_compat",
+            TaskKind::CheckPrereq => "check_prereq",
+            // v3.6
+            TaskKind::Diagnose => "diagnose",
         }
     }
 }

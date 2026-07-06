@@ -549,6 +549,13 @@ export interface TaskTerminalEvent {
   task_id: string;
   status: string;
   summary: string | null;
+  /**
+   * v3.6：任务结果载荷（任意 JSON），由后端 `TaskResult.payload` 携带。
+   * - Diagnose 任务：携带 DiagnoseReport
+   * - 其他任务：可能为 null
+   * 前端通过 `waitForTaskWithPayload<T>` 取出并按需类型断言。
+   */
+  payload?: unknown;
 }
 
 // ============================================================================
