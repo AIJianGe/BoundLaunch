@@ -30,8 +30,9 @@ use crate::log_store::LogStoreService;
 
 use self::progress::{emit_queued, emit_terminal};
 use self::runner::run_action;
-use self::task::{FinalErr, FinalOutcome, TaskDef, TaskHandle};
+use self::task::{FinalErr, FinalOutcome, TaskHandle};
 
+pub mod factory;
 pub mod history;
 pub mod models;
 pub mod progress;
@@ -41,6 +42,9 @@ pub mod task;
 pub use models::{
     TaskError, TaskId, TaskInfo, TaskKind, TaskPriority, TaskResult, TaskStatus,
 };
+
+/// 重新导出 TaskDef 以便外部模块（如 core_manager::switcher）构造任务
+pub use task::TaskDef;
 
 /// 内存中保留的终态任务上限（超过则淘汰最早的）
 const MAX_TERMINAL_KEEP: usize = 200;

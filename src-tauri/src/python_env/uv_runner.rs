@@ -181,6 +181,10 @@ impl UvRunner {
     /// 安装 torch（按 CUDA 版本构造索引 URL）
     ///
     /// `uv pip install torch torchvision torchaudio --index-url <url>`
+    ///
+    /// **v1.8 增强**：安装后自动调 `smoke_test_torch()` 验证 `import torch` 成功。
+    /// 之前 uv 返回 success 就算成功，但 numpy 2.4.4 wheel 缺 exceptions.py 等情况
+    /// 会让 `import torch` 失败 → 前端显示"未安装"。smoke test 提前捕获此类问题。
     pub async fn install_torch(
         &self,
         venv_path: &Path,
@@ -211,7 +215,60 @@ impl UvRunner {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EnvError::TorchInstallFailed(stderr.into_owned()));
         }
-        tracing::info!(?cuda_version, "torch installed");
+
+        // v1.8 关键：装完后必须 smoke test 验证 import torch 成功
+        // 不然前端会显示"已安装"但实际上 numpy 等关键包有问题
+        self.smoke_test_torch(venv_path).await?;
+
+        tracing::info!(?cuda_version, "torch installed and smoke-tested");
+        Ok(())
+    }
+
+    /// v1.8 关键：torch smoke test
+    ///
+    /// 跑 `python -c "import torch; print(torch.__version__)"` 验证：
+    /// 1. torch wheel 完整（无文件缺失）
+    /// 2. 关键依赖（numpy 等）能正常 import
+    /// 3. CUDA 初始化不出错（如有 GPU）
+    ///
+    /// 失败时返回详细错误（带 traceback 前 500 字符），让前端能给用户
+    /// "torch 装好了但 import 失败 - 可能是 numpy 2.4.4 等问题" 的明确提示。
+    ///
+    /// **超时 90s**：与 `probe_torch_script` 共用脚本（首次 import 受 Defender 影响可达 30-60s）
+    pub async fn smoke_test_torch(&self, venv_path: &Path) -> Result<(), EnvError> {
+        let python = venv_python_path(venv_path);
+        if !python.exists() {
+            return Err(EnvError::TorchInstallFailed(format!(
+                "venv python 不存在: {}（smoke test 无法运行）",
+                python.display()
+            )));
+        }
+
+        // 复用 probe_torch_script 的脚本（30s 超时），同款探针能让失败信息一致
+        let json_output = crate::env_inspector::scripts::probe_torch_script(venv_path)
+            .await
+            .map_err(|e| {
+                EnvError::TorchInstallFailed(format!("smoke test 启动失败: {}", e))
+            })?;
+
+        let probe = crate::env_inspector::scripts::parse_torch_probe(&json_output);
+        if !probe.installed {
+            let err_type = probe.error_type.as_deref().unwrap_or("Unknown");
+            let err_msg = probe.error_msg.as_deref().unwrap_or("(无错误信息)");
+            let tb = probe.traceback_tail.as_deref().unwrap_or("");
+            return Err(EnvError::TorchInstallFailed(format!(
+                "torch 安装后 smoke test 失败：{}: {}\n\n\
+                 这通常意味着 torch wheel 装好了，但某个关键依赖（如 numpy）有问题。\n\
+                 traceback 末尾:\n{}\n\n\
+                 建议：尝试「环境修复」→ 重新安装 PyTorch，或手动降级 numpy",
+                err_type, err_msg, tb
+            )));
+        }
+
+        tracing::info!(
+            torch_version = %probe.version.as_deref().unwrap_or("?"),
+            "torch smoke test passed"
+        );
         Ok(())
     }
 
@@ -290,24 +347,80 @@ impl UvRunner {
     /// 安装 requirements.txt
     ///
     /// `uv pip install -r <file> --python <venv>`
+    ///
+    /// **v1.8 新增 `constraints` 参数**：传入 constraints 文件路径时，
+    /// uv 会同时应用这些上界约束（防止拉来有问题的版本，如 numpy 2.4.4）。
+    /// 典型用法：先 `freeze::write_constraints_to_venv()`，再传入此函数。
     pub async fn install_requirements(
         &self,
         venv_path: &Path,
         requirements_file: &Path,
+        constraints: Option<&Path>,
     ) -> Result<(), EnvError> {
         let venv_arg = format!("--python={}", venv_python_arg(venv_path));
         let req_str = format!("-r={}", requirements_file.to_string_lossy());
 
-        let args: Vec<&str> = vec!["pip", "install", &venv_arg, &req_str];
+        let mut args: Vec<String> = vec![
+            "pip".into(),
+            "install".into(),
+            venv_arg,
+            req_str,
+        ];
+        if let Some(c) = constraints {
+            args.push("-c".into());
+            args.push(c.to_string_lossy().into_owned());
+        }
+        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let output = self
-            .run_cmd(&args)
+            .run_cmd(&args_ref)
             .await
             .map_err(|e| EnvError::RequirementsInstallFailed(e.to_string()))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EnvError::RequirementsInstallFailed(stderr.into_owned()));
         }
-        tracing::info!(?requirements_file, "requirements installed");
+        tracing::info!(?requirements_file, ?constraints, "requirements installed");
+        Ok(())
+    }
+
+    /// v1.8 / F36：强制按新 constraints 重装 requirements
+    ///
+    /// 用于 Preserve 模式（保留 venv，强制让 pip 按新版本约束重装/降级）
+    ///
+    /// `uv pip install --upgrade --force-reinstall -r <file> --python <venv>`
+    ///
+    /// **v1.8 新增 `constraints` 参数**：与 `install_requirements` 一致。
+    pub async fn install_requirements_upgrade(
+        &self,
+        venv_path: &Path,
+        requirements_file: &Path,
+        constraints: Option<&Path>,
+    ) -> Result<(), EnvError> {
+        let venv_arg = format!("--python={}", venv_python_arg(venv_path));
+        let req_str = format!("-r={}", requirements_file.to_string_lossy());
+
+        let mut args: Vec<String> = vec![
+            "pip".into(),
+            "install".into(),
+            "--upgrade".into(),
+            "--force-reinstall".into(),
+            venv_arg,
+            req_str,
+        ];
+        if let Some(c) = constraints {
+            args.push("-c".into());
+            args.push(c.to_string_lossy().into_owned());
+        }
+        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let output = self
+            .run_cmd(&args_ref)
+            .await
+            .map_err(|e| EnvError::RequirementsInstallFailed(e.to_string()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EnvError::RequirementsInstallFailed(stderr.into_owned()));
+        }
+        tracing::info!(?requirements_file, ?constraints, "requirements upgraded with --force-reinstall");
         Ok(())
     }
 
@@ -335,7 +448,8 @@ fn venv_python_arg(venv_path: &Path) -> String {
 /// 构造 venv 的 python 可执行文件完整路径（跨平台）
 ///
 /// `<venv>/Scripts/python.exe` (Windows) / `<venv>/bin/python` (Unix)
-fn venv_python_path(venv_path: &Path) -> PathBuf {
+/// v1.8 / F36：pub 出来给 compat.rs 用
+pub fn venv_python_path(venv_path: &Path) -> PathBuf {
     if cfg!(windows) {
         venv_path.join("Scripts").join("python.exe")
     } else {

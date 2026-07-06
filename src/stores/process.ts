@@ -35,7 +35,7 @@ import {
   processKillStale,
 } from "@/api/process";
 import { listen, type UnlistenFn } from "@/api";
-import type { ProcessStatus, ShutdownReason } from "@/api/types";
+import type { ComfyUILogEvent, ProcessStatus, ShutdownReason } from "@/api/types";
 
 /** 前端日志缓冲最大容量（超出自动剔除最旧） */
 const MAX_LOG_BUFFER = 1000;
@@ -53,6 +53,11 @@ export const useProcessStore = defineStore("process", () => {
   const loading = ref(false);
   const error = ref<string | null>(null);
   const logBuffer = ref<string[]>([]);
+  /**
+   * v3.2.2 结构化日志条目（含 source / ts）— 供 TerminalPanel 用
+   * 与 logBuffer 并行：logBuffer 保留兼容旧 LogsPage，logEntries 供新组件
+   */
+  const logEntries = ref<ComfyUILogEvent[]>([]);
   const staleProcess = ref<StaleProcessInfo | null>(null);
   /** F24 退出中标记（用于启动页按钮 disabled + spinner + 「正在退出...」） */
   const isExiting = ref(false);
@@ -121,10 +126,19 @@ export const useProcessStore = defineStore("process", () => {
    * 加载历史日志（启动页打开时调用）
    *
    * 后端环形缓冲保留最近 5000 行，前端取 200 行用于初始展示。
-   * 实时日志通过 "log" 事件追加。
+   * 实时日志通过 "comfyui_log" 事件追加。
+   *
+   * v3.2.2：同步填充 logBuffer（兼容 LogsPage）和 logEntries（供 TerminalPanel）
+   * 后端 tail_log 不区分 stdout/stderr，统一标记为 stdout
    */
   async function loadHistoryLogs(lines = 200) {
-    logBuffer.value = await processTailLog(lines);
+    const history = await processTailLog(lines);
+    logBuffer.value = history;
+    logEntries.value = history.map((line) => ({
+      source: "stdout" as const,
+      line,
+      ts: new Date().toISOString(),
+    }));
   }
 
   /** 追加日志行（来自 "log" 事件） */
@@ -138,6 +152,7 @@ export const useProcessStore = defineStore("process", () => {
   /** 清空日志缓冲（切换页面 / 手动清空时调用） */
   function clearLogs() {
     logBuffer.value = [];
+    logEntries.value = [];
   }
 
   /**
@@ -197,8 +212,14 @@ export const useProcessStore = defineStore("process", () => {
           error.value = e.payload.error;
         }
       }),
-      await listen<string>("log", (e) => {
-        appendLog(e.payload);
+      // v3.2.2 修复：事件名 `log` → `comfyui_log`（后端 log_pipeline.rs:185）
+      // payload 是 { source, line, ts }，不是字符串
+      await listen<ComfyUILogEvent>("comfyui_log", (e) => {
+        appendLog(e.payload.line);
+        logEntries.value.push(e.payload);
+        if (logEntries.value.length > MAX_LOG_BUFFER) {
+          logEntries.value.splice(0, logEntries.value.length - MAX_LOG_BUFFER);
+        }
       }),
       await listen<StaleProcessInfo>("stale_process_detected", (e) => {
         staleProcess.value = e.payload;
@@ -234,6 +255,7 @@ export const useProcessStore = defineStore("process", () => {
     loading,
     error,
     logBuffer,
+    logEntries, // v3.2.2
     staleProcess,
     isExiting,
     exitingReason,

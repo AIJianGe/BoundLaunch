@@ -1,9 +1,16 @@
 //! EnvironmentInspector 模块 - 环境探查器
 //!
 //! 设计模式：
-//! - **Cache-Aside**：30s TTL 内存缓存，事件总线订阅主动失效
+//! - **Cache-Aside + stale 模式（F32）**：30s TTL 内存缓存；`invalidate()` 不删值，
+//!   仅标记 `stale=true`，invoke 立即返回旧值，后台 spawn 刷新
 //! - **Strategy**：不同 OS 不同 python 二进制路径
 //! - **Facade**：Tauri commands 封装内部实现
+//!
+//! F32 改造（v3.3）：
+//! - 探查类命令（`env_inspect` / `env_readiness_check`）改为「立即返回 stale 值 +
+//!   后台 spawn 刷新 + emit `env_inspect_updated` 事件」模式
+//! - 不再阻塞前端 5-90s 等待 `import torch`
+//! - 详见 `PR/03-模块设计/07-EnvironmentInspector.md §14 F32 探查类异步化`
 //!
 //! 详见 `PR/03-模块设计/07-EnvironmentInspector.md`
 
@@ -16,9 +23,13 @@ pub mod readiness;
 pub mod scripts;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use chrono::Utc;
+use parking_lot::RwLock;
 use serde_json::Value;
+use tauri::{AppHandle, Emitter};
 
 use crate::error::EnvError;
 use crate::event_bus::{EventBus, SystemEvent};
@@ -31,9 +42,13 @@ use scripts::{probe_torch_script, run_pip_list, venv_python_path};
 
 /// EnvironmentInspector 服务
 ///
-/// - 30s TTL 内存缓存
-/// - 事件总线订阅（TorchInstalled / VenvRebuilt / CoreVersionSwitched）主动失效
-/// - v2.10：持有 uv_binary 用于加速 `pip list` 探查（uv pip list 主路径 + python -m pip fallback）
+/// - 30s TTL 内存缓存（F32 stale 模式）
+/// - 事件总线订阅（TorchInstalled / VenvRebuilt / CoreVersionSwitched / RequirementsInstalled）
+///   主动失效（仅标记 stale，不删值）
+/// - v2.10：持有 uv_binary 用于加速 `pip list` 探查
+/// - F32：新增 `refreshing` CAS 防并发刷新 + `snapshot_cache` 存最后一次 EnvSnapshot +
+///   `app_handle` 用于 emit `env_inspect_updated` 事件
+#[derive(Clone)]
 pub struct EnvironmentInspectorService {
     cache: EnvCache,
     event_bus: EventBus,
@@ -42,34 +57,85 @@ pub struct EnvironmentInspectorService {
     /// - `Some(path)`：生产环境从 lib.rs 注入 uv sidecar 路径
     /// - `None`：测试场景或 uv 不可用，run_pip_list 会直接走 fallback 路径
     uv_binary: Option<PathBuf>,
+    /// F32 新增：后台刷新进行中标志（CAS 防并发刷新）
+    ///
+    /// - `false`：空闲
+    /// - `true`：已有 spawn_refresh 任务在跑，跳过新请求
+    refreshing: Arc<AtomicBool>,
+    /// F32 新增：Tauri AppHandle，用于 emit `env_inspect_updated` 事件给前端
+    ///
+    /// - `Some(handle)`：生产环境从 lib.rs 注入
+    /// - `None`：测试场景，spawn_refresh 完成后只更新 cache 不 emit 前端事件
+    app_handle: Option<AppHandle>,
+    /// F32 新增：最后一次返回给前端的 EnvSnapshot（独立于 EnvInfo cache）
+    ///
+    /// 设计原因：`inspect_snapshot` 调用 `python_version_from_torch_probe`（5s 超时），
+    /// 不适合 ≤100ms 快速返回路径。改为：
+    /// - invoke 立即返回 snapshot_cache 中的 stale 值
+    /// - spawn_refresh 调完整 inspect_snapshot 后更新 snapshot_cache
+    snapshot_cache: Arc<RwLock<Option<EnvSnapshot>>>,
 }
 
 impl EnvironmentInspectorService {
-    /// 生产构造：注入 uv binary 路径
+    /// 生产构造：注入 uv binary 路径（向后兼容，app_handle=None）
     ///
     /// uv_binary 通常来自 `uv_sidecar::ensure_released()` 返回的 sidecar 路径。
+    ///
+    /// 注：此构造函数不注入 AppHandle，spawn_refresh 完成后不会 emit `env_inspect_updated`
+    /// 前端事件。生产环境应改用 [`Self::new_with_app`]。
     pub fn new(event_bus: EventBus, uv_binary: PathBuf) -> Self {
-        let service = Self {
-            cache: EnvCache::new(),
-            event_bus,
-            uv_binary: Some(uv_binary),
-        };
-        service.spawn_event_listener();
-        service
+        Self::build(event_bus, Some(uv_binary), None)
+    }
+
+    /// F32 新增：生产构造（注入 AppHandle，支持 emit `env_inspect_updated`）
+    ///
+    /// 推荐在 `lib.rs` setup hook 中使用此构造函数。
+    pub fn new_with_app(event_bus: EventBus, uv_binary: PathBuf, app_handle: AppHandle) -> Self {
+        Self::build(event_bus, Some(uv_binary), Some(app_handle))
+    }
+
+    /// F32 新增：生产构造（uv 可选 + 注入 AppHandle）
+    ///
+    /// 用于 `lib.rs` 中 uv sidecar 不可用但仍需 emit 事件的场景：
+    /// - `uv_binary = None`：run_pip_list 走 python -m pip fallback
+    /// - `app_handle = Some(handle)`：spawn_refresh 完成后仍会 emit `env_inspect_updated`
+    pub fn new_with_app_optional(
+        event_bus: EventBus,
+        uv_binary: Option<PathBuf>,
+        app_handle: AppHandle,
+    ) -> Self {
+        Self::build(event_bus, uv_binary, Some(app_handle))
     }
 
     /// 测试构造：不注入 uv binary（run_pip_list 走 python -m pip fallback）
     pub fn new_for_test(event_bus: EventBus) -> Self {
+        Self::build(event_bus, None, None)
+    }
+
+    /// 内部统一构造逻辑
+    fn build(
+        event_bus: EventBus,
+        uv_binary: Option<PathBuf>,
+        app_handle: Option<AppHandle>,
+    ) -> Self {
         let service = Self {
             cache: EnvCache::new(),
             event_bus,
-            uv_binary: None,
+            uv_binary,
+            refreshing: Arc::new(AtomicBool::new(false)),
+            app_handle,
+            snapshot_cache: Arc::new(RwLock::new(None)),
         };
         service.spawn_event_listener();
         service
     }
 
     /// 启动事件总线订阅（监听外部模块变更，主动失效缓存）
+    ///
+    /// F32 改造：
+    /// - TorchInstalled / RequirementsInstalled / VenvRebuilt / CoreVersionSwitched
+    ///   → `cache.invalidate()`（仅标记 stale，保留旧值）
+    /// - AppExiting → `cache.clear()`（完全清空，避免退出后还持有大对象）
     fn spawn_event_listener(&self) {
         let mut rx = self.event_bus.subscribe();
         let cache = self.cache.clone(); // EnvCache 内部用 Arc，可安全 clone
@@ -77,10 +143,15 @@ impl EnvironmentInspectorService {
             while let Ok(event) = rx.recv().await {
                 match event {
                     SystemEvent::TorchInstalled { .. }
+                    | SystemEvent::RequirementsInstalled
                     | SystemEvent::VenvRebuilt
                     | SystemEvent::CoreVersionSwitched { .. } => {
                         cache.invalidate();
                         tracing::debug!(?event, "env cache invalidated by event");
+                    }
+                    SystemEvent::AppExiting { .. } => {
+                        cache.clear();
+                        tracing::debug!(?event, "env cache cleared on app exit");
                     }
                     _ => {}
                 }
@@ -192,6 +263,120 @@ impl EnvironmentInspectorService {
         })
     }
 
+    /// F32 新增：探查或返回 stale 值（不阻塞，立即返回）
+    ///
+    /// 用于 P0 探查类命令（`env_inspect` / `env_readiness_check`）的快速返回路径：
+    ///
+    /// 1. **读 `snapshot_cache`**：返回最后一次完整 `inspect_snapshot` 的结果（不检查新鲜度）。
+    ///    即使 `cache.invalidate()` 已标记 stale，仍返回旧值，前端不显示 loading。
+    /// 2. **触发后台刷新**：若 `cache.needs_refresh(venv_path)` 为 true，
+    ///    调 `spawn_refresh` 异步刷新（不等待，立即返回当前 stale 值）。
+    /// 3. **首次启动**：`snapshot_cache` 为空 → 返回 `None`，
+    ///    前端可选择显示 loading 或调用 `env_invalidate_cache` 后等待第一次 `env_inspect_updated` 事件。
+    ///
+    /// 返回值：
+    /// - `Some(snapshot)`：立即返回给前端（可能是 stale 值）
+    /// - `None`：首次启动或 `clear()` 后无数据，前端应等待 `env_inspect_updated` 事件
+    ///
+    /// 副作用：可能触发 `spawn_refresh`，刷新完成后会：
+    /// - 更新 `snapshot_cache`
+    /// - emit Tauri 2 Event `env_inspect_updated`（payload = 新 EnvSnapshot）
+    /// - emit 后端 `EnvInspectUpdated` 事件
+    pub fn inspect_or_cached(
+        &self,
+        venv_path: &Path,
+        comfyui_root: &Path,
+    ) -> Option<EnvSnapshot> {
+        // 1. 读 snapshot_cache（不阻塞）
+        let snapshot = self.snapshot_cache.read().clone();
+
+        // 2. 检查是否需要后台刷新
+        if self.cache.needs_refresh(venv_path) {
+            tracing::debug!(
+                has_stale = snapshot.is_some(),
+                "env cache needs refresh, spawning background refresh"
+            );
+            self.spawn_refresh(venv_path.to_path_buf(), comfyui_root.to_path_buf());
+        } else {
+            tracing::debug!("env cache fresh, no refresh needed");
+        }
+
+        snapshot
+    }
+
+    /// F32 新增：后台 spawn 刷新任务（CAS 防并发）
+    ///
+    /// **不阻塞调用方**：CAS 失败说明已有刷新在跑，直接返回。
+    /// CAS 成功则 spawn tokio task 执行完整 `inspect_snapshot`，完成后：
+    /// 1. 更新 `snapshot_cache`
+    /// 2. emit Tauri 2 Event `env_inspect_updated`（前端通过 `listen('env_inspect_updated')` 接收）
+    /// 3. emit 后端 `EnvInspectUpdated` 事件（其他 Service 联动）
+    /// 4. 重置 `refreshing = false`
+    ///
+    /// 失败容错：
+    /// - `inspect_snapshot` 失败 → 记录 warn，保留旧 `snapshot_cache` 不动
+    /// - emit 失败 → 记录 warn（不阻塞流程）
+    ///
+    /// 注意：本方法接受 `PathBuf`（非 `&Path`），因为需要 'static 生命周期 spawn task。
+    fn spawn_refresh(&self, venv_path: PathBuf, comfyui_root: PathBuf) {
+        // 1. CAS：如果已在刷新，直接返回
+        if self
+            .refreshing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            tracing::debug!("env refresh already in progress, skip spawn");
+            return;
+        }
+
+        // 2. clone self 进 task（EnvironmentInspectorService 已 derive Clone）
+        let service = self.clone();
+        let venv = venv_path.clone();
+        let comfyui = comfyui_root.clone();
+
+        tokio::spawn(async move {
+            tracing::info!("env background refresh started");
+
+            let result = service.inspect_snapshot(&venv, &comfyui).await;
+
+            match result {
+                Ok(snapshot) => {
+                    // 1. 更新 snapshot_cache
+                    *service.snapshot_cache.write() = Some(snapshot.clone());
+
+                    // 2. emit Tauri 2 Event 给前端
+                    if let Some(app) = &service.app_handle {
+                        if let Err(e) = app.emit("env_inspect_updated", &snapshot) {
+                            tracing::warn!(error = %e, "emit env_inspect_updated failed");
+                        } else {
+                            tracing::debug!("emitted env_inspect_updated event to frontend");
+                        }
+                    } else {
+                        tracing::debug!("app_handle None (test mode), skip emit env_inspect_updated");
+                    }
+
+                    // 3. emit 后端 SystemEvent（其他 Service 联动）
+                    service.event_bus.emit(SystemEvent::EnvInspectUpdated);
+
+                    tracing::info!(
+                        torch_installed = snapshot.torch_installed,
+                        "env background refresh complete"
+                    );
+                }
+                Err(e) => {
+                    // 失败：保留旧 snapshot_cache 不动，前端继续用 stale 值
+                    tracing::warn!(
+                        error = %e,
+                        "env background refresh failed, keeping stale snapshot"
+                    );
+                }
+            }
+
+            // 4. 重置 refreshing（无论成功失败）
+            service.refreshing.store(false, Ordering::SeqCst);
+        });
+    }
+
     /// 探查 venv 中的 torch
     pub async fn probe_torch(&self, venv_path: &Path) -> Result<TorchInfo, EnvError> {
         if !venv_exists(venv_path) {
@@ -291,6 +476,12 @@ impl EnvironmentInspectorService {
     }
 
     /// 主动失效缓存
+    ///
+    /// F32 改造：仅调 `cache.invalidate()`（标记 stale=true，保留旧值）。
+    /// 下次 `inspect_or_cached` 调用时会自动触发 `spawn_refresh` 后台刷新。
+    ///
+    /// 不再同步触发刷新，避免阻塞调用方（如 `env_change_torch_variant` 命令）。
+    /// 前端在收到 `task_completed` 事件后会主动调 `env_inspect`，触发刷新。
     pub fn invalidate_cache(&self) {
         self.cache.invalidate();
     }

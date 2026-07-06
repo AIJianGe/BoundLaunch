@@ -270,11 +270,21 @@ impl ProcessLauncherService {
         }
 
         // 11. spawn health check task
-        let health_handle = spawn_health_check(port, app.clone());
+        //
+        // v3.2.2 关键修复：start() 立即返回，不等 health_check 完成
+        // - 之前 `health_handle.await` 在 start() 流程内 await → 最坏阻塞 60s
+        // - 修复后 health_check 是完全独立的 task：
+        //   - ready → emit("process_started") + transition_to_running
+        //   - timeout → 自动 stop_impl（用户也能点启动按钮立即返回）
+        // - start() 立即返回 Ok(())，前端 invoke 不会阻塞
         let inner_for_health = self.inner.clone();
         let app_for_health = app.clone();
         let health_handle = tokio::spawn(async move {
-            let outcome = health_handle.await.unwrap_or(HealthCheckOutcome::Timeout);
+            // spawn_health_check 返回 JoinHandle<HealthCheckOutcome>，需要 await
+            // 但 await 在独立 task 内，不阻塞 start() 主流程
+            let outcome = spawn_health_check(port, app_for_health.clone())
+                .await
+                .unwrap_or(HealthCheckOutcome::Timeout);
             match outcome {
                 HealthCheckOutcome::Ready => {
                     let _lock = inner_for_health.instance_lock.lock().await;
@@ -292,6 +302,7 @@ impl ProcessLauncherService {
                 }
                 HealthCheckOutcome::Timeout => {
                     tracing::warn!("health check timeout, triggering stop");
+                    // 复用 stop_impl 走标准停止流程（emit process_stopped 等）
                     let _ = stop_impl(&inner_for_health, &app_for_health, StopReason::HealthCheckTimeout).await;
                 }
             }

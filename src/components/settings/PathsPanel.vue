@@ -8,10 +8,12 @@
  * - comfyui_root：ComfyUI 仓库克隆位置
  * - venv_path：Python 虚拟环境路径
  * - python_version：目标 Python 版本（仅记录，实际切换在 PythonVersionPanel）
+ * - models_path：自定义 models 路径（v3.1 / F26 决策 12，可选）
  *
  * 行为：
  * - 输入防抖 500ms 后调用 configStore.update
  * - 实时校验：父目录可写 / 路径不互相重复
+ * - models_path 修改后自动调用 coreEnsureModelsLink 建立软链接
  *
  * 设计模式：
  * - **Repository**：通过 configStore 持久化
@@ -32,13 +34,17 @@ import {
 } from "naive-ui";
 import { useConfigStore } from "@/stores/config";
 import { useEnvStore } from "@/stores/env";
+import { useCoreStore } from "@/stores/core";
 import { useToast } from "@/composables/useToast";
 import { useEnvInstaller } from "@/composables/useEnvInstaller";
 import { useConfirm } from "@/composables/useConfirm";
 import FolderPicker from "@/components/FolderPicker.vue";
+import RepoUrlDialog from "@/components/settings/RepoUrlDialog.vue";
+import RepairWizard from "@/components/settings/RepairWizard.vue";
 
 const configStore = useConfigStore();
 const envStore = useEnvStore();
+const coreStore = useCoreStore();
 const toast = useToast();
 const { confirm: showConfirm } = useConfirm();
 
@@ -59,6 +65,16 @@ const pythonVersionOptions = [
 const localRoot = ref("");
 const localVenv = ref("");
 const localPython = ref("3.11");
+/** 自定义 models 路径（v3.1 / F26 决策 12，空字符串 = 用默认） */
+const localModelsPath = ref("");
+/**
+ * v3.2：venv 路径是否刚切换（用于 NAlert 按钮文案上下文感知）
+ *
+ * - 用户在 PathsPanel 切换 venv 路径后置 true
+ * - 用户点 NAlert 按钮 / env 已就绪后置 false
+ * - 控制按钮文案：「一键补装」 vs 「重新安装环境」
+ */
+const venvPathJustChanged = ref(false);
 const debounceTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 
 watch(
@@ -68,6 +84,7 @@ watch(
       localRoot.value = cfg.paths.comfyui_root;
       localVenv.value = cfg.paths.venv_path;
       localPython.value = cfg.paths.python_version;
+      localModelsPath.value = cfg.paths.models_path ?? "";
       // 首次加载时初始化 lastSavedVenv
       if (!lastSavedVenv) {
         lastSavedVenv = cfg.paths.venv_path;
@@ -87,41 +104,68 @@ const venvEmpty = computed(() => !localVenv.value.trim());
 
 const hasError = computed(() => pathConflict.value || rootEmpty.value || venvEmpty.value);
 
-function debouncedUpdate(field: "root" | "venv" | "python", value: string) {
+function debouncedUpdate(field: "root" | "venv" | "python" | "models", value: string) {
   if (debounceTimers[field]) clearTimeout(debounceTimers[field]);
   debounceTimers[field] = setTimeout(async () => {
     try {
       if (field === "root") {
         await configStore.update({ paths: { comfyui_root: value } });
       } else if (field === "venv") {
-        // v3.0：切换 venv 路径时让用户确认
+        // v3.2：切换 venv 路径时让用户确认
         const oldPath = lastSavedVenv;
-        if (oldPath && oldPath !== value) {
+        const isPathChanged = !!(oldPath && oldPath !== value);
+
+        if (isPathChanged) {
           const oldPathStr = oldPath;
           const newPathStr = value;
           const confirmed = await showConfirm({
             title: "切换 venv 路径",
             content:
-              "切换 venv 路径后，原 venv 中的 Python 包将不再被使用。\n\n" +
-              "旧路径：" +
+              "切换 venv 路径后：\n\n" +
+              "• 旧路径的 Python 包将不再被使用\n" +
+              "• 新路径下如未检测到 venv，需要创建并安装依赖\n" +
+              "  （含 torch + ComfyUI requirements.txt，预计 5-15 分钟）\n\n" +
+              "旧：" +
               oldPathStr +
-              "\n新路径：" +
+              "\n" +
+              "新：" +
               newPathStr +
-              "\n\n如果新路径不存在或不是有效 venv，下次启动 ComfyUI 前需要重新初始化环境。是否继续？",
-            positiveText: "确认切换",
-            negativeText: "取消",
+              "\n\n立即开始安装？",
+            positiveText: "立即开始",
+            negativeText: "稍后手动装",
           });
-          if (!confirmed) {
-            // 回退 localVenv 到原值
-            localVenv.value = oldPath;
-            return;
+
+          // v3.2 关键修复：无论选哪个，路径都切换
+          // 区别只在于"是否自动调 installMissingSteps"
+          lastSavedVenv = value;
+          venvPathJustChanged.value = true; // 标记路径刚切换
+
+          await configStore.update({ paths: { venv_path: value } });
+          // 立即重新做 readiness，让 UI 反映新 venv 状态
+          try {
+            await envStore.invalidateCache();
+            await envStore.refresh();
+            await envStore.checkReadiness();
+          } catch (e) {
+            console.warn("[PathsPanel] post-venv-change readiness failed:", e);
           }
-          lastSavedVenv = value;
-        } else {
-          lastSavedVenv = value;
+
+          if (confirmed) {
+            // 选"立即开始"：直接调 installMissingSteps
+            const ok = await installMissingSteps();
+            if (ok) {
+              venvPathJustChanged.value = false;
+            }
+          } else {
+            // 选"稍后手动装"：保持 venvPathJustChanged=true，让 NAlert 按钮文案变为"重新安装环境"
+            toast.info("新 venv 路径已保存，请点击「重新安装环境」按钮开始安装");
+          }
+          return;
         }
+
+        // 路径未变化（首次输入 / 重新输入相同路径）
+        lastSavedVenv = value;
         await configStore.update({ paths: { venv_path: value } });
-        // 切换后立即重新做一次 readiness，让 UI 反映新 venv 状态
         try {
           await envStore.invalidateCache();
           await envStore.refresh();
@@ -131,6 +175,24 @@ function debouncedUpdate(field: "root" | "venv" | "python", value: string) {
         }
       } else if (field === "python") {
         await configStore.update({ paths: { python_version: value } });
+      } else if (field === "models") {
+        // v3.1 / F26 决策 12：保存 models_path 并建立软链接
+        await configStore.update({ paths: { models_path: value || null } });
+        // 调用 ensureModelsLink 建立软链接
+        try {
+          const linked = await coreStore.ensureModelsLink();
+          if (value) {
+            toast.success(
+              linked
+                ? `已建立 models 软链接到: ${value}`
+                : "models 软链接已存在，无需重复建立",
+            );
+          } else {
+            toast.info("已清除自定义 models 路径，将使用 ComfyUI 默认路径");
+          }
+        } catch (e) {
+          toast.error("建立 models 软链接失败", e);
+        }
       }
     } catch (e) {
       toast.error("保存失败", e);
@@ -169,10 +231,31 @@ const missingStepsText = computed(() => {
   return steps.map((s) => labels[s.kind] ?? s.kind).join("、");
 });
 
-/** 点击「一键补装」按钮 */
+/** 点击「一键补装」按钮（v3.2：成功后清除 venvPathJustChanged 标记） */
 async function onInstallMissing() {
-  await installMissingSteps();
+  const ok = await installMissingSteps();
+  if (ok) {
+    venvPathJustChanged.value = false;
+  }
 }
+
+/** NAlert 按钮文案（v3.2：上下文感知） */
+const installButtonText = computed(() => {
+  if (installingEnv.value) return installStepText.value;
+  if (venvPathJustChanged.value) return "重新安装环境";
+  return "一键补装";
+});
+
+/** F31：仓库地址管理对话框显示状态 */
+const showRepoDialog = ref(false);
+
+/** v1.8 / F36-Phase2：环境修复向导显示状态（深度诊断按钮触发） */
+const showRepairWizard = ref(false);
+
+/** v1.8 / F36-Phase2：torch 未安装（诊断修复按钮高亮） */
+const torchBroken = computed(
+  () => envStore.envInfo !== null && !envStore.envInfo.torch_installed,
+);
 </script>
 
 <template>
@@ -214,14 +297,44 @@ async function onInstallMissing() {
             <template #icon>
               <NSpin v-if="installingEnv" size="small" />
             </template>
-            {{ installingEnv ? installStepText : "一键补装" }}
+            {{ installButtonText }}
           </NButton>
         </div>
       </NAlert>
+
+      <!-- v1.8 / F36-Phase2：深度诊断入口（独立于一键补装，可诊断隐蔽问题如 numpy 坏版本） -->
+      <NSpace :size="8" align="center" class="diagnose-row">
+        <NButton
+          size="small"
+          :type="torchBroken ? 'error' : 'default'"
+          :loading="envStore.repairing"
+          :disabled="envStore.repairing"
+          @click="showRepairWizard = true"
+        >
+          🔧 {{ torchBroken ? "诊断修复（推荐）" : "深度诊断" }}
+        </NButton>
+        <span class="diagnose-hint">
+          扫描 venv + torch import + 关键依赖，定位隐蔽问题并自动修复
+        </span>
+      </NSpace>
     </div>
 
     <NForm label-placement="top" :show-feedback="false" size="small">
-      <NFormItem label="ComfyUI 根目录">
+      <NFormItem>
+        <template #label>
+          <span class="label-with-help">
+            ComfyUI 根目录
+            <NButton
+              size="tiny"
+              quaternary
+              type="primary"
+              class="repo-url-btn"
+              @click="showRepoDialog = true"
+            >
+              仓库地址管理
+            </NButton>
+          </span>
+        </template>
         <FolderPicker
           v-model="localRoot"
           placeholder="如 D:\AIWork\ComfyUI"
@@ -265,6 +378,36 @@ async function onInstallMissing() {
           @update:value="(v) => debouncedUpdate('python', v)"
         />
       </NFormItem>
+
+      <NFormItem>
+        <template #label>
+          <span class="label-with-help">
+            models 路径（可选）
+            <NTooltip placement="top" trigger="hover">
+              <template #trigger>
+                <span class="help-icon" aria-label="models 路径说明">?</span>
+              </template>
+              <div class="help-content">
+                自定义 models 目录路径（v3.1 / F26 决策 12）。<br /><br />
+                <strong>留空</strong>：使用 ComfyUI 默认路径
+                &lt;comfyui_root&gt;/models<br />
+                <strong>指定路径</strong>：在 &lt;comfyui_root&gt;/models
+                建立软链接（Windows 使用 junction，无需管理员权限）指向此路径。<br /><br />
+                用途：跨 ComfyUI 版本共享模型文件，避免版本切换时重复下载。<br />
+                注意：若 &lt;comfyui_root&gt;/models
+                已是真实目录（非链接），需先迁移数据再删除目录，否则无法建立链接。
+              </div>
+            </NTooltip>
+          </span>
+        </template>
+        <FolderPicker
+          v-model="localModelsPath"
+          placeholder="留空则使用 ComfyUI 默认 models 目录"
+          dialog-title="选择 models 路径（将建立软链接）"
+          clearable
+          @update:model-value="(v) => debouncedUpdate('models', v)"
+        />
+      </NFormItem>
     </NForm>
 
     <NSpace v-if="hasError" vertical :size="8" class="error-list">
@@ -278,6 +421,22 @@ async function onInstallMissing() {
         ⚠ ComfyUI 根目录与 venv 路径不能相同
       </NAlert>
     </NSpace>
+
+    <!-- F31：仓库地址管理对话框 -->
+    <RepoUrlDialog v-model:show="showRepoDialog" />
+
+    <!-- v1.8 / F36-Phase2：环境修复向导 -->
+    <RepairWizard
+      :show="showRepairWizard"
+      @close="showRepairWizard = false"
+      @repaired="
+        async () => {
+          showRepairWizard = false;
+          await envStore.refresh();
+          await envStore.checkReadiness();
+        }
+      "
+    />
   </NCard>
 </template>
 
@@ -339,5 +498,25 @@ async function onInstallMissing() {
 .help-content {
   max-width: 360px;
   line-height: 1.6;
+}
+
+/* F31：仓库地址管理按钮（白底可见，遵循 UI 约束） */
+.repo-url-btn {
+  margin-left: 8px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* v1.8 / F36-Phase2：深度诊断入口行 */
+.diagnose-row {
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.diagnose-hint {
+  font-size: 12px;
+  color: var(--app-text-muted, #999);
+  line-height: 1.5;
 }
 </style>

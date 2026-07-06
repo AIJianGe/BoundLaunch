@@ -3,8 +3,17 @@
  *
  * 设计模式：
  * - **Store (Flux)**：集中管理环境信息
- * - **Observer**：监听 `env_changed` 事件
+ * - **Observer**：监听 `env_changed` / `env_inspect_updated`（F32 新增）事件
  * - **Cache-Aside**：30s TTL 由后端管理，前端仅缓存最近一次结果
+ *
+ * F32 改造（v3.3）：
+ * - `envInfo` 可能为 null（首次启动无 stale 值时）
+ * - 6 个长任务 action（createVenv / installTorch / installRequirements /
+ *   switchPython / rebuildVenv / changeTorchVariant）改为「invoke 拿 task_id →
+ *   waitForTask 等待完成 → refresh」模式
+ * - 订阅 `env_inspect_updated` 事件，后台刷新完成后自动更新 envInfo
+ * - 删除 `probeTorch`（后端命令已删除）
+ * - `checkReadiness` 适配返回 `ReadinessCheckResult | null`
  *
  * 使用方式：
  * ```ts
@@ -18,7 +27,6 @@ import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import {
   envInspect,
-  envProbeTorch,
   envListDependencies,
   envInvalidateCache,
   envReadinessCheck,
@@ -31,6 +39,8 @@ import {
   envRebuildVenv,
   envCheckDependencyConflicts,
   envChangeTorchVariant,
+  envDiagnose,
+  envRepair,
   systemDetectGpus,
   systemClearGpuCache,
   systemRecommendTorch,
@@ -45,6 +55,9 @@ import type {
   ConflictReport,
   TorchVariant,
   GpuInfo,
+  TaskTerminalEvent,
+  DiagnoseReport,
+  RepairAction,
 } from "@/api/types";
 import { parseTorchVariant, serializeTorchVariant } from "@/utils/torchVariant";
 import { useConfigStore } from "./config";
@@ -67,6 +80,13 @@ export const useEnvStore = defineStore("env", () => {
   const checkingReadiness = ref(false);
   const error = ref<string | null>(null);
   const lastUpdated = ref<string | null>(null);
+  // v1.8 / F36-Phase2：环境诊断 + 修复
+  /** 最新一次诊断报告（null = 未诊断） */
+  const lastDiagnose = ref<DiagnoseReport | null>(null);
+  /** 修复中状态（true = 已提交 task_id，正在等 task_completed） */
+  const repairing = ref(false);
+  /** 修复动作（用于进度提示） */
+  const currentRepairAction = ref<RepairAction | null>(null);
 
   const unlisteners: UnlistenFn[] = [];
 
@@ -90,9 +110,56 @@ export const useEnvStore = defineStore("env", () => {
     return raw ? parseTorchVariant(raw) : null;
   });
 
+  // ========== F32 内部工具：等待任务完成 ==========
+
+  /**
+   * 等待指定 task_id 完成（通过 `task_completed` 事件）
+   *
+   * F32 改造：长任务命令返回 task_id 后，store 用此方法等待任务终态。
+   * - `completed` → resolve
+   * - `failed` / `cancelled` → reject(Error)
+   *
+   * 注意：存在轻微 race condition（任务在 listen 注册前已完成），
+   * 但 TaskScheduler 从 submit 到 emit task_completed 至少需要几十毫秒，
+   * listen 注册通常在几毫秒内完成，race 概率极低。
+   * 若未来需要更稳健，可加 taskGet 轮询兜底。
+   */
+  function waitForTask(taskId: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let unlisten: UnlistenFn | null = null;
+      const cleanup = () => {
+        if (unlisten) unlisten();
+      };
+
+      // 注册监听器
+      listen<TaskTerminalEvent>("task_completed", (e) => {
+        if (e.payload.task_id !== taskId) return;
+        cleanup();
+        if (e.payload.status === "completed") {
+          resolve();
+        } else {
+          reject(
+            new Error(
+              e.payload.summary ??
+                `任务${e.payload.status === "failed" ? "失败" : "已取消"}`,
+            ),
+          );
+        }
+      }).then((un) => {
+        unlisten = un;
+      });
+    });
+  }
+
   // ========== Actions ==========
 
-  /** 刷新环境信息（含依赖列表） */
+  /**
+   * 刷新环境信息（含依赖列表）
+   *
+   * F32 改造：envInspect 返回 `EnvInfo | null`
+   * - 非 null：立即更新 envInfo（可能是 stale 值）
+   * - null：首次启动，envInfo 保持 null，等待 `env_inspect_updated` 事件
+   */
   async function refresh() {
     loading.value = true;
     error.value = null;
@@ -102,10 +169,13 @@ export const useEnvStore = defineStore("env", () => {
         envStatus(),
         envListDependencies(),
       ]);
-      envInfo.value = info;
+      // F32: info 可能为 null（首次启动），仅在有值时更新
+      if (info) {
+        envInfo.value = info;
+        lastUpdated.value = info.last_updated;
+      }
       pythonEnvStatus.value = status;
       dependencies.value = deps;
-      lastUpdated.value = info.last_updated;
       // 同步 v3.0 torch 变体（从 Config 解析）
       const configStore = useConfigStore();
       const raw = configStore.config?.torch.torch_variant;
@@ -122,7 +192,13 @@ export const useEnvStore = defineStore("env", () => {
     }
   }
 
-  /** 检查环境就绪性（不修改任何后端状态） */
+  /**
+   * 检查环境就绪性（不修改任何后端状态）
+   *
+   * F32 改造：返回 `ReadinessCheckResult | null`
+   * - 非 null：更新 readiness
+   * - null：首次启动无 snapshot，readiness 保持 null
+   */
   async function checkReadiness() {
     checkingReadiness.value = true;
     try {
@@ -138,52 +214,63 @@ export const useEnvStore = defineStore("env", () => {
     await refresh();
   }
 
-  /** 探测 torch（真实调用 torch.cuda.is_available） */
-  async function probeTorch() {
-    const result = await envProbeTorch();
-    // 触发刷新以更新 envInfo
-    await refresh();
-    return result;
-  }
-
-  /** 创建 venv */
+  /**
+   * 创建 venv（F32 改造：返回 task_id，内部等待完成）
+   *
+   * 流程：invoke 拿 task_id → waitForTask → invalidateCache + refresh
+   */
   async function createVenv(pythonVersion: string) {
     loading.value = true;
     try {
-      await envCreateVenv(pythonVersion);
+      const taskId = await envCreateVenv(pythonVersion);
+      await waitForTask(taskId);
+      // 完成后失效缓存 + 刷新（env_inspect_updated 事件也会自动更新）
+      await envInvalidateCache();
       await refresh();
     } finally {
       loading.value = false;
     }
   }
 
-  /** 安装 torch */
+  /**
+   * 安装 torch（F32 改造：返回 task_id，内部等待完成）
+   */
   async function installTorch(cudaVersion: string) {
     loading.value = true;
     try {
-      await envInstallTorch(cudaVersion);
+      const taskId = await envInstallTorch(cudaVersion);
+      await waitForTask(taskId);
+      await envInvalidateCache();
       await refresh();
     } finally {
       loading.value = false;
     }
   }
 
-  /** 安装 ComfyUI 依赖（v2.14，幂等：uv 自动跳过已满足的包） */
+  /**
+   * 安装 ComfyUI 依赖（F32 改造：返回 task_id，内部等待完成）
+   */
   async function installRequirements() {
     loading.value = true;
     try {
-      await envInstallRequirements();
+      const taskId = await envInstallRequirements();
+      await waitForTask(taskId);
+      await envInvalidateCache();
       await refresh();
     } finally {
       loading.value = false;
     }
   }
 
-  /** 切换 Python 版本（5 步事务，自动回滚） */
+  /**
+   * 切换 Python 版本（F32 改造：返回 task_id，内部等待完成）
+   */
   async function switchPython(pythonVersion: string) {
     loading.value = true;
     try {
-      await envSwitchPython(pythonVersion);
+      const taskId = await envSwitchPython(pythonVersion);
+      await waitForTask(taskId);
+      await envInvalidateCache();
       await refresh();
     } finally {
       loading.value = false;
@@ -195,14 +282,68 @@ export const useEnvStore = defineStore("env", () => {
     return envCheckCompatibility();
   }
 
-  /** 重建 venv */
+  /**
+   * 重建 venv（F32 改造：返回 task_id，内部等待完成）
+   */
   async function rebuildVenv() {
     loading.value = true;
     try {
-      await envRebuildVenv();
+      const taskId = await envRebuildVenv();
+      await waitForTask(taskId);
+      await envInvalidateCache();
       await refresh();
     } finally {
       loading.value = false;
+    }
+  }
+
+  // ========== v1.8 / F36-Phase2：环境诊断 + 修复 ==========
+
+  /**
+   * 环境诊断（v1.8 / F36-Phase2）
+   *
+   * 不会修改任何后端状态，纯只读探测。
+   * 返回 `DiagnoseReport`：
+   * - `venv_exists` / `torch_import_ok` / `torch_version`
+   * - `issues[]`：诊断出的所有问题（按严重度排序）
+   * - `suggested_action`：综合建议（最严重 action）
+   * - `suggested_reason`：建议原因（用户可读）
+   */
+  async function diagnose(): Promise<DiagnoseReport> {
+    const report = await envDiagnose();
+    lastDiagnose.value = report;
+    return report;
+  }
+
+  /**
+   * 环境修复（v1.8 / F36-Phase2）
+   *
+   * F32 改造：返回 task_id，内部等待完成。
+   * 完成后 invalidateCache + refresh（让 StatusCard / 关键依赖列表更新）。
+   *
+   * @param action 修复动作（建议从 `diagnose` 拿到的 `suggested_action` 传入）
+   */
+  async function repair(action: RepairAction) {
+    if (repairing.value) {
+      throw new Error("已有修复任务在执行中");
+    }
+    repairing.value = true;
+    currentRepairAction.value = action;
+    try {
+      const taskId = await envRepair(action);
+      await waitForTask(taskId);
+      // 完成后让缓存失效 + 重新刷新 + 重新诊断
+      await envInvalidateCache();
+      await refresh();
+      // 重新诊断（让 UI 看到修复结果）
+      try {
+        await diagnose();
+      } catch (e) {
+        console.warn("[env] re-diagnose after repair failed:", e);
+      }
+    } finally {
+      repairing.value = false;
+      currentRepairAction.value = null;
     }
   }
 
@@ -248,23 +389,18 @@ export const useEnvStore = defineStore("env", () => {
   }
 
   /**
-   * 切换 torch 变体
+   * 切换 torch 变体（F32 改造：返回 task_id，内部等待完成）
    *
-   * 流程：
-   * 1. 自动停 ComfyUI（如运行中，调用方需在 UI 提示用户）
-   * 2. uv pip install --upgrade <torch> + 验证
-   * 3. 更新 Config（cuda_version + torch_variant）
-   * 4. 失效 env_status 缓存
-   *
-   * 失败时返回错误，旧 torch 保留。
+   * 流程（action 内部）：停 ComfyUI → 切换 torch → 更新 Config
    */
   async function changeTorchVariant(variant: TorchVariant) {
     switchingTorch.value = true;
     try {
-      await envChangeTorchVariant(variant);
+      const taskId = await envChangeTorchVariant(variant);
+      await waitForTask(taskId);
       // 同步本地状态
       currentTorch.value = variant;
-      // 同步 ConfigStore
+      // 同步 ConfigStore（后端 action 已更新 Config，这里同步前端缓存）
       const configStore = useConfigStore();
       const raw = serializeTorchVariant(variant);
       await configStore.update({
@@ -273,7 +409,8 @@ export const useEnvStore = defineStore("env", () => {
           torch_variant: raw,
         } as any,
       });
-      // 刷新环境信息
+      // 失效后端 30s 缓存 + 刷新
+      await envInvalidateCache();
       await refresh();
     } finally {
       switchingTorch.value = false;
@@ -288,16 +425,28 @@ export const useEnvStore = defineStore("env", () => {
   }
 
   /**
-   * 订阅后端 `env_changed` 事件
+   * 订阅后端事件
    *
-   * 后端在 venv 创建 / torch 安装 / Python 切换等操作后 emit 此事件。
+   * F32 改造：新增 `env_inspect_updated` 事件订阅
+   * - `env_changed`：环境状态变更（旧事件，保留兼容）
+   * - `env_inspect_updated`（F32 新增）：后台 spawn_refresh 完成，payload = 新 EnvInfo
+   *   收到后自动更新 envInfo（无需主动 refresh）
    */
   async function subscribe() {
     if (unlisteners.length > 0) return;
     unlisteners.push(
+      // 旧事件：环境变更 → 主动 refresh
       await listen<void>("env_changed", () => {
-        // 收到事件后自动刷新
         refresh().catch((e) => console.warn("env refresh failed:", e));
+      }),
+      // F32 新事件：后台刷新完成 → 直接更新 envInfo（不调 refresh，避免循环）
+      await listen<EnvInfo>("env_inspect_updated", (e) => {
+        envInfo.value = e.payload;
+        lastUpdated.value = e.payload.last_updated;
+        // 顺便重新检查 readiness（基于新 snapshot）
+        checkReadiness().catch((err) =>
+          console.warn("[env] readiness check after env_inspect_updated failed:", err),
+        );
       }),
     );
   }
@@ -324,6 +473,10 @@ export const useEnvStore = defineStore("env", () => {
     currentTorch,
     switchingTorch,
     detectingGpus,
+    // v1.8 / F36-Phase2 state
+    lastDiagnose,
+    repairing,
+    currentRepairAction,
     // getters
     isLoaded,
     torchInstalled,
@@ -337,7 +490,6 @@ export const useEnvStore = defineStore("env", () => {
     refresh,
     checkReadiness,
     invalidateCache,
-    probeTorch,
     createVenv,
     installTorch,
     installRequirements,
@@ -345,6 +497,9 @@ export const useEnvStore = defineStore("env", () => {
     checkCompatibility,
     rebuildVenv,
     checkConflicts,
+    // v1.8 / F36-Phase2 actions
+    diagnose,
+    repair,
     // v3.0 actions (F25)
     detectGpus,
     recommendTorch,

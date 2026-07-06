@@ -85,6 +85,17 @@ pub fn run() {
                         .expect("failed to init LogStore"),
                 );
 
+                // **v1.8 / F36**：启动恢复——把上次崩溃时残留的 running 任务标记为 failed
+                // 场景：torch 装到一半启动器被重启，DB 里 status='running' 永远不结束
+                // 启动时清理，避免历史记录卡在 running
+                if let Err(e) = log_store
+                    .tasks()
+                    .fail_orphaned_running_tasks("启动器启动，上次未完成的任务被强制标记为失败")
+                    .await
+                {
+                    tracing::warn!(error = %e, "F36: fail_orphaned_running_tasks failed");
+                }
+
                 // uv sidecar 先发布到用户目录（同时供 PythonEnv + EnvironmentInspector 使用）
                 //
                 // v2.10：EnvironmentInspector 也需要 uv_binary 用于加速 pip list 探查
@@ -92,16 +103,26 @@ pub fn run() {
                 let uv_path = uv_sidecar::ensure_released(&handle).await;
 
                 // EnvironmentInspector 初始化（30s 缓存 + 事件总线订阅 + uv binary 注入）
+                // F32：注入 AppHandle，支持 spawn_refresh 完成后 emit `env_inspect_updated` 事件
                 let env_inspector = match &uv_path {
                     Some(p) => {
                         tracing::info!(?p, "EnvironmentInspector: injecting uv binary for pip list");
-                        EnvironmentInspectorService::new((*event_bus).clone(), p.clone())
+                        EnvironmentInspectorService::new_with_app(
+                            (*event_bus).clone(),
+                            p.clone(),
+                            handle.clone(),
+                        )
                     }
                     None => {
                         tracing::warn!(
                             "EnvironmentInspector: uv sidecar not available, pip list will use python -m pip fallback"
                         );
-                        EnvironmentInspectorService::new_for_test((*event_bus).clone())
+                        // F32: uv 不可用时仍注入 AppHandle（仅丢失 uv pip list 加速，不影响事件推送）
+                        EnvironmentInspectorService::new_with_app_optional(
+                            (*event_bus).clone(),
+                            None,
+                            handle.clone(),
+                        )
                     }
                 };
 
@@ -201,6 +222,49 @@ pub fn run() {
                 // 托盘初始化失败不阻塞应用启动（用户仍可通过窗口操作）
             }
 
+            // v1.8 / F36-Phase2：启动一次性 numpy 迁移
+            //
+            // 背景：numpy 2.4.4 wheel 缺 exceptions.py（2025-12 报告），导致 `import torch` 失败。
+            // 之前 probe_torch 脚本 `except ImportError: installed=False` 把这个错误吞了，
+            // 用户看到"已装但显示未装"。本次启动器启动时静默跑一次：
+            // 1. 探测 torch import 是否 OK（能 → 不需要迁移）
+            // 2. 检查 numpy 版本（>= 2.3 → 已知坏版本）
+            // 3. 降级 numpy 到 < 2.3 + smoke test
+            // 4. emit RequirementsInstalled 让 env cache 失效
+            //
+            // 幂等：检测到 numpy < 2.3 立即返回，重启器反复启动也只跑一次降级（pip 已装的就是好版本）。
+            // 非阻塞：spawn 后立即返回，不阻塞 setup hook。
+            // 错误隔离：迁移失败时仅 warn 日志，不影响启动器正常运行（用户可手动触发 env_repair）。
+            {
+                let app_handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    // 延迟 3 秒执行，等 EnvironmentInspector 完成首次探查
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let state = app_handle.state::<app_state::AppState>();
+                    let config_snapshot = (**state.config.get()).clone();
+                    let venv_path = std::path::PathBuf::from(&config_snapshot.paths.venv_path);
+                    let comfyui_root =
+                        std::path::PathBuf::from(&config_snapshot.paths.comfyui_root);
+
+                    match crate::python_env::recovery::run_startup_numpy_migration(
+                        &state.python_env,
+                        &venv_path,
+                        &comfyui_root,
+                        &config_snapshot,
+                        &state.event_bus,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            tracing::debug!("startup numpy migration: completed (no-op or success)");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "startup numpy migration failed (non-fatal)");
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -216,7 +280,7 @@ pub fn run() {
             commands::log_store::task_history_list,
             // EnvironmentInspector
             commands::env_inspector::env_inspect,
-            commands::env_inspector::env_probe_torch,
+            // F32: env_probe_torch 已删除（死代码，前端无调用）
             commands::env_inspector::env_list_dependencies,
             commands::env_inspector::env_invalidate_cache,
             commands::env_inspector::env_readiness_check,
@@ -232,14 +296,36 @@ pub fn run() {
             commands::python_env::env_rebuild_venv,
             // v3.0 新增（F25）：torch 多厂商切换
             commands::python_env::env_change_torch_variant,
+            // v1.8 / F36-Phase2：环境诊断 + 修复
+            commands::python_env::env_diagnose,
+            commands::python_env::env_repair,
             // CoreManager
             commands::core_manager::core_clone,
             commands::core_manager::core_ensure_cloned,
             commands::core_manager::core_list_tags,
+            commands::core_manager::core_list_tags_classified,
+            commands::core_manager::core_check_switch_prerequisites,
+            commands::core_manager::core_switch_version,
             commands::core_manager::core_checkout,
             commands::core_manager::core_update,
             commands::core_manager::core_status,
             commands::core_manager::core_is_cloned,
+            commands::core_manager::core_ensure_models_link,
+            // F31：仓库地址切换与备份恢复
+            commands::core_manager::core_get_repo_url,
+            commands::core_manager::core_official_repo_url,
+            commands::core_manager::core_list_backups,
+            commands::core_manager::core_set_repo_url,
+            commands::core_manager::core_restore_backup,
+            commands::core_manager::core_open_comfyui_dir,
+            // F35-A+：工作区脏原因检查 + 一键清理
+            commands::core_manager::core_workspace_dirty_reason,
+            // F36：venv 路径校验
+            config::service::config_validate_venv_path,
+            commands::core_manager::core_reset_staged,
+            commands::core_manager::core_force_clean_workspace,
+            // F36：版本兼容性预检（切版本前弹对话框用）
+            commands::core_manager::core_check_version_compatibility,
             // ModelPathManager
             commands::model_path::modelpath_generate,
             commands::model_path::modelpath_remove,

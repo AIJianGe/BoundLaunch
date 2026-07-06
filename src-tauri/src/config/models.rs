@@ -26,6 +26,12 @@ pub struct PathsConfig {
     ///
     /// v3.1（F26）：默认独立于 ComfyUI 仓库（位于 app_data_dir/data/venv），
     /// 切换 ComfyUI 版本时不影响 venv。详见 §F26 决策 1：路径布局 B。
+    ///
+    /// **v1.8 / F36 强约束**：`venv_path` 禁止放在 `src-tauri/` 子目录下！
+    /// 原因：Tauri dev 模式自动监视 `src-tauri/` 目录所有文件变化触发 rebuild。
+    /// `uv pip install` 修改 venv 内部文件（.lock、site-packages 等）会触发启动器重启，
+    /// 导致长任务（torch 安装）被打断、用户环境永远装不全。
+    /// 校验函数：[`crate::config::service::validate_paths`]
     pub venv_path: PathBuf,
     /// Python 版本（如 "3.11"）
     pub python_version: String,
@@ -38,6 +44,15 @@ pub struct PathsConfig {
     /// 切换 ComfyUI 版本时，会重新建立软链接关系，确保数据不丢失。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_path: Option<PathBuf>,
+    /// ComfyUI 仓库 URL（F31 新增）
+    ///
+    /// - `None`：使用默认常量 `COMFYUI_REPO_URL`（官方仓库）
+    /// - `Some(url)`：用户自定义仓库 URL（支持带 token 的私有仓库）
+    ///
+    /// 日志和 UI 显示时需脱敏（把 token 部分替换为 ***）。
+    /// 切换仓库地址时由 `core_set_repo_url` 命令写入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comfyui_repo_url: Option<String>,
 }
 
 /// 启动配置
@@ -256,6 +271,7 @@ impl Default for Config {
                 venv_path: PathBuf::new(),
                 python_version: "3.11".to_string(),
                 models_path: None,
+                comfyui_repo_url: None,
             },
             launch: LaunchConfig {
                 mode: LaunchMode::GpuHigh,
@@ -302,6 +318,18 @@ pub struct PathsConfigPatch {
     pub comfyui_root: Option<PathBuf>,
     pub venv_path: Option<PathBuf>,
     pub python_version: Option<String>,
+    /// v3.1 / F26：自定义 models 路径
+    ///
+    /// 语义：
+    /// - `None`（字段未提供）：跳过（不修改）
+    /// - `Some(空 PathBuf)`：清空自定义路径，恢复使用 `<comfyui_root>/models` 默认值
+    /// - `Some(非空 PathBuf)`：设置自定义 models 路径
+    ///
+    /// 前端约定：传 `""` 表示清空，传 `"D:/models"` 表示设置，不传字段表示跳过。
+    /// apply_paths_patch 中按 `path.as_os_str().is_empty()` 判断清空语义。
+    pub models_path: Option<PathBuf>,
+    /// F31：ComfyUI 仓库 URL
+    pub comfyui_repo_url: Option<String>,
 }
 
 /// Launch section 的 patch
@@ -361,6 +389,25 @@ pub fn apply_paths_patch(cfg: &mut PathsConfig, patch: PathsConfigPatch) {
     }
     if let Some(v) = patch.python_version {
         cfg.python_version = v;
+    }
+    // v3.1 / F26：models_path 三态语义
+    // - None：跳过（字段未提供）
+    // - Some(空)：清空自定义路径 → None（用默认 <comfyui_root>/models）
+    // - Some(非空)：设置自定义路径
+    if let Some(v) = patch.models_path {
+        if v.as_os_str().is_empty() {
+            cfg.models_path = None;
+        } else {
+            cfg.models_path = Some(v);
+        }
+    }
+    // F31：comfyui_repo_url
+    if let Some(v) = patch.comfyui_repo_url {
+        if v.is_empty() {
+            cfg.comfyui_repo_url = None;
+        } else {
+            cfg.comfyui_repo_url = Some(v);
+        }
     }
 }
 

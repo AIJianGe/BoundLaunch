@@ -8,7 +8,9 @@
 //! 详见 `PR/03-模块设计/02-PythonEnvManager.md`
 
 pub mod compatibility;
+pub mod freeze;
 pub mod models;
+pub mod recovery;
 pub mod torch_variant;
 pub mod uv_runner;
 pub mod verify;
@@ -55,6 +57,16 @@ impl PythonEnvService {
             event_bus,
             op_lock: Mutex::new(()),
         }
+    }
+
+    /// v1.8：访问 uv runner（recovery 模块用）
+    pub fn uv(&self) -> &UvRunner {
+        &self.uv
+    }
+
+    /// v1.8：访问 event bus（recovery 模块用）
+    pub fn event_bus_ref(&self) -> &EventBus {
+        &self.event_bus
     }
 
     /// uv 是否可用
@@ -212,13 +224,71 @@ impl PythonEnvService {
     }
 
     /// 安装 requirements.txt
+    ///
+    /// v3.2 修复：成功后 emit `RequirementsInstalled` 事件让 env cache 失效。
+    ///
+    /// 之前不 emit 任何事件，导致 30s 缓存命中陈旧的 deps 列表，
+    /// readiness 持续报"InstallRequirements 缺失"（用户体感：装完仍说未装）。
+    /// `install_torch` 一直有 emit `TorchInstalled`，但 `install_requirements` 漏了。
+    ///
+    /// v1.8：自动应用 freeze constraints 防止 numpy 等包装到坏版本。
     pub async fn install_requirements(
         &self,
         venv_path: &Path,
         requirements_file: &Path,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
-        self.uv.install_requirements(venv_path, requirements_file).await
+        let constraints = self.prepare_freeze_constraints(venv_path).await?;
+        self.uv.install_requirements(venv_path, requirements_file, Some(&constraints)).await?;
+
+        // v3.2：通知 EnvironmentInspector 失效 30s 缓存
+        self.event_bus.emit(SystemEvent::RequirementsInstalled);
+        tracing::info!(?requirements_file, "requirements installed");
+        Ok(())
+    }
+
+    /// v1.8 / F36：Preserve 模式专用
+    ///
+    /// 强制按新 constraints 重装（含 `--upgrade --force-reinstall`），用于切版本时
+    /// 让 pip 按新 requirements.txt 升级/降级包版本，避免 venv 残留旧版本。
+    ///
+    /// v1.8：自动应用 freeze constraints 防止 numpy 等包装到坏版本。
+    pub async fn install_requirements_upgrade(
+        &self,
+        venv_path: &Path,
+        requirements_file: &Path,
+    ) -> Result<(), EnvError> {
+        let _guard = self.op_lock.lock().await;
+        // 写入 constraints 到 venv（如已存在则覆盖更新）
+        let constraints = self.prepare_freeze_constraints(venv_path).await?;
+        self.uv.install_requirements_upgrade(venv_path, requirements_file, Some(&constraints)).await?;
+
+        // v3.2：通知 EnvironmentInspector 失效 30s 缓存
+        self.event_bus.emit(SystemEvent::RequirementsInstalled);
+        tracing::info!(?requirements_file, "requirements upgraded with --force-reinstall");
+        Ok(())
+    }
+
+    /// v1.8：准备 freeze constraints 文件
+    ///
+    /// 写入到 `<venv>/.freeze-constraints.txt`，返回路径。
+    /// 写入失败时降级返回 None（不阻塞主流程，warn 日志）。
+    pub async fn prepare_freeze_constraints(&self, venv_path: &Path) -> Result<std::path::PathBuf, EnvError> {
+        match crate::python_env::freeze::write_constraints_to_venv(venv_path) {
+            Ok(p) => Ok(p),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to write freeze constraints, proceeding without");
+                // 用一个空 constraints 文件占位
+                let placeholder = venv_path.join(".freeze-constraints.txt");
+                std::fs::write(&placeholder, "# empty\n").map_err(|e2| {
+                    EnvError::RequirementsInstallFailed(format!(
+                        "freeze constraints 写入失败: {} / 兜底也失败: {}",
+                        e, e2
+                    ))
+                })?;
+                Ok(placeholder)
+            }
+        }
     }
 
     /// 校验 venv 完整性
@@ -282,7 +352,8 @@ impl PythonEnvService {
         // 4. 装 requirements
         let req_file = comfyui_root.join("requirements.txt");
         if req_file.exists() {
-            self.uv.install_requirements(&venv_path, &req_file).await?;
+            let constraints = self.prepare_freeze_constraints(&venv_path).await?;
+            self.uv.install_requirements(&venv_path, &req_file, Some(&constraints)).await?;
         }
 
         // 5. 校验
@@ -372,7 +443,11 @@ impl PythonEnvService {
             .await;
         let req_file = comfyui_root.join("requirements.txt");
         if req_file.exists() {
-            if let Err(e) = self.uv.install_requirements(&venv_path, &req_file).await {
+            if let Err(e) = self
+                .uv
+                .install_requirements(&venv_path, &req_file, None)
+                .await
+            {
                 restore_backup(&venv_path, &backup_path).await;
                 return Err(e);
             }

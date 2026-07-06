@@ -46,6 +46,33 @@ impl ConfigService {
                         // 迁移后立即保存
                         save_to_disk(&path, &cfg).await?;
                     }
+                    // **v1.8 / F36 自动迁移**：检测 venv 路径是否在 src-tauri/ 下
+                    // 若是，自动改到 app_data_dir/data/venv，并把旧 venv 复制过去
+                    // 旧 venv 在 src-tauri/ 下会被 Tauri dev 监视触发 rebuild，
+                    // 复制到 app_data_dir 下彻底解决问题
+                    if let Err(reason) = validate_venv_path_not_under_src_tauri(&cfg.paths.venv_path) {
+                        tracing::warn!(
+                            old_venv = %cfg.paths.venv_path.display(),
+                            reason = %reason,
+                            "F36: venv 在 src-tauri/ 下，自动迁移到 app_data_dir"
+                        );
+                        let old_venv = cfg.paths.venv_path.clone();
+                        let new_venv = paths::app_data_dir().join("data").join("venv");
+                        // 若旧 venv 存在且新 venv 不存在 → 移动过去（保留用户的依赖）
+                        if old_venv.exists() && !new_venv.exists() {
+                            if let Err(e) = migrate_venv_dir(&old_venv, &new_venv).await {
+                                tracing::error!(error = %e, "F36: 迁移 venv 失败，将创建新 venv");
+                            } else {
+                                tracing::info!(
+                                    from = %old_venv.display(),
+                                    to = %new_venv.display(),
+                                    "F36: venv 迁移成功"
+                                );
+                            }
+                        }
+                        cfg.paths.venv_path = new_venv;
+                        save_to_disk(&path, &cfg).await?;
+                    }
                     cfg
                 }
                 Err(e) => {
@@ -146,6 +173,74 @@ async fn save_to_disk(path: &Path, config: &Config) -> Result<(), ConfigError> {
         .map_err(|e| ConfigError::IoError(e.to_string()))
 }
 
+/// **v1.8 / F36**：把 venv 目录从 src-tauri/ 下迁移到 app_data_dir
+///
+/// 行为：使用 tokio::fs::rename（如果同盘）或递归复制（跨盘）
+async fn migrate_venv_dir(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
+    if let Some(parent) = to.parent() {
+        paths::ensure_dir(parent)
+            .await
+            .map_err(|e| format!("创建父目录失败: {}", e))?;
+    }
+    // 先尝试 rename（同盘极快）
+    match tokio::fs::rename(from, to).await {
+        Ok(()) => return Ok(()),
+        Err(_) => {
+            // 跨盘 → 递归复制
+            copy_dir_recursive(from, to).await?;
+            // 复制成功后删旧目录
+            let _ = tokio::fs::remove_dir_all(from).await;
+        }
+    }
+    Ok(())
+}
+
+async fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
+    tokio::fs::create_dir_all(to)
+        .await
+        .map_err(|e| format!("创建 {} 失败: {}", to.display(), e))?;
+    let mut entries = tokio::fs::read_dir(from)
+        .await
+        .map_err(|e| format!("读取 {} 失败: {}", from.display(), e))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        let ft = entry.file_type().await.map_err(|e| e.to_string())?;
+        let dest = to.join(entry.file_name());
+        if ft.is_dir() {
+            Box::pin(copy_dir_recursive(&entry.path(), &dest)).await?;
+        } else if ft.is_symlink() {
+            // 软链接：复制链接本身
+            let target = tokio::fs::read_link(&entry.path())
+                .await
+                .map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            tokio::fs::symlink(&target, &dest)
+                .await
+                .map_err(|e| e.to_string())?;
+            #[cfg(windows)]
+            {
+                if target.is_dir() {
+                    tokio::fs::symlink_dir(&target, &dest)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    tokio::fs::symlink_file(&target, &dest)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        } else {
+            tokio::fs::copy(&entry.path(), &dest)
+                .await
+                .map_err(|e| format!("复制 {} 失败: {}", entry.path().display(), e))?;
+        }
+    }
+    Ok(())
+}
+
 /// 构造默认 Config，并将空路径字段填充为 launcher 工作目录
 ///
 /// 与 `Config::default()` 区别：
@@ -161,8 +256,9 @@ fn build_default_config() -> Config {
 /// 将空路径字段填充为 launcher 工作目录
 ///
 /// 规则：
-/// - `comfyui_root` 为空 → 设置为 launcher 工作目录
-/// - `venv_path` 为空 → 设置为 `${comfyui_root}/venv`（此时 comfyui_root 一定非空）
+/// - `comfyui_root` 为空 → 设置为 launcher 工作目录的 `ComfyUI` 子目录
+/// - `venv_path` 为空 → 设置为 `<app_data_dir>/data/venv`（v3.1 / F26 决策 1：venv 独立于 ComfyUI 仓库）
+/// - `models_path` 不在此处设置（保持 `None`，由用户在设置页显式配置）
 ///
 /// 已配置的路径不会被覆盖（保证老用户的 config.toml 不会被打乱）。
 fn apply_default_paths(cfg: &mut Config) {
@@ -176,8 +272,12 @@ fn apply_default_paths(cfg: &mut Config) {
     if cfg.paths.comfyui_root.as_os_str().is_empty() {
         cfg.paths.comfyui_root = launcher_dir.join("ComfyUI");
     }
+    // v3.1 / F26 决策 1：venv 独立于 ComfyUI 仓库
+    //   - 旧版默认 `<comfyui_root>/venv` 切版本时会被 git 操作影响
+    //   - 新版默认 `<app_data_dir>/data/venv`，跨版本切换 ComfyUI 不影响 venv
+    //   - 用户已配置的路径保留不动（向后兼容）
     if cfg.paths.venv_path.as_os_str().is_empty() {
-        cfg.paths.venv_path = cfg.paths.comfyui_root.join("venv");
+        cfg.paths.venv_path = paths::app_data_dir().join("data").join("venv");
     }
 }
 
@@ -195,7 +295,59 @@ fn validate(cfg: &Config) -> Result<(), AppError> {
             value: "(empty)".into(),
         }.into());
     }
+    // **v1.8 / F36**：venv 路径不能在 src-tauri/ 子目录下
+    // 原因：Tauri dev 自动监视 src-tauri/ 触发 rebuild，破坏 venv 安装长任务
+    validate_venv_path_not_under_src_tauri(&cfg.paths.venv_path)?;
     Ok(())
+}
+
+/// **v1.8 / F36**：校验 venv 路径不在 src-tauri/ 子目录下
+///
+/// 场景：早期版本默认把 venv 放在 `src-tauri/venv/`，Tauri dev file watcher 会
+/// 监视 src-tauri/ 下所有文件变化触发 rebuild，导致 uv pip install 改 venv 时
+/// 整个启动器被重启，torch 安装永远装不全。
+///
+/// 修复：拒绝 venv 在 src-tauri/ 下的配置，让用户改到独立位置（如 app_data_dir/data/venv）。
+pub fn validate_venv_path_not_under_src_tauri(venv_path: &std::path::Path) -> Result<(), AppError> {
+    if venv_path.as_os_str().is_empty() {
+        return Ok(()); // 空路径在 build_default_config 阶段填充，这里不阻塞
+    }
+    // 通过 CARGO_MANIFEST_DIR 环境变量（编译时）拿 src-tauri 的绝对路径
+    // 也可以运行时通过当前可执行文件回溯：env!("CARGO_MANIFEST_DIR")
+    let src_tauri_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let venv_abs = match std::fs::canonicalize(venv_path) {
+        Ok(p) => p,
+        Err(_) => {
+            // 路径不存在（首次配置）→ 不阻塞，等创建后再校验
+            return Ok(());
+        }
+    };
+    if venv_abs.starts_with(src_tauri_dir) {
+        return Err(ConfigError::InvalidValue {
+            field: "paths.venv_path".into(),
+            value: format!(
+                "{}（在 src-tauri/ 下，会被 Tauri dev 监视触发启动器重启）",
+                venv_path.display()
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// **v1.8 / F36**：Tauri 命令——前端调用获取 venv 路径是否合法
+///
+/// 用途：启动时 + 设置页保存 venv 路径后调用
+/// 返回：None = 合法；Some(reason) = 不合法原因
+#[tauri::command]
+pub async fn config_validate_venv_path(
+    state: tauri::State<'_, crate::app_state::AppState>,
+) -> Result<Option<String>, String> {
+    let venv_path = state.config.get().paths.venv_path.clone();
+    match validate_venv_path_not_under_src_tauri(&venv_path) {
+        Ok(()) => Ok(None),
+        Err(e) => Ok(Some(e.to_string())),
+    }
 }
 
 /// 内部：识别这次 update 影响的主要 section（用于事件订阅者过滤）

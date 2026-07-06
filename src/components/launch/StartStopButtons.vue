@@ -1,58 +1,55 @@
 <script setup lang="ts">
 /**
- * 启动 / 停止按钮（单按钮 + 6 态状态机）
+ * 启动 / 停止按钮（单按钮 + 6 态状态机，v3.2 极简化）
  *
  * 详见 `PR/06-界面设计.md §3.2 启动停止按钮`
  *
- * 单按钮（启动/停止合一），按状态机切换 label / type / 行为：
+ * v3.2 变更（F25 绘世启动器哲学）：
+ * - 移除 `needs_setup` / `installing` 分支（首页不再触发安装）
+ * - 安装入口统一收归到「设置 → 路径配置」PathsPanel
+ * - 按钮只显示"启动"或"停止"，保持启动器极简
+ * - 环境未就绪时：按钮仍显示"▶ 启动"，sublabel 提示去设置页，点击 toast 引导
+ *
+ * 单按钮状态机（按优先级排序）：
  *
  * | 状态 | label | type | 点击行为 |
  * |---|---|---|---|
- * | `exiting` | "🚪 正在退出..." | default | loading disabled（F24 退出流程中，禁用所有按钮） |
- * | `env_switching` | "⏳ 环境切换中..." | warning | loading disabled |
- * | `needs_setup` | "⚙ 一键安装环境" | warning | 按 missing_steps 顺序自动补齐 |
- * | `installing` | "⏳ 正在安装..." | warning | loading disabled，订阅 task 进度 |
+ * | `exiting` | "🚪 正在退出..." | default | loading disabled（F24 退出流程中） |
+ * | `env_switching` | "⏳ 环境切换中..." | warning | loading disabled（torch 切换等） |
  * | `starting` | "▶ 启动中..." | primary | loading disabled（process 启动中） |
  * | `running` | "■ 停止" | error | 弹 confirm → 调 processStore.stop() |
- * | `stopped` | "▶ 启动" | success | 再次校验 readiness → 调 processStore.start() |
  * | `crashed` | "↻ 重启" | error | 校验 readiness → processStore.start() |
+ * | `stopped` | "▶ 启动" | success | 校验 readiness → processStore.start() |
  *
  * 幂等性：
- * - exiting/env_switching/installing/starting 状态点击 no-op（按钮 disabled）
- * - stopped 状态点启动：会再次校验 readiness，避免在后台 install 完前误启动
+ * - exiting/env_switching/starting 状态点击 no-op（按钮 disabled）
+ * - stopped 状态点启动：会再次校验 readiness，未就绪则 toast 引导去设置页
  * - running 状态点停止：processStore.stop() 后端已幂等
  *
  * 优先级（自上而下）：
- * exiting > env_switching > installing > starting > running > needs_setup > crashed > stopped
+ * exiting > env_switching > starting > running > crashed > stopped
  */
 
-import { computed, ref } from "vue";
+import { computed } from "vue";
 import { NButton, NSpin } from "naive-ui";
 import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
 import { useToast } from "@/composables/useToast";
+import { useConfirm } from "@/composables/useConfirm";
 import { useEnvInstaller } from "@/composables/useEnvInstaller";
-import type { ReadinessStep } from "@/api/types";
 
 const processStore = useProcessStore();
 const envStore = useEnvStore();
 const toast = useToast();
-
-// v2.14：使用 composable 共享补装逻辑
-const {
-  installing,
-  currentStep: installStage,
-  installMissingSteps,
-} = useEnvInstaller();
+const { confirm: showConfirm } = useConfirm();
+const { installMissingSteps, installing: installingEnv } = useEnvInstaller();
 
 /** 6 态枚举（按优先级排序） */
 type ButtonState =
   | "exiting"
   | "env_switching"
-  | "installing"
   | "starting"
   | "running"
-  | "needs_setup"
   | "crashed"
   | "stopped";
 
@@ -60,25 +57,30 @@ type ButtonState =
 const currentState = computed<ButtonState>(() => {
   // 1. F24 退出流程中（最高优先级，禁用所有按钮）
   if (processStore.isExiting) return "exiting";
-  // 2. 正在按缺失步骤引导安装（本地状态）
-  if (installing.value) return "installing";
+  // 2. 环境切换中（torch 切换等，由 envStore.switchingTorch 驱动）
+  if (envStore.switchingTorch) return "env_switching";
   // 3. 启动中（process 状态机驱动）
   if (processStore.isStarting) return "starting";
   // 4. 运行中
   if (processStore.isRunning) return "running";
   // 5. 进程崩溃（可重启）
   if (processStore.isCrashed) return "crashed";
-  // 6. 环境未就绪（readiness.ready === false 且 readiness 已被加载过）
-  if (
-    envStore.isLoaded &&
-    envStore.readiness !== null &&
-    !envStore.readiness.ready
-  ) {
-    return "needs_setup";
-  }
-  // 7. 已就绪，未运行
+  // 6. 已就绪或未就绪，统一归 stopped 态（未就绪由 sublabel + 点击 toast 引导）
   return "stopped";
 });
+
+/**
+ * 环境是否未就绪（用于 sublabel 提示）
+ *
+ * 仅在 stopped / crashed 态有意义：判断是否需要引导用户去设置页补装。
+ * readiness === null 时不视为未就绪（可能还在加载，避免误报）。
+ */
+const envNotReady = computed(
+  () =>
+    envStore.isLoaded &&
+    envStore.readiness !== null &&
+    !envStore.readiness.ready,
+);
 
 /** 按钮配置 */
 const buttonConfig = computed(() => {
@@ -91,12 +93,12 @@ const buttonConfig = computed(() => {
         label: "🚪 正在退出",
         showSublabel: true,
       };
-    case "installing":
+    case "env_switching":
       return {
         type: "warning" as const,
         loading: true,
         disabled: true,
-        label: "⏳ 正在安装",
+        label: "⏳ 环境切换中",
         showSublabel: true,
       };
     case "starting":
@@ -115,16 +117,6 @@ const buttonConfig = computed(() => {
         label: "■ 停止",
         showSublabel: false,
       };
-    case "needs_setup":
-      // v2.14：按钮文案按 missing_steps 动态调整
-      // 单一缺失步骤用更精确的描述
-      return {
-        type: "warning" as const,
-        loading: false,
-        disabled: false,
-        label: needsSetupLabel.value,
-        showSublabel: true,
-      };
     case "crashed":
       return {
         type: "error" as const,
@@ -139,52 +131,27 @@ const buttonConfig = computed(() => {
         loading: false,
         disabled: false,
         label: "▶ 启动",
-        showSublabel: false,
+        showSublabel: true, // 改为 true 以便未就绪时显示提示
       };
   }
 });
 
-/** needs_setup 状态下的按钮文案（v2.14：按 missing_steps 动态调整） */
-const needsSetupLabel = computed(() => {
-  const steps = envStore.readiness?.missing_steps ?? [];
-  if (steps.length === 0) return "⚙ 一键安装环境";
-  if (steps.length === 1) {
-    return `⚙ ${stageLabel(steps[0])}`;
-  }
-  return "⚙ 一键补装环境";
-});
-
-/** 副标题（缺失步骤或崩溃原因） */
+/** 副标题（未就绪提示 / 退出/切换中说明 / 崩溃原因） */
 const sublabel = computed(() => {
   if (currentState.value === "exiting") {
     return "正在停止 ComfyUI 进程组并释放资源...";
   }
-  if (currentState.value === "installing") {
-    return installStage.value;
-  }
-  if (currentState.value === "needs_setup") {
-    const steps = envStore.readiness?.missing_steps ?? [];
-    return steps.map(stageLabel).join(" → ");
+  if (currentState.value === "env_switching") {
+    return "正在切换 torch 变体，请稍候...";
   }
   if (currentState.value === "crashed") {
     return processStore.error || "ComfyUI 进程已崩溃";
   }
+  if (currentState.value === "stopped" && envNotReady.value) {
+    return "⚠ 环境未就绪，请前往「设置 → 路径配置」点击「一键补装」";
+  }
   return "";
 });
-
-/** 单个缺失步骤的简明描述 */
-function stageLabel(step: ReadinessStep): string {
-  switch (step.kind) {
-    case "CloneComfyUI":
-      return "克隆 ComfyUI";
-    case "CreateVenv":
-      return `创建 venv (Python ${step.params.python_version})`;
-    case "InstallTorch":
-      return `安装 torch (${step.params.cuda_version})`;
-    case "InstallRequirements":
-      return "安装依赖";
-  }
-}
 
 // ========== Actions ==========
 
@@ -192,15 +159,12 @@ function stageLabel(step: ReadinessStep): string {
 async function onClick() {
   switch (currentState.value) {
     case "exiting":
-    case "installing":
+    case "env_switching":
     case "starting":
       // 这些状态下按钮已 disabled，这里只是兜底
       return;
     case "running":
       await onStop();
-      return;
-    case "needs_setup":
-      await onInstallEnv();
       return;
     case "crashed":
     case "stopped":
@@ -216,16 +180,63 @@ async function onStart() {
     toast.info("ComfyUI 已在运行中");
     return;
   }
+
+  // v3.2.1 关键修复：先强制刷新 envInfo 和 readiness
+  // - 之前只调 checkReadiness()，envInfo 仍是旧路径数据（PYTORCH 显示旧值）
+  // - 修复后 envInfo 与 readiness 来自同一份最新 inspect 结果
+  try {
+    await envStore.invalidateCache();
+    await envStore.refresh();
+    await envStore.checkReadiness();
+  } catch (e) {
+    console.warn("[start] precheck failed:", e);
+  }
+
   // 守卫 2: 环境就绪（再次校验，避免后台 install 期间误启动）
   if (!envStore.readiness?.ready) {
-    // 重新 check 一次（可能 store 缓存过期）
-    try {
-      await envStore.checkReadiness();
-    } catch (e) {
-      console.warn("[start] recheck readiness failed:", e);
-    }
-    if (!envStore.readiness?.ready) {
-      toast.error("环境未就绪", "请先点击「一键安装环境」");
+    // v3.2.1 关键改进：检查是否 venv 不存在
+    // - 用户改 venv 路径后新路径下没 venv（v3.2 之前版本行为）
+    // - 弹窗引导用户立即创建，比单纯 toast 引导去设置页更直接
+    const missingKinds = envStore.readiness?.missing_steps?.map(s => s.kind) ?? [];
+    if (missingKinds.includes("CreateVenv") && !installingEnv.value) {
+      const venvPath = envStore.envInfo?.venv_path ?? "(未知)";
+      const ok = await showConfirm({
+        title: "检测到 venv 目录不存在",
+        content:
+          `当前 venv 路径：${venvPath}\n\n` +
+          "该路径下未检测到 venv，无法启动 ComfyUI。\n\n" +
+          "立即创建 venv 并安装依赖？\n" +
+          "（含创建 venv + 安装 PyTorch + 安装 ComfyUI 依赖，预计 5-15 分钟）",
+        positiveText: "立即创建",
+        negativeText: "取消",
+      });
+      if (ok) {
+        const success = await installMissingSteps();
+        if (success) {
+          // 安装完成后再 check 一次
+          await envStore.checkReadiness();
+          if (!envStore.readiness?.ready) {
+            toast.error("环境未就绪", "安装过程中出现问题，请到「设置 → 路径配置」查看详情");
+            return;
+          }
+        } else {
+          toast.error("环境安装失败", "请到「设置 → 路径配置」重试");
+          return;
+        }
+      } else {
+        // 取消：明确告知去设置页（更具体的引导）
+        toast.error(
+          "环境未就绪",
+          `请前往「设置 → 路径配置」\n手动操作 venv 路径或点击「一键补装」`,
+        );
+        return;
+      }
+    } else {
+      // v3.2：未就绪时引导用户去设置页（首页不再触发安装）
+      toast.error(
+        "环境未就绪",
+        "请前往「设置 → 路径配置」点击「一键补装」",
+      );
       return;
     }
   }
@@ -267,11 +278,6 @@ async function onStop() {
     toast.error("停止失败", e);
   }
 }
-
-/** 一键引导安装（v2.14：委托给 useEnvInstaller composable） */
-async function onInstallEnv() {
-  await installMissingSteps();
-}
 </script>
 
 <template>
@@ -289,9 +295,9 @@ async function onInstallEnv() {
         {{ buttonConfig.label }}
       </NButton>
 
-      <!-- 旁置指示：启动中 / 停止中 -->
+      <!-- 旁置指示：启动中 / 环境切换中 -->
       <div
-        v-if="currentState === 'starting' || currentState === 'installing'"
+        v-if="currentState === 'starting' || currentState === 'env_switching'"
         class="side-indicator indicator-warning"
       >
         <NSpin size="small" />

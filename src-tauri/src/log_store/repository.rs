@@ -312,6 +312,80 @@ impl<'a> TaskRepository<'a> {
             .await?;
         Ok(result.rows_affected())
     }
+
+    /// v1.8 / F36：把 status='running' 的历史任务标记为 failed（启动器崩溃恢复）
+    ///
+    /// 场景：上次启动器在 torch 安装时崩溃，DB 里残留 status='running' 记录
+    /// 启动时调用此函数把这些"孤儿"任务标记为 failed 并附原因
+    pub async fn fail_orphaned_running_tasks(
+        &self,
+        reason: &str,
+    ) -> Result<u64, LogStoreError> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE task_history
+             SET status = 'failed', completed_at = ?, error = ?
+             WHERE status = 'running'",
+        )
+        .bind(&now)
+        .bind(reason)
+        .execute(self.pool)
+        .await?;
+        let count = result.rows_affected();
+        if count > 0 {
+            tracing::warn!(
+                count,
+                reason,
+                "F36: marked orphaned running tasks as failed (previous launcher crashed)"
+            );
+        }
+        Ok(count)
+    }
+
+    /// v1.8 / F36：插入 running 状态记录（任务开始时调用）
+    pub async fn append_running(
+        &self,
+        kind: &str,
+        name: &str,
+        started_at: chrono::DateTime<Utc>,
+    ) -> Result<i64, LogStoreError> {
+        let result = sqlx::query(
+            "INSERT INTO task_history(kind, name, status, started_at, completed_at, error)
+             VALUES (?, ?, 'running', ?, NULL, NULL)",
+        )
+        .bind(kind)
+        .bind(name)
+        .bind(started_at.to_rfc3339())
+        .execute(self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    /// v1.8 / F36：把 running 状态改为 terminal 状态（成功/失败/取消）
+    pub async fn mark_terminal_by_kind_name(
+        &self,
+        kind: &str,
+        name: &str,
+        started_at: chrono::DateTime<Utc>,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), LogStoreError> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE task_history
+             SET status = ?, completed_at = ?, error = ?
+             WHERE kind = ? AND name = ? AND started_at = ? AND status = 'running'",
+        )
+        .bind(status)
+        .bind(&now)
+        .bind(error)
+        .bind(kind)
+        .bind(name)
+        .bind(started_at.to_rfc3339())
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 // ───────────────────────── 内部行类型 ─────────────────────────

@@ -208,6 +208,8 @@ mod tests {
                 comfyui_root: PathBuf::from("/tmp/comfyui"),
                 venv_path: PathBuf::from("/tmp/venv"),
                 python_version: "3.11".into(),
+                models_path: None,
+                comfyui_repo_url: None,
             },
             launch: LaunchConfig {
                 mode,

@@ -6,6 +6,9 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
+use serde::Serialize;
+use serde_json::Value;
+
 use crate::error::EnvError;
 
 /// 子进程默认超时（秒）
@@ -32,8 +35,28 @@ const PROBE_TORCH_TIMEOUT_SECS: u64 = 90;
 /// 探查 torch 的 Python 脚本
 ///
 /// 输出 JSON：`{"torch": {...}, "platform": {...}}`
+///
+/// **v1.8 关键修复（torch "已装但显示未装" 问题）**：
+/// 之前的 `except ImportError` 会默默吞掉所有 `import torch` 失败的真实原因
+/// （如 numpy 2.4.4 wheel 缺 `exceptions.py` 导致 `import torch` 抛 ImportError，
+/// 或 torch C 扩展加载失败抛 RuntimeError），前端只看到 `installed: false`，
+/// 用户不知道为什么。
+///
+/// 现在：
+/// 1. catch 所有 Exception（不再只 catch ImportError）
+/// 2. 把错误类型 / 消息 / traceback 一并写入 JSON
+/// 3. 前端 StatusCard 看到 `_error_type` 时直接显示原文
+///
+/// JSON 结构：
+/// - 成功：`{"torch": {"installed": true, "version": ..., "cuda_available": ...}}`
+/// - 失败：`{"torch": {"installed": false, "_error_type": "ImportError",
+///                    "_error_msg": "...", "_traceback": "..."}}`
+///
+/// ⚠ 下划线开头的字段前端 JSON 反序列化时会被 TS 类型忽略（TS 类型只有
+/// installed / version / cuda_available 等），但通过 raw JSON 透传给 StatusCard
+/// 的诊断面板（见 frontend/src/components/launch/StatusCard.vue）。
 const PROBE_TORCH_SCRIPT: &str = r#"
-import sys, json, platform
+import sys, json, platform, traceback
 try:
     import torch
     torch_info = {
@@ -46,8 +69,18 @@ try:
         "total_memory_mb": (torch.cuda.get_device_properties(0).total_memory // (1024*1024))
                           if torch.cuda.is_available() else None,
     }
-except ImportError:
-    torch_info = {"installed": False}
+except Exception as e:
+    # 关键：捕获所有异常（不再只 catch ImportError），暴露真实失败原因
+    # 典型场景：
+    # - ImportError: numpy 2.4.4 wheel 缺 exceptions.py → import torch 失败
+    # - RuntimeError: torch C 扩展加载失败（CUDA driver 不匹配等）
+    # - OSError: torch 共享库加载失败
+    torch_info = {
+        "installed": False,
+        "_error_type": type(e).__name__,
+        "_error_msg": str(e)[:500],  # 截断防止 traceback 过长
+        "_traceback": traceback.format_exc()[-500:],  # 取最后 500 字符（最有信息量的栈底）
+    }
 result = {
     "torch": torch_info,
     "platform": {"system": platform.system(), "release": platform.release()},
@@ -296,6 +329,107 @@ async fn run_pip_list_fallback(python: &Path) -> Result<String, EnvError> {
 /// v2.11：使用 `PROBE_TORCH_TIMEOUT_SECS`（90s）而非默认 30s
 pub async fn probe_torch_script(venv_path: &Path) -> Result<String, EnvError> {
     run_python_script(venv_path, PROBE_TORCH_SCRIPT, PROBE_TORCH_TIMEOUT_SECS).await
+}
+
+/// v1.8：torch 探针原始结果（带错误详情）
+///
+/// **关键**：区分 "torch 真的没装"（installed=false 且无 _error_type）
+/// 和 "torch 装了但 import 失败"（installed=false 且有 _error_type）。
+/// 前端应给后者提供"诊断"按钮（RecoveryWizard 入口）。
+///
+/// 字段说明：
+/// - `installed`：是否能成功 import torch
+/// - `version` / `cuda_available` 等：仅在 installed=true 时有值
+/// - `error_type` / `error_msg` / `traceback`：仅在 installed=false 且 import 抛异常时有值
+#[derive(Debug, Clone, Serialize)]
+pub struct TorchProbeResult {
+    pub installed: bool,
+    pub version: Option<String>,
+    pub cuda_available: bool,
+    pub cuda_version: Option<String>,
+    pub device_name: Option<String>,
+    /// 错误类型（如 "ImportError" / "RuntimeError"）
+    pub error_type: Option<String>,
+    /// 错误消息（截断到 500 字符）
+    pub error_msg: Option<String>,
+    /// traceback 末尾（截断到 500 字符）
+    pub traceback_tail: Option<String>,
+}
+
+/// 解析 torch 探针 JSON 输出
+///
+/// 不会失败（解析失败时返回 installed=false，所有可选字段 None）
+pub fn parse_torch_probe(json_output: &str) -> TorchProbeResult {
+    let mut result = TorchProbeResult {
+        installed: false,
+        version: None,
+        cuda_available: false,
+        cuda_version: None,
+        device_name: None,
+        error_type: None,
+        error_msg: None,
+        traceback_tail: None,
+    };
+    let parsed: Value = match serde_json::from_str(json_output) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "torch probe json parse failed");
+            // 解析失败 → 把原文存到 error_msg（极少见，但能帮用户看到 "JSON 烂了"）
+            result.error_type = Some("JsonParseError".to_string());
+            result.error_msg = Some(json_output.chars().take(200).collect());
+            return result;
+        }
+    };
+    let torch = parsed.get("torch");
+    if let Some(t) = torch {
+        if t.get("installed").and_then(|v| v.as_bool()) == Some(true) {
+            result.installed = true;
+            result.version = t.get("version").and_then(|v| v.as_str()).map(String::from);
+            result.cuda_available = t.get("cuda_available").and_then(|v| v.as_bool()).unwrap_or(false);
+            result.cuda_version = t.get("cuda_version").and_then(|v| v.as_str()).map(String::from);
+            result.device_name = t.get("device_name").and_then(|v| v.as_str()).map(String::from);
+        } else {
+            // installed=false → 读错误详情（如果有）
+            result.error_type = t.get("_error_type").and_then(|v| v.as_str()).map(String::from);
+            result.error_msg = t.get("_error_msg").and_then(|v| v.as_str()).map(String::from);
+            result.traceback_tail = t.get("_traceback").and_then(|v| v.as_str()).map(String::from);
+        }
+    }
+    result
+}
+
+/// v1.8 / F36：快速读 torch variant（cu118/cu121/cu124/cpu）
+///
+/// 用于版本切换兼容性预检。直接解析 `version.py` 而不跑 python（避免 90s 探查超时）。
+/// 返回 None 表示未安装 torch。
+pub fn read_torch_variant_fast(venv_path: &Path) -> Option<String> {
+    // 候选路径
+    let candidates = [
+        venv_path.join("Lib/site-packages/torch/version.py"),  // Windows
+        venv_path.join("lib/python3.11/site-packages/torch/version.py"),  // Linux
+        venv_path.join("lib/python3.10/site-packages/torch/version.py"),
+        venv_path.join("lib/python3.12/site-packages/torch/version.py"),
+    ];
+    let content = candidates
+        .iter()
+        .filter(|p| p.exists())
+        .next()
+        .and_then(|p| std::fs::read_to_string(p).ok())?;
+    // 找 __version__ = '2.4.0+cu121' 行
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("__version__") {
+            if let Some(eq_pos) = trimmed.find('=') {
+                let val = trimmed[eq_pos + 1..].trim().trim_matches(|c| c == '\'' || c == '"');
+                // val 形如 "2.4.0+cu121" 或 "2.4.0"
+                if let Some(plus_pos) = val.find('+') {
+                    return Some(val[plus_pos + 1..].to_string());
+                }
+                return Some("cpu".to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

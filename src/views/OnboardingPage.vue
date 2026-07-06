@@ -85,8 +85,14 @@ onMounted(async () => {
       // 统一用 forward-slash（Windows / POSIX 都接受）
       form.comfyui_root = `${workDir}/ComfyUI`;
     }
+    // v3.2.1：venv 默认路径改到 ComfyUI 外
+    // - 之前默认 `<comfyui_root>/venv`，venv 嵌套在 ComfyUI 内
+    // - 嵌套问题：ComfyUI 是 git 仓库，venv 在内部会被 git status 看到
+    //            切换 ComfyUI 版本（决策 5 工作区干净）时易冲突
+    // - 改为 `<workdir>/venv`，与 ComfyUI 同级但独立
+    // - 用户可在向导第 2 步自由调整
     if (!form.venv_path) {
-      form.venv_path = `${form.comfyui_root}/venv`;
+      form.venv_path = `${workDir}/venv`;
     }
   } catch (e) {
     console.warn("[onboarding] failed to get launcher working dir:", e);
@@ -416,7 +422,7 @@ class InitStageError extends Error {
           <NFormItem label="venv 虚拟环境路径">
             <FolderPicker
               v-model="form.venv_path"
-              :placeholder="form.comfyui_root ? `${form.comfyui_root}/venv` : '如 D:\\AIWork\\ComfyUI\\venv'"
+              :placeholder="form.comfyui_root ? `${form.comfyui_root}/../venv` : '如 D:\\AIWork\\venv'"
               dialog-title="选择 venv 虚拟环境路径"
               clearable
               size="medium"
@@ -431,9 +437,14 @@ class InitStageError extends Error {
             ⚠ venv 路径不能与 ComfyUI 根目录相同
           </span>
           <span v-else>
-            venv 是 ComfyUI 专用的 Python 运行环境目录，程序会在此自动下载 Python
-            并安装所需依赖（如 torch）。请选择空文件夹或新路径（程序会自动创建），
-            请勿指向系统已有的 Python 安装目录。
+            <strong>建议：</strong>将 venv 放在
+            <code>ComfyUI</code>
+            外部（如与 ComfyUI 同级的 venv 目录）。<br />
+            • 避免污染 ComfyUI 仓库的 git 状态<br />
+            • 切换 ComfyUI 版本时无需处理 venv<br />
+            venv 是 ComfyUI 专用的 Python 运行环境目录，程序会在此自动下载
+            Python 并安装所需依赖（如 torch）。请选择空文件夹或新路径
+            （程序会自动创建），请勿指向系统已有的 Python 安装目录。
           </span>
         </NAlert>
       </div>

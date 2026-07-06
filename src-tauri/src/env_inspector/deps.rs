@@ -13,10 +13,17 @@ use crate::error::EnvError;
 /// 关键依赖清单（固定常量）
 ///
 /// (包名, 用途说明)
+///
+/// v3.2 修复：**移除 torch / torchvision / torchaudio**
+///
+/// 原因：
+/// - 这三个包由 `InstallTorch` 步骤单独安装（不在 ComfyUI requirements.txt 中）
+/// - ComfyUI 官方文档明确说"请先单独装 torch"
+/// - 之前把它们留在 KEY_DEPENDENCIES 中，导致 venv 没装 torch 时，readiness
+///   同时报 `InstallTorch` 和 `InstallRequirements` 两个步骤缺失（误报）
+/// - 拆解后：torch 由 `InstallTorch` 步骤管，ComfyUI 运行时其他依赖由 `InstallRequirements` 管
 pub const KEY_DEPENDENCIES: &[(&str, &str)] = &[
-    ("torch", "PyTorch 核心"),
-    ("torchvision", "视觉模型库"),
-    ("torchaudio", "音频库"),
+    // torch / torchvision / torchaudio：已移除（v3.2）
     ("torchsde", "随机微分方程求解器"),
     ("safetensors", "模型文件加载"),
     ("transformers", "CLIP / 文本编码"),
@@ -146,11 +153,19 @@ pub fn build_dependency_list(
         .collect()
 }
 
-/// 简化版本满足判断（仅解析 `==` 与 `>=` 约束的「主版本」）
+/// 简化版本满足判断
 ///
 /// 复杂约束（如 `>=1.0,<2.0,!=1.5`）按简化规则处理：
 /// - 提取首个版本号与 installed 比较
 /// - 不实现完整 PEP 440 解析器（依赖 packaging 库会引入额外依赖）
+///
+/// v3.2.1 关键修复：
+/// 1. **支持 `~=` 约束**（PEP 440 compatible release）
+///    - 例如 `pydantic~=2.0` 等价于 `>=2.0, <3.0`
+///    - 之前未处理，导致 pydantic 2.13.4 误判为 NeedsUpgrade
+/// 2. **用元组比较替代字符串比较**
+///    - 字符串 `"0.10.0" >= "0.7.0"` 在 ASCII 比较下错误（'1' < '7'）
+///    - 元组比较 `[0,10,0] >= [0,7,0]` 正确（数值 10 > 7）
 fn version_satisfies(installed: &str, required: &str) -> bool {
     // 提取 required 中的版本号
     let required_version = extract_version_number(required);
@@ -161,16 +176,79 @@ fn version_satisfies(installed: &str, required: &str) -> bool {
         return true;
     }
 
-    // 简化：字符串相等即满足（不实现完整版本比较）
-    // 若 required 用 >= 约束，要求 installed 版本字符串 >= required
     if required.starts_with(">=") {
-        return installed_version >= required_version;
+        return version_gte(&installed_version, &required_version);
     }
     if required.starts_with("==") {
         return installed_version == required_version;
     }
+    if required.starts_with("~=") {
+        // PEP 440 compatible release: ~=X.Y[.Z] 等价于 >=X.Y[.Z], <(X+1).0
+        // 例如 ~=2.0 → [2,0) 即 >=2.0, <3.0
+        let parts: Vec<&str> = required_version.split('.').collect();
+        if parts.is_empty() {
+            return true;
+        }
+        let major: u32 = parts[0].parse().unwrap_or(0);
+        let upper = format!("{}.0", major + 1);
+        return version_gte(&installed_version, &required_version)
+            && version_lt(&installed_version, &upper);
+    }
     // 默认按「相等」处理
     installed_version == required_version
+}
+
+/// 从版本字符串中解析出 (major, minor, patch, ...) 数值元组
+///
+/// - "2.13.4" → [2, 13, 4]
+/// - "0.7.1" → [0, 7, 1]
+/// - "" → []
+///
+/// 容错：解析失败的段跳过（不报错），用于版本号末尾的预发布标签如 "1.0.0a1"
+fn version_tuple(s: &str) -> Vec<u32> {
+    s.split('.').filter_map(|p| p.parse().ok()).collect()
+}
+
+/// 元组比较：installed >= required（按数值）
+///
+/// - 段数不一致时，短的一方补 0
+/// - 任一段 installed > required → true
+/// - 任一段 installed < required → false
+/// - 所有段都相等 → true
+fn version_gte(installed: &str, required: &str) -> bool {
+    let inst = version_tuple(installed);
+    let req = version_tuple(required);
+    for (i, r) in req.iter().enumerate() {
+        let i_val = inst.get(i).copied().unwrap_or(0);
+        if i_val > *r {
+            return true;
+        }
+        if i_val < *r {
+            return false;
+        }
+    }
+    true
+}
+
+/// 元组比较：installed < upper（按数值）
+///
+/// - 段数不一致时，短的一方补 0
+/// - 任一段 installed < upper → true
+/// - 任一段 installed > upper → false
+/// - 所有段都相等 → false（严格小于）
+fn version_lt(installed: &str, upper: &str) -> bool {
+    let inst = version_tuple(installed);
+    let up = version_tuple(upper);
+    for (i, u) in up.iter().enumerate() {
+        let i_val = inst.get(i).copied().unwrap_or(0);
+        if i_val < *u {
+            return true;
+        }
+        if i_val > *u {
+            return false;
+        }
+    }
+    false
 }
 
 /// 从版本规范中提取纯版本号
@@ -287,5 +365,102 @@ mod tests {
         let required: HashMap<String, String> = HashMap::new();
         let deps = build_dependency_list(&installed, &required);
         assert_eq!(deps.len(), KEY_DEPENDENCIES.len());
+    }
+
+    // ===== v3.2.1 新增测试：覆盖 `~=` 约束 + 元组比较 =====
+
+    #[test]
+    fn test_version_tuple_basic() {
+        assert_eq!(version_tuple("2.13.4"), vec![2, 13, 4]);
+        assert_eq!(version_tuple("0.7.1"), vec![0, 7, 1]);
+        assert_eq!(version_tuple("1.0"), vec![1, 0]);
+        assert_eq!(version_tuple(""), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn test_version_tuple_strip_suffix() {
+        // 带预发布标签的版本号：1.0.0a1 → [1, 0, 0]（容错，跳过 a1）
+        assert_eq!(version_tuple("1.0.0a1"), vec![1, 0, 0]);
+    }
+
+    #[test]
+    fn test_version_gte_basic() {
+        // 基础：数值比较
+        assert!(version_gte("2.13.4", "2.0.0"));
+        assert!(version_gte("2.0.0", "2.0.0"));
+        assert!(!version_gte("1.0.0", "2.0.0"));
+    }
+
+    #[test]
+    fn test_version_gte_zero_padding() {
+        // 关键 bug 修复：字符串比较 "0.10.0" >= "0.7.0" 错误（'1' < '7'）
+        // 元组比较正确
+        assert!(version_gte("0.10.0", "0.7.0"));
+        assert!(version_gte("0.8.0", "0.4.2"));
+        assert!(!version_gte("0.4.2", "0.8.0"));
+    }
+
+    #[test]
+    fn test_version_lt_basic() {
+        assert!(version_lt("2.0.0", "3.0"));
+        assert!(!version_lt("3.0.0", "3.0"));
+        assert!(!version_lt("2.99.0", "3.0"));
+    }
+
+    #[test]
+    fn test_version_satisfies_pydantic_compatible_release() {
+        // v3.2.1 用户场景：pydantic 2.13.4 vs pydantic~=2.0
+        // 之前误报 NeedsUpgrade，修复后应满足
+        assert!(version_satisfies("2.13.4", "~=2.0"));
+        assert!(version_satisfies("2.0.0", "~=2.0"));
+        assert!(version_satisfies("2.99.99", "~=2.0"));
+        // 跨主版本不满足
+        assert!(!version_satisfies("3.0.0", "~=2.0"));
+        assert!(!version_satisfies("1.9.9", "~=2.0"));
+    }
+
+    #[test]
+    fn test_version_satisfies_ge_zero_padding() {
+        // v3.2.1 修复：>=0.7.0 vs installed 0.10.0
+        // 之前字符串比较错误，修复后元组比较正确
+        assert!(version_satisfies("0.10.0", ">=0.7.0"));
+        assert!(version_satisfies("0.8.0", ">=0.4.2"));
+        assert!(version_satisfies("3.14.1", ">=3.11.8"));
+        assert!(version_satisfies("5.13.0", ">=4.50.3"));
+        // 边界
+        assert!(version_satisfies("0.7.0", ">=0.7.0"));
+        assert!(!version_satisfies("0.6.99", ">=0.7.0"));
+    }
+
+    #[test]
+    fn test_version_satisfies_eq() {
+        assert!(version_satisfies("2.4.0", "==2.4.0"));
+        assert!(!version_satisfies("2.4.1", "==2.4.0"));
+    }
+
+    #[test]
+    fn test_build_dep_list_pydantic_satisfies_compatible_release() {
+        // v3.2.1 关键场景：完整端到端测试
+        let installed = HashMap::from([("pydantic".to_string(), "2.13.4".to_string())]);
+        let required = HashMap::from([("pydantic".to_string(), "~=2.0".to_string())]);
+
+        let deps = build_dependency_list(&installed, &required);
+        let pydantic_dep = deps.iter().find(|d| d.name == "pydantic").unwrap();
+        assert!(
+            matches!(pydantic_dep.status, DepStatus::Satisfied),
+            "pydantic 2.13.4 vs ~=2.0 should be Satisfied, got {:?}",
+            pydantic_dep.status
+        );
+    }
+
+    #[test]
+    fn test_build_dep_list_pydantic_settings() {
+        // requirements.txt 中 pydantic-settings~=2.0 同样场景
+        let installed = HashMap::from([("pydantic-settings".to_string(), "2.5.2".to_string())]);
+        let required = HashMap::from([("pydantic-settings".to_string(), "~=2.0".to_string())]);
+
+        let deps = build_dependency_list(&installed, &required);
+        let dep = deps.iter().find(|d| d.name == "pydantic-settings").unwrap();
+        assert!(matches!(dep.status, DepStatus::Satisfied));
     }
 }

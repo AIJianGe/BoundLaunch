@@ -37,6 +37,15 @@ export interface PathsConfig {
   comfyui_root: string;
   venv_path: string;
   python_version: string;
+  /**
+   * 自定义 models 路径（v3.1 / F26 决策 12）
+   *
+   * - `null` / `undefined`：使用 ComfyUI 默认 `<comfyui_root>/models`
+   * - 字符串：建立 `<comfyui_root>/models` 软链接到此路径
+   *
+   * 后端通过 `core_ensure_models_link` 命令建立 / 维护链接。
+   */
+  models_path?: string | null;
 }
 
 export interface LaunchConfig {
@@ -285,20 +294,144 @@ export interface ConflictReport {
 // CoreManager 模块（对应 src-tauri/src/core_manager/models.rs）
 // ============================================================================
 
-export type CloneStatus = "not_cloned" | "cloning" | "cloned" | "failed";
-
+/**
+ * ComfyUI 仓库当前状态
+ *
+ * 与后端 `CoreStatus` 一一对应（v3.1 / F26 同步）
+ */
 export interface CoreStatus {
-  is_cloned: boolean;
+  /** 当前 HEAD 对应的 tag 名（无 tag 时为 null） */
   current_version: string | null;
-  latest_version: string | null;
-  has_updates: boolean;
-  clone_status: CloneStatus;
+  /** 当前 commit SHA */
+  current_commit: string;
+  /** 工作区是否有未提交改动 */
+  has_local_changes: boolean;
+  /** 最新稳定版 tag（list_tags 后填充） */
+  latest_stable: string | null;
+  /** 仓库是否已克隆 */
+  is_clone_done: boolean;
 }
 
+/**
+ * 单个 Git tag 信息（v3.1 / F26）
+ *
+ * 与后端 `TagInfo` 一一对应
+ */
+export interface TagInfo {
+  /** tag 名（如 "v0.3.10"） */
+  name: string;
+  /** 是否为稳定版（严格 vX.Y.Z 格式，无 rc/beta/pre/dev 后缀） */
+  is_stable: boolean;
+  /** tag 指向的 commit SHA */
+  commit: string;
+  /** tag 创建时间（ISO8601 / RFC3339） */
+  date: string;
+}
+
+/**
+ * tag 分类（v3.1 / F26 决策 9：SemVer 规则 + 决策 7：NTab 双分类）
+ *
+ * - stable：严格 `vX.Y.Z` 格式（无后缀），按版本倒序
+ * - prerelease：`vX.Y.Z-rc1` / `vX.Y.Z-beta` 等带后缀，按版本倒序
+ */
+export interface ClassifiedTags {
+  stable: TagInfo[];
+  prerelease: TagInfo[];
+}
+
+/**
+ * 切换版本前置检查结果（v3.1 / F26 决策 5）
+ *
+ * 在调用 `coreSwitchVersion` 前由前端调用 `coreCheckSwitchPrerequisites` 获取。
+ */
+export interface SwitchPrerequisites {
+  /** 是否允许切换 */
+  can_switch: boolean;
+  /** ComfyUI 是否正在运行（运行中拒绝切换） */
+  comfyui_running: boolean;
+  /** 工作区是否有未提交改动（脏状态拒绝切换） */
+  has_local_changes: boolean;
+  /** 当前 tag（用于回滚提示） */
+  current_tag: string | null;
+  /** 阻止原因（can_switch = false 时填充） */
+  block_reason: string | null;
+}
+
+/**
+ * 切换版本结果（v3.1 / F26 决策 6：全部回滚）
+ *
+ * 后端使用 `#[serde(tag = "kind", rename_all = "snake_case")]`
+ */
+export type SwitchVersionResult =
+  | {
+      kind: "success";
+      from: string | null;
+      to: string;
+      /** venv 是否被重建（决策 3：总是重建） */
+      venv_rebuilt: boolean;
+      /** models 链接是否重建 */
+      models_link_rebuilt: boolean;
+      /** requirements 是否已重新安装 */
+      requirements_reinstalled: boolean;
+    }
+  | {
+      kind: "rolled_back";
+      to: string;
+      error: string;
+      /** 回滚是否完整（git checkout 已恢复；venv 可能已损坏） */
+      rollback_clean: boolean;
+    };
+
+/**
+ * checkout 操作结果（对应后端 `CheckoutResult`）
+ *
+ * 后端使用 `#[serde(tag = "kind")]`
+ */
+export type CheckoutResult =
+  | { kind: "Switched"; from: string | null; to: string }
+  | { kind: "AlreadyOnTag"; tag: string }
+  | { kind: "StashedAndSwitched"; stash_ref: string; from: string; to: string };
+
+/**
+ * @deprecated 旧类型，保留用于 core_list_tags 命令（v3.1 已被 TagInfo 取代）
+ *
+ * 新代码请使用 `TagInfo`。
+ */
 export interface GitTag {
   name: string;
   is_version: boolean;
 }
+
+// ----------------------------------------------------------------------------
+// F31：ComfyUI 仓库地址切换与备份恢复
+// ----------------------------------------------------------------------------
+
+/** 备份信息（F31） */
+export interface BackupInfo {
+  name: string;
+  path: string;
+  backed_up_at: string;
+  repo_url_masked: string;
+  current_tag: string | null;
+  current_commit: string;
+  size_bytes: number;
+}
+
+/** 切换仓库地址结果（F31） */
+export type SwitchRepoResult =
+  | {
+      kind: "success";
+      from_url: string;
+      to_url: string;
+      backup_name: string | null;
+      clone_elapsed_ms: number;
+    }
+  | {
+      kind: "rolled_back";
+      to_url: string;
+      error: string;
+      rollback_clean: boolean;
+    };
 
 // ============================================================================
 // ModelPathManager 模块（对应 src-tauri/src/model_path/models.rs）
@@ -360,7 +493,12 @@ export type TaskKind =
   | "plugin_install"
   | "plugin_update"
   | "scan_models"
-  | "custom";
+  | "custom"
+  // F32 新增：4 个环境长任务
+  | "create_venv"
+  | "switch_torch_variant"
+  | "rebuild_venv"
+  | "switch_python";
 
 export type TaskPriority = "high" | "normal" | "low";
 
@@ -379,6 +517,36 @@ export interface TaskInfo {
   status: TaskStatus;
   started_at: string | null;
   completed_at: string | null;
+}
+
+/**
+ * `task_progress` 事件 payload
+ *
+ * 对应后端 `task_scheduler/progress.rs::ProgressEvent`：
+ * `{ task_id, progress, message, status }`
+ *
+ * 注意：`status` 是字符串（"queued" / "running" / "completed" / "failed" / "cancelled"），
+ * 不是 TaskStatus discriminated union。
+ */
+export interface TaskProgressEvent {
+  task_id: string;
+  progress: number;
+  message: string | null;
+  status: string;
+}
+
+/**
+ * `task_completed` 事件 payload
+ *
+ * 对应后端 `task_scheduler/progress.rs::TerminalEvent`：
+ * `{ task_id, status, summary }`
+ *
+ * 注意：与 TaskInfo 不同，TerminalEvent 只携带终态信息，不包含 kind/name/priority 等。
+ */
+export interface TaskTerminalEvent {
+  task_id: string;
+  status: string;
+  summary: string | null;
 }
 
 // ============================================================================
@@ -403,6 +571,55 @@ export interface LogQueryOptions {
   end_time?: string;
   limit?: number;
   offset?: number;
+}
+
+// ============================================================================
+// v1.8 / F36-Phase2：环境诊断 + 修复（对应 src-tauri/src/python_env/recovery.rs）
+// ============================================================================
+
+/** 问题严重度 */
+export type IssueSeverity = "info" | "warning" | "error" | "critical";
+
+/** 单个诊断问题 */
+export interface EnvIssue {
+  severity: IssueSeverity;
+  /** 问题代码（前端国际化用） */
+  code: string;
+  /** 用户可读描述 */
+  message: string;
+  /** 详情（错误消息、traceback 等） */
+  detail: string | null;
+  /** 建议的修复动作 */
+  suggested_action: RepairAction;
+}
+
+/** 修复动作（前端发命令时序列化为 snake_case 字符串） */
+export type RepairAction =
+  | "none"
+  | "downgrade_numpy"
+  | "reinstall_torch"
+  | "reinstall_requirements"
+  | "rebuild_venv";
+
+/** 完整诊断报告 */
+export interface DiagnoseReport {
+  venv_exists: boolean;
+  torch_import_ok: boolean;
+  torch_version: string | null;
+  issues: EnvIssue[];
+  suggested_action: RepairAction;
+  suggested_reason: string;
+}
+
+// ============================================================================
+// v3.2.2 ProcessLauncher 事件 payload（对应 src-tauri/src/process_launcher/*）
+// ============================================================================
+
+/** `comfyui_log` 事件 payload（对应 log_pipeline.rs:185 emit） */
+export interface ComfyUILogEvent {
+  source: "stdout" | "stderr";
+  line: string;
+  ts: string; // ISO 8601
 }
 
 export interface TaskHistoryRecord {

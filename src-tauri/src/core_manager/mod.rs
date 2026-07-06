@@ -7,8 +7,13 @@
 //!
 //! 详见 `PR/03-模块设计/03-CoreManager.md`
 
+pub mod compat;
 pub mod git_ops;
 pub mod models;
+pub mod paths;
+pub mod repo_switcher;
+pub mod semver;
+pub mod switcher;
 pub mod tags;
 
 use std::path::{Path, PathBuf};
@@ -22,7 +27,7 @@ use crate::error::CoreError;
 use crate::event_bus::{EventBus, SystemEvent};
 use crate::log_store::LogStoreService;
 
-use models::{CheckoutResult, CoreStatus, TagInfo};
+use models::{CheckoutResult, ClassifiedTags, CoreStatus, SwitchPrerequisites, TagInfo};
 
 /// Tags 缓存 TTL
 const TAGS_CACHE_TTL: Duration = Duration::from_secs(300); // 5 分钟
@@ -94,6 +99,19 @@ impl CoreManagerService {
         self.config.get().paths.comfyui_root.clone()
     }
 
+    /// 读取当前仓库 URL（F31 新增）
+    ///
+    /// 优先从 Config.paths.comfyui_repo_url 读取（用户自定义），
+    /// None 时回退到常量 `COMFYUI_REPO_URL`（官方仓库）。
+    pub fn current_repo_url(&self) -> String {
+        let config = self.config.get();
+        config
+            .paths
+            .comfyui_repo_url
+            .clone()
+            .unwrap_or_else(|| models::COMFYUI_REPO_URL.to_string())
+    }
+
     /// 仓库是否已克隆
     pub async fn is_cloned(&self) -> bool {
         self.current_repo_path().join(".git").exists()
@@ -128,6 +146,11 @@ impl CoreManagerService {
     /// - 目录非空但非 git 仓库 → 返回 `NotEmptyDir` 错误（让前端提示用户）
     ///
     /// 用途：向导/启动页调用，无需用户手动选择 URL。
+    ///
+    /// **v1.8 改进**：clone 完成后**自动 checkout 到 latest stable tag**，
+    /// 避免用户首次启动时停留在 master 分支（不是稳定版）。
+    /// - 找 latest_stable 失败 → 回退到 master（不阻塞 onboarding）
+    /// - checkout 失败 → 回退到 master + 记录 warn
     pub async fn ensure_cloned(&self) -> Result<(), CoreError> {
         if self.is_cloned().await {
             tracing::debug!("comfyui repo already cloned, skipping");
@@ -135,8 +158,21 @@ impl CoreManagerService {
         }
 
         // 委托给 clone_repo，自动检测目录状态
-        let url = models::COMFYUI_REPO_URL.to_string();
-        self.clone_repo(&url).await
+        let url = self.current_repo_url();
+        self.clone_repo(&url).await?;
+
+        // clone 完成后，自动切到最新稳定版（onboarding 体验优化）
+        // 失败不阻塞（用户可能想用 master / 网络问题拉不到 tags）
+        match self.update_latest_stable().await {
+            Ok(tag) => {
+                tracing::info!(tag = %tag, "onboarding auto-switched to latest stable");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "onboarding auto-switch to latest_stable failed, staying on master");
+            }
+        }
+
+        Ok(())
     }
 
     /// 列出所有 tag（缓存命中 < 5ms，未命中 1-10s）
@@ -171,11 +207,11 @@ impl CoreManagerService {
             .map_err(|e| CoreError::GitError(e.to_string()))??;
 
         // fetch tags（网络操作，可能失败）
-        let url = models::COMFYUI_REPO_URL;
+        let url = self.current_repo_url();
         let repo_for_fetch = tokio::task::spawn_blocking(move || {
             // repo 移动到 blocking 上下文
             let r = repo;
-            git_ops::fetch_tags(&r, url)
+            git_ops::fetch_tags(&r, &url)
         })
         .await
         .map_err(|e| CoreError::GitError(e.to_string()))?;
@@ -218,6 +254,64 @@ impl CoreManagerService {
     pub async fn list_stable_tags(&self, force_refresh: bool) -> Result<Vec<TagInfo>, CoreError> {
         let tags = self.list_tags(force_refresh).await?;
         Ok(tags::filter_stable_tags(&tags))
+    }
+
+    /// 列出所有 tag 并按 SemVer 分类（v3.1 / F26 决策 7：NTab 双分类）
+    ///
+    /// 决策 10：本地优先 - 先用本地缓存，未命中再 fetch 远程。
+    /// force_refresh = true 时强制刷新缓存。
+    pub async fn list_classified_tags(
+        &self,
+        force_refresh: bool,
+    ) -> Result<ClassifiedTags, CoreError> {
+        let tags = self.list_tags(force_refresh).await?;
+        Ok(tags::classify_tags(tags))
+    }
+
+    /// 检查切换版本的前置条件（v3.1 / F26 决策 5）
+    ///
+    /// 返回 SwitchPrerequisites，前端根据 can_switch 决定是否允许切换。
+    /// 阻止条件：
+    /// - ComfyUI 运行中
+    /// - 工作区有未提交改动（脏状态）
+    pub async fn check_switch_prerequisites(
+        &self,
+        comfyui_running: bool,
+    ) -> Result<SwitchPrerequisites, CoreError> {
+        // 读取当前 tag
+        let current_tag = if self.is_cloned().await {
+            self.current_version().await?.current_version
+        } else {
+            None
+        };
+
+        // 检查工作区
+        let has_local_changes = if self.is_cloned().await {
+            self.has_local_changes().await?
+        } else {
+            false
+        };
+
+        let mut blocks: Vec<String> = Vec::new();
+        if comfyui_running {
+            blocks.push("ComfyUI 正在运行".to_string());
+        }
+        if has_local_changes {
+            blocks.push("工作区有未提交改动".to_string());
+        }
+        let block_reason = if blocks.is_empty() {
+            None
+        } else {
+            Some(blocks.join("；"))
+        };
+
+        Ok(SwitchPrerequisites {
+            can_switch: block_reason.is_none(),
+            comfyui_running,
+            has_local_changes,
+            current_tag,
+            block_reason,
+        })
     }
 
     /// 当前仓库状态
@@ -342,6 +436,150 @@ impl CoreManagerService {
     pub fn invalidate_tags_cache(&self) {
         let mut cache = self.tags_cache.write();
         cache.cached_at = None; // 失效缓存（避免 Instant 下溢出 panic）
+    }
+
+    // ========================================================================
+    // F31：仓库地址切换与备份恢复
+    // ========================================================================
+
+    /// 获取当前仓库 URL（脱敏后的，用于前端显示）
+    pub fn get_repo_url_masked(&self) -> String {
+        repo_switcher::mask_url_credentials(&self.current_repo_url())
+    }
+
+    /// 获取官方仓库 URL（常量）
+    pub fn official_repo_url(&self) -> &'static str {
+        models::COMFYUI_REPO_URL
+    }
+
+    /// 列出所有备份
+    pub async fn list_backups(&self) -> Result<Vec<models::BackupInfo>, CoreError> {
+        let repo_path = self.current_repo_path();
+        let _guard = self.repo_lock.lock().await;
+        tokio::task::spawn_blocking(move || repo_switcher::list_backups(&repo_path))
+            .await
+            .map_err(|e| CoreError::GitError(e.to_string()))?
+    }
+
+    /// 切换仓库地址
+    ///
+    /// 完整流程：备份 → 更新 Config → 克隆 → 迁移 → 重建链接 → 失效缓存
+    /// 失败时回滚（恢复备份 + 恢复 Config）
+    pub async fn switch_repo_url(
+        &self,
+        new_url: &str,
+        migrate_custom_nodes: bool,
+    ) -> Result<models::SwitchRepoResult, CoreError> {
+        let _guard = self.repo_lock.lock().await;
+        let repo_path = self.current_repo_path();
+        let old_url = self.current_repo_url();
+        let new_url = new_url.to_string();
+        // 闭包内需要拥有 new_url，闭包外也需要更新 Config，因此克隆一份供闭包使用
+        let new_url_for_closure = new_url.clone();
+        let migrate = migrate_custom_nodes;
+
+        // 执行切换（spawn_blocking 因为 clone 是同步操作）
+        let result = tokio::task::spawn_blocking(move || {
+            repo_switcher::switch_repo_url_sync(&repo_path, &old_url, &new_url_for_closure, migrate)
+        })
+        .await
+        .map_err(|e| CoreError::GitError(format!("switch task join error: {}", e)))??;
+
+        // 根据结果更新 Config
+        match &result {
+            models::SwitchRepoResult::Success { .. } => {
+                // 更新 Config.paths.comfyui_repo_url
+                self.config
+                    .update(|cfg| {
+                        cfg.paths.comfyui_repo_url = Some(new_url.clone());
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|e| CoreError::GitError(format!("config update failed: {}", e)))?;
+
+                // 重建 models 软链接
+                let comfyui_root = self.current_repo_path();
+                let models_path = self.config.get().paths.models_path.clone();
+                if let Err(e) =
+                    crate::core_manager::paths::ensure_models_link(&comfyui_root, models_path.as_deref())
+                {
+                    tracing::warn!(error = %e, "failed to rebuild models link after repo switch");
+                }
+
+                // 失效 tags 缓存
+                self.invalidate_tags_cache();
+
+                // 清空 LogStore tags 持久化缓存（v3.3 / F33 改用 invalidate 语义）
+                let log_store = self.log_store.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = log_store.logs().invalidate_tags_cache().await {
+                        tracing::warn!(error = %e, "failed to clear tags persistent cache");
+                    }
+                });
+            }
+            models::SwitchRepoResult::RolledBack { .. } => {
+                // 回滚时 Config 不需要更新（保持原 URL）
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// 恢复备份
+    ///
+    /// 1. 当前 ComfyUI 也备份
+    /// 2. rename 备份 → comfyui_root
+    /// 3. 更新 Config.paths.comfyui_repo_url = 备份的 URL
+    /// 4. 重建 models 链接 + 失效缓存
+    pub async fn restore_backup(
+        &self,
+        backup_name: &str,
+    ) -> Result<models::SwitchRepoResult, CoreError> {
+        let _guard = self.repo_lock.lock().await;
+        let repo_path = self.current_repo_path();
+        let backup_name = backup_name.to_string();
+        let backup_name_for_result = backup_name.clone();
+
+        let (repo_url, _masked) = tokio::task::spawn_blocking(move || {
+            repo_switcher::restore_backup_sync(&repo_path, &backup_name)
+        })
+        .await
+        .map_err(|e| CoreError::GitError(format!("restore task join error: {}", e)))??;
+
+        // 更新 Config
+        self.config
+            .update(|cfg| {
+                cfg.paths.comfyui_repo_url = Some(repo_url.clone());
+                Ok(())
+            })
+            .await
+            .map_err(|e| CoreError::GitError(format!("config update failed: {}", e)))?;
+
+        // 重建 models 软链接
+        let comfyui_root = self.current_repo_path();
+        let models_path = self.config.get().paths.models_path.clone();
+        if let Err(e) =
+            crate::core_manager::paths::ensure_models_link(&comfyui_root, models_path.as_deref())
+        {
+            tracing::warn!(error = %e, "failed to rebuild models link after restore");
+        }
+
+        // 失效 tags 缓存（v3.3 / F33：内存缓存 + LogStore 持久化缓存都要清，
+        // 与 switch_repo_url 保持一致；之前只清内存，启动后会用旧持久化缓存）
+        self.invalidate_tags_cache();
+        let log_store = self.log_store.clone();
+        tokio::spawn(async move {
+            if let Err(e) = log_store.logs().invalidate_tags_cache().await {
+                tracing::warn!(error = %e, "failed to clear tags persistent cache after restore");
+            }
+        });
+
+        Ok(models::SwitchRepoResult::Success {
+            from_url: "backup".to_string(),
+            to_url: repo_switcher::mask_url_credentials(&repo_url),
+            backup_name: Some(backup_name_for_result),
+            clone_elapsed_ms: 0,
+        })
     }
 }
 

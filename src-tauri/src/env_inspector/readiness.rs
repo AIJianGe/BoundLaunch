@@ -163,7 +163,7 @@ fn count_requirements_status(deps: &[DependencyInfo]) -> (bool, usize) {
 }
 
 /// 把 `CudaVersion` 枚举转为后端命令接受的字符串
-fn cuda_version_to_string(cuda: &crate::config::CudaVersion) -> String {
+pub fn cuda_version_to_string(cuda: &crate::config::CudaVersion) -> String {
     use crate::config::CudaVersion::*;
     match cuda {
         Cpu => "cpu".to_string(),

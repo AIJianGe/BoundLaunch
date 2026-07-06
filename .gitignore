@@ -70,3 +70,4 @@ src-tauri/resources/uv/*
 src-tauri/ComfyUI
 !src-tauri/resources/uv/.gitkeep
 !src-tauri/resources/uv/README.md
+src-tauri/venv

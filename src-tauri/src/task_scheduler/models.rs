@@ -29,17 +29,34 @@ pub enum TaskKind {
     ScanModels,
     /// 调用方自定义
     Custom,
+    /// F32 新增：创建 venv
+    CreateVenv,
+    /// F32 新增：切换 torch 变体（NVIDIA/AMD/Intel/Apple/CPU）
+    SwitchTorchVariant,
+    /// F32 新增：重建 venv（5 步事务）
+    RebuildVenv,
+    /// F32 新增：切换 Python 版本（5 步事务 + 备份回滚）
+    SwitchPython,
+    /// v1.8 / F36：环境修复（诊断 + 自动修复），见 `python_env::recovery`
+    EnvRepair,
 }
 
 impl TaskKind {
     /// 默认优先级
     ///
     /// - 版本切换与 torch 安装为 High（用户主动等待）
+    /// - F32 新增 4 个环境操作为 High（用户主动等待）
     /// - 插件安装/更新、requirements 为 Normal
     /// - 扫描类为 Low
     pub fn default_priority(&self) -> TaskPriority {
         match self {
             TaskKind::Checkout | TaskKind::InstallTorch => TaskPriority::High,
+            // F32 新增：4 个环境长任务均为 High（用户主动触发并等待）
+            TaskKind::CreateVenv
+            | TaskKind::SwitchTorchVariant
+            | TaskKind::RebuildVenv
+            | TaskKind::SwitchPython
+            | TaskKind::EnvRepair => TaskPriority::High,
             TaskKind::CloneRepo
             | TaskKind::FetchTags
             | TaskKind::InstallRequirements
@@ -62,6 +79,12 @@ impl TaskKind {
             TaskKind::PluginUpdate => "plugin_update",
             TaskKind::ScanModels => "scan_models",
             TaskKind::Custom => "custom",
+            // F32 新增
+            TaskKind::CreateVenv => "create_venv",
+            TaskKind::SwitchTorchVariant => "switch_torch_variant",
+            TaskKind::RebuildVenv => "rebuild_venv",
+            TaskKind::SwitchPython => "switch_python",
+            TaskKind::EnvRepair => "env_repair",
         }
     }
 }

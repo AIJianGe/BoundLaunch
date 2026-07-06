@@ -72,6 +72,23 @@ pub enum SystemEvent {
         outdated: Vec<String>,
     },
 
+    /// ComfyUI requirements.txt 依赖安装完成（v3.2 修复 30s 缓存陈旧）
+    ///
+    /// 与 `TorchInstalled` 对应：
+    /// - `TorchInstalled` → torch 装完 → 失效 env cache
+    /// - `RequirementsInstalled` → ComfyUI 依赖装完 → 失效 env cache
+    ///
+    /// 由 `PythonEnvService::install_requirements` 在 `uv pip install -r requirements.txt`
+    /// 成功后广播。`EnvironmentInspectorService` 订阅以失效 30s TTL 缓存。
+    RequirementsInstalled,
+
+    /// F32 新增：环境探查缓存已刷新
+    ///
+    /// 由 `EnvironmentInspectorService` 后台 `spawn_refresh` 完成后广播：
+    /// - 通知后端模块联动（ProcessLauncher 重置 dirty 标记等）
+    /// - 前端通过 Tauri 2 Event `env_inspect_updated` 接收（不走 EventBus.subscribe）
+    EnvInspectUpdated,
+
     /// launcher 即将退出（F24 退出流程）
     ///
     /// 由 ShutdownCoordinator 在事务开始时广播：
@@ -100,6 +117,8 @@ impl SystemEvent {
             Self::VenvRebuilt => "VenvRebuilt",
             Self::PythonVersionSwitched { .. } => "PythonVersionSwitched",
             Self::RequirementsMismatch { .. } => "RequirementsMismatch",
+            Self::RequirementsInstalled => "RequirementsInstalled",
+            Self::EnvInspectUpdated => "EnvInspectUpdated",
             Self::AppExiting { .. } => "AppExiting",
             Self::AppExited => "AppExited",
         }

@@ -45,6 +45,17 @@ impl ProgressSender {
     pub fn send_message(&self, msg: impl Into<String>) {
         let _ = self.tx.send(ProgressMsg::Message(msg.into()));
     }
+
+    /// 创建 no-op 进度发送器（v1.8 / F36）
+    ///
+    /// 用途：在非任务上下文（如启动时一次性迁移）调用 `recovery::quick_repair_*`，
+    /// 这些函数需要 `&ProgressSender`，但不希望上报进度事件。
+    /// no-op 实现：所有 send_* 调用都静默丢弃。
+    pub fn no_op() -> Self {
+        // 创建会立即 drop 的 channel，所有 send 都被静默丢弃
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Self { tx }
+    }
 }
 
 /// 推送给前端的进度事件 payload
