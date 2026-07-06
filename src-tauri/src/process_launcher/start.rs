@@ -5,7 +5,10 @@
 //! 设计要点：
 //! - **前置校验**：verify_venv + dirty 标记检查，防止 torch 缺失时启动
 //! - **PID 文件**：崩溃恢复用，记录 pid/started_at/args 三元组
-//! - **健康检查**：1s 间隔轮询 `/system_stats`，60s 超时触发 stop
+//! - **健康检查（v3.4.2 完全异步）**：2s 间隔轮询 `/system_stats`，**无超时**（无限轮询直到 ready / cancel / crash）
+//!   - 之前 60s 超时触发 stop 会误杀慢启动（机械盘 / 大模型加载）；现在改为事件通知
+//!   - 取消由 `CancellationToken` 控制（stop_impl 调用时 cancel）
+//!   - 每 30s emit 一次 `process_health_warning` 事件，前端可显示"启动较慢"提示
 //! - **stdout/stderr 行读取**：独立 task，无锁 mpsc 推送到 LogPipeline
 //!
 //! 设计模式：
@@ -19,23 +22,37 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
+use crate::common::process_util::decode_windows_bytes;
 use crate::error::ProcessError;
 use crate::process_launcher::models::LaunchArgs;
 use crate::process_launcher::log_pipeline::LogPipeline;
 use crate::python_env::PythonEnvService;
 use crate::python_env::models::EnvInfo;
+use crate::task_scheduler::progress::ProgressSender;
 
-/// 健康检查轮询间隔
-const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// 健康检查轮询间隔（v3.4.2 调整为 2s）
+///
+/// 之前 1s 轮询对冷启动 ComfyUI 太密集（HTTP 请求每秒一次），改 2s 更友好。
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
-/// 健康检查总超时（60s）
+/// v3.4.2：健康检查不再有总超时（之前的 60s 上限是 bug 误杀慢启动）
+///
+/// 保留常量以备未来扩展用，目前函数内部不引用。
+#[allow(dead_code)]
 pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// 单次健康检查 HTTP 请求超时
-const HEALTH_CHECK_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+/// 单次健康检查 HTTP 请求超时（v3.4.2 调整为 5s）
+///
+/// 之前 2s 在 Windows 上 HTTP 客户端初始化慢时容易 false-negative。
+/// 5s 留足缓冲，HTTP 失败重试代价小（2s 间隔 + 5s timeout = 7s/轮）。
+const HEALTH_CHECK_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// v3.4.2：启动缓慢警告间隔（30s 推一次 process_health_warning）
+const HEALTH_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// PID 文件名（位于用户数据目录）
 pub const PID_FILE_NAME: &str = "comfyui.pid";
@@ -135,7 +152,8 @@ pub async fn check_port_available(host: &str, port: u16) -> Result<(), ProcessEr
 /// - 设置工作目录为 `comfyui_root`
 /// - 关闭 stdin（避免 ComfyUI 等待输入）
 /// - piped stdout/stderr（供 reader task 消费）
-/// - Windows 隐藏控制台窗口
+/// - **消除 cmd 窗口**：使用 `common::process_util::new_command` 统一加 `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`
+///   （v3.3 之前在 Windows 上子进程会弹 cmd 窗口；v3.4 统一到 new_command 避免重复实现）
 /// - **F24 进程组隔离**：
 ///   - Unix：`setsid()` 创建新 session（也是新进程组），让 ComfyUI + 其 Python worker 子进程同组
 ///     → 关闭 launcher 时用 `kill -<pgid>` 整体终止，避免 python worker 残留
@@ -146,24 +164,14 @@ pub fn spawn_process(
     comfyui_root: &Path,
     cmd_args: Vec<String>,
 ) -> Result<Child, ProcessError> {
-    let mut cmd = Command::new(venv_python);
+    // v3.4 统一改用 process_util::new_command：消除此处重复实现 creation_flags
+    // （Windows 上自动加 CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP，非 Windows 等价 Command::new）
+    let mut cmd = crate::common::process_util::new_command(venv_python);
     cmd.args(&cmd_args)
         .current_dir(comfyui_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-
-    // Windows 进程标志：CREATE_NO_WINDOW + CREATE_NEW_PROCESS_GROUP
-    // 注：tokio::process::Command 在 Windows 上原生提供 `creation_flags` 方法
-    // （无需 `use std::os::windows::process::CommandExt`，否则会触发 unused_import 警告）
-    #[cfg(target_os = "windows")]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        // CREATE_NEW_PROCESS_GROUP = 0x00000200
-        // 让 ComfyUI 成为新进程组的根，配合 taskkill /T 整体终止
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    }
 
     // Unix 进程组隔离：spawn 后立即调 setsid()，让 ComfyUI + 其子进程归属新 session
     // pre_exec 在 fork 之后、exec 之前执行，仍在子进程上下文中
@@ -246,38 +254,143 @@ pub fn spawn_stderr_reader(stderr: ChildStderr, pipeline: Arc<LogPipeline>) -> J
 
 /// 健康检查结果回调
 pub enum HealthCheckOutcome {
-    /// 就绪
+    /// 就绪（GET /system_stats 返回 2xx）
     Ready,
-    /// 超时
+    /// 超时（HEALTH_CHECK_TIMEOUT 60s 内未就绪）
+    ///
+    /// v3.4.2：移除 60s 超时后此分支基本不会触发，保留兜底
     Timeout,
+    /// v3.4：child 在 health_check 期间死亡（try_wait 检测到 exit）
+    ///
+    /// 载荷 `Option<i32>` 是 exit code（None 表示被信号杀死）
+    Crashed(Option<i32>),
+    /// v3.4.2 新增：取消令牌触发（stop_impl 调用时）
+    ///
+    /// health_check 收到 cancel 信号后直接退出，不动状态。
+    /// stop_impl 负责把状态推进到 Stopped/Crashed。
+    Cancelled,
 }
 
-/// 启动健康检查轮询 task
+/// 启动健康检查轮询 task（v3.4.2 完全异步版）
 ///
-/// 每 `HEALTH_CHECK_INTERVAL` GET `http://127.0.0.1:<port>/system_stats`：
-/// - 200 → emit("process_ready") 并返回 `Ready`
-/// - 累计 `HEALTH_CHECK_TIMEOUT` 仍未通过 → emit("health_timeout") 并返回 `Timeout`
+/// **关键变化**：
+/// - 接收 `cancel_token: CancellationToken`：
+///   - stop_impl 调用时调 `cancel_token.cancel()` → health_check 立即退出
+///   - 之前是 `JoinHandle::abort()`，无法区分"自然完成"和"被取消"
+/// - 移除 `HEALTH_CHECK_TIMEOUT` 限制：之前 60s 上限对机械盘 / 大模型加载太短，
+///   现在改为无限轮询，直到：
+///   - a) child 死了（try_wait 返回 Some）→ Crashed
+///   - b) ComfyUI 就绪（HTTP 200）→ Ready
+///   - c) cancel_token 被 cancel → Cancelled
+///   - d) 用户应用关闭（cancel_token 兜底）→ Cancelled
+/// - 每 `HEALTH_WARNING_INTERVAL`（30s）emit 一次 `process_health_warning` 事件，
+///   前端可监听并显示"启动较慢"提示
+///
+/// **进度推送**：
+/// - ready → push_percent(100) + send_message("ComfyUI 已就绪")
+/// - 每轮：发"等待 ComfyUI 就绪（Xs）"消息，**不再发百分数**（之前 60-90% 进度条不再适用）
+///
+/// # 参数
+/// - `inner`：共享 `Arc<Inner>`，用于 try_wait 共享的 `Child` 句柄 + 读 log_pipeline
+/// - `cancel_token`：取消令牌，stop_impl 调用时 cancel
 pub fn spawn_health_check(
     port: u16,
     app: tauri::AppHandle,
+    inner: Arc<crate::process_launcher::Inner>,
+    progress: Option<ProgressSender>,
+    cancel_token: CancellationToken,
 ) -> JoinHandle<HealthCheckOutcome> {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let url = format!("http://127.0.0.1:{}/system_stats", port);
         let start = std::time::Instant::now();
 
+        // 第一次推 health_warning 的时间点（30s 后）
+        let mut next_warning_at = HEALTH_WARNING_INTERVAL;
+
         loop {
-            if start.elapsed() > HEALTH_CHECK_TIMEOUT {
-                tracing::warn!(
-                    port,
-                    timeout = ?HEALTH_CHECK_TIMEOUT,
-                    "health check timed out"
-                );
-                use tauri::Emitter;
-                let _ = app.emit("health_timeout", serde_json::json!({ "port": port }));
-                return HealthCheckOutcome::Timeout;
+            // v3.4.2：检查取消令牌（优先级最高，避免 sleep 阻塞 cancel）
+            // 用 `tokio::select!` 同时等 sleep 和 cancel，但这里简单点用 is_cancelled 轮询
+            if cancel_token.is_cancelled() {
+                tracing::info!(port, "health check cancelled");
+                return HealthCheckOutcome::Cancelled;
             }
 
+            // v3.4 关键修复：先检查 child 是否还活着（每次轮询前）
+            // 修复了之前"child 启动 0.5s 就死，health_check 傻等 60s 才超时"的 bug
+            let child_exit = {
+                let mut guard = inner.child.lock().await;
+                match guard.as_mut() {
+                    Some(child) => child.try_wait().ok().flatten(),
+                    None => None, // child 已被 take（cleanup_after_exit）→ 视为已退出
+                }
+            };
+            if let Some(exit_status) = child_exit {
+                let exit_code = exit_status.code();
+                tracing::warn!(
+                    port,
+                    ?exit_code,
+                    "health_check: child already exited (early death detected)"
+                );
+                if let Some(ref p) = progress {
+                    p.send_percent(95);
+                    p.send_message(format!(
+                        "ComfyUI 进程已退出（exit code: {:?}）",
+                        exit_code
+                    ));
+                }
+                use tauri::Emitter;
+                // 拿 log_pipeline 最近的 stderr tail
+                let stderr_tail = inner
+                    .log_pipeline
+                    .read()
+                    .as_ref()
+                    .map(|p| p.tail(50))
+                    .unwrap_or_default();
+                let _ = app.emit(
+                    "process_crashed",
+                    serde_json::json!({
+                        "exit_code": exit_code,
+                        "stderr_tail": stderr_tail,
+                        "reason": "health_check_detected",
+                    }),
+                );
+                return HealthCheckOutcome::Crashed(exit_code);
+            }
+
+            // v3.4.2：移除 60s 超时限制。改用 cancel_token 控制生命周期。
+            // 慢启动（如机械盘 / 大模型加载）现在不会被误杀。
+
+            // 周期性推 health_warning（30s / 60s / 90s ...）
+            let elapsed = start.elapsed();
+            if elapsed >= next_warning_at {
+                use tauri::Emitter;
+                let _ = app.emit(
+                    "process_health_warning",
+                    serde_json::json!({
+                        "elapsed": elapsed.as_secs(),
+                        "port": port,
+                    }),
+                );
+                tracing::info!(
+                    port,
+                    elapsed_secs = elapsed.as_secs(),
+                    "health_check: still waiting, emit warning"
+                );
+                next_warning_at += HEALTH_WARNING_INTERVAL;
+            }
+
+            // v3.4.2：每轮仅推消息（不推百分数），让前端显示"等待 ComfyUI 就绪（Xs）"
+            if let Some(ref p) = progress {
+                p.send_message(format!(
+                    "等待 ComfyUI 就绪（{:.0}s）",
+                    elapsed.as_secs_f32()
+                ));
+            }
+
+            // v3.4.2：HTTP 请求失败不报错，仅 debug 记录
+            // - 之前 `Ok(resp) =>` 分支只在 2xx 算成功
+            // - 现在 reqwest::Client 已配 5s timeout，单次失败不致命
             match client
                 .get(&url)
                 .timeout(HEALTH_CHECK_HTTP_TIMEOUT)
@@ -285,7 +398,11 @@ pub fn spawn_health_check(
                 .await
             {
                 Ok(resp) if resp.status().is_success() => {
-                    tracing::info!(port, "health check passed, ComfyUI ready");
+                    tracing::info!(port, elapsed_secs = elapsed.as_secs(), "health check passed, ComfyUI ready");
+                    if let Some(ref p) = progress {
+                        p.send_percent(100);
+                        p.send_message("ComfyUI 已就绪".to_string());
+                    }
                     use tauri::Emitter;
                     let _ = app.emit("process_ready", serde_json::json!({ "port": port }));
                     return HealthCheckOutcome::Ready;
@@ -302,7 +419,16 @@ pub fn spawn_health_check(
                 }
             }
 
-            tokio::time::sleep(HEALTH_CHECK_INTERVAL).await;
+            // v3.4.2：用 tokio::select! 让 sleep 与 cancel 竞争
+            // - 之前是 `tokio::time::sleep(HEALTH_CHECK_INTERVAL).await`，cancel 时也要等满 2s
+            // - 现在 select! 让 cancel 立即生效
+            tokio::select! {
+                _ = tokio::time::sleep(HEALTH_CHECK_INTERVAL) => {}
+                _ = cancel_token.cancelled() => {
+                    tracing::info!(port, "health check cancelled (during sleep)");
+                    return HealthCheckOutcome::Cancelled;
+                }
+            }
         }
     })
 }
@@ -377,6 +503,7 @@ pub async fn is_comfyui_process(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
         // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW，避免弹 cmd 窗口
+        // v3.4.2：wmic 输出可能含 GBK 编码的中文 CommandLine，按 GBK 解码
         let output = crate::common::process_util::new_command("wmic")
             .args([
                 "process",
@@ -389,7 +516,7 @@ pub async fn is_comfyui_process(pid: u32) -> bool {
             .await;
         match output {
             Ok(o) if o.status.success() => {
-                let cmdline = String::from_utf8_lossy(&o.stdout);
+                let cmdline = decode_windows_bytes(&o.stdout);
                 cmdline.contains("main.py") && cmdline.contains("comfyui")
             }
             _ => false,
@@ -416,6 +543,7 @@ pub async fn is_comfyui_process(pid: u32) -> bool {
         // -p: 按 PID 过滤；-o command=: 仅输出命令列（无表头）
         let pid_str = pid.to_string();
         // v3.3：使用 new_command 在 Windows 上加 CREATE_NO_WINDOW（macOS 无影响）
+        // v3.4.2：ps 输出按 UTF-8 解码（macOS 终端是 UTF-8，与 Linux 相同）
         let output = crate::common::process_util::new_command("ps")
             .args(["-p", &pid_str, "-o", "command="])
             .output()

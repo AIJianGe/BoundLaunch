@@ -106,23 +106,74 @@ impl LaunchMode {
 }
 
 /// 预览方式
+///
+/// **v3.4.1 修复**：与 ComfyUI main.py argparse 对齐，只接受以下 4 个值：
+/// - `none`
+/// - `auto`
+/// - `latent2rgb`
+/// - `taesd`
+///
+/// 旧版本里使用的 `latent` / `latent-upscale` / `autoencoder` 在新版 ComfyUI 中已被移除，
+/// 直接传这些值会导致 main.py 启动时 argparse 失败、进程退出码 2。
+/// 旧 config 中的值会在 `load_or_default` 中自动迁移（见 `migrate_legacy_preview_method`）。
+///
+/// **serde 标签说明**：用 `#[serde(rename = "...")]` 显式指定每个变体名，
+/// 不依赖 `rename_all` 的命名规则推断（避免 `Latent2Rgb` 之类的驼峰被错误转换）。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum PreviewMethod {
-    Latent,
-    LatentUpscale,
-    Autoencoder,
+    #[serde(rename = "none")]
     None,
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "latent2rgb")]
+    Latent2Rgb,
+    #[serde(rename = "taesd")]
+    Taesd,
 }
 
 impl PreviewMethod {
     pub fn to_arg(&self) -> &'static str {
         match self {
-            Self::Latent => "latent",
-            Self::LatentUpscale => "latent-upscale",
-            Self::Autoencoder => "autoencoder",
             Self::None => "none",
+            Self::Auto => "auto",
+            Self::Latent2Rgb => "latent2rgb",
+            Self::Taesd => "taesd",
         }
+    }
+
+    /// 从字符串解析（用于旧 config 迁移和前端 patch）
+    ///
+    /// 严格模式：只接受 ComfyUI 实际支持的 4 个值。旧值（`latent`/`latent-upscale`/`autoencoder`）
+    /// 返回 `Err`，由调用方走 `migrate_legacy_preview_method` 走迁移。
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "none" => Ok(Self::None),
+            "auto" => Ok(Self::Auto),
+            "latent2rgb" => Ok(Self::Latent2Rgb),
+            "taesd" => Ok(Self::Taesd),
+            other => Err(format!("unsupported preview_method: '{}'", other)),
+        }
+    }
+}
+
+/// **v3.4.1 新增**：将旧版 preview_method 字符串迁移到 ComfyUI 实际支持的值
+///
+/// 旧 → 新映射：
+/// - `latent` → `latent2rgb`（最接近的等价物）
+/// - `latent-upscale` → `taesd`（高质量预览，新版推荐）
+/// - `autoencoder` → `auto`（新版自动选择）
+///
+/// 返回 `Some(new_value)` 表示发生了迁移，`None` 表示输入已是新格式。
+pub fn migrate_legacy_preview_method(s: &str) -> Option<String> {
+    match s {
+        // 已经是新格式
+        "none" | "auto" | "latent2rgb" | "taesd" => None,
+        // 旧值 → 新值
+        "latent" => Some("latent2rgb".to_string()),
+        "latent-upscale" => Some("taesd".to_string()),
+        "autoencoder" => Some("auto".to_string()),
+        // 未知值：保守起见，强制迁移到 `latent2rgb`（最接近的默认）
+        _ => Some("latent2rgb".to_string()),
     }
 }
 
@@ -278,7 +329,9 @@ impl Default for Config {
                 listen_host: "127.0.0.1".to_string(),
                 listen_port: 8188,
                 auto_open_browser: true,
-                preview_method: PreviewMethod::Latent,
+                // v3.4.1 修复：旧版 PreviewMethod::Latent（"latent"）已被 ComfyUI 移除
+                // 改用 Latent2Rgb（最接近的等价物）
+                preview_method: PreviewMethod::Latent2Rgb,
                 custom_args: String::new(),
                 advanced: AdvancedArgs::default(),
             },

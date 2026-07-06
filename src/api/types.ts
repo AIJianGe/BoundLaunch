@@ -498,7 +498,9 @@ export type TaskKind =
   | "create_venv"
   | "switch_torch_variant"
   | "rebuild_venv"
-  | "switch_python";
+  | "switch_python"
+  // v3.4 新增：启动 ComfyUI 主进程（spawn + 健康检查）
+  | "start_comfyui";
 
 export type TaskPriority = "high" | "normal" | "low";
 

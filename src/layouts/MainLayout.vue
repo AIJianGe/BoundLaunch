@@ -9,15 +9,20 @@
  * - 顶栏：AppHeader（项目名 + 状态指示 + 设置入口）
  * - 内容区：RouterView
  *
- * 导航项：
+ * 导航项（v3.4 调整顺序：日志上移到第 2 位）：
  * 1. 启动（首页）
- * 2. 核心版本
- * 3. 插件管理
- * 4. 模型路径
- * 5. 日志
+ * 2. 日志
+ * 3. 核心版本
+ * 4. 插件管理
+ * 5. 模型路径
  * 6. 任务进度
  * 7. 关于
  * （设置入口在顶栏右上角 AppHeader）
+ *
+ * v3.4 调整原因：
+ * - 启动 ComfyUI 后用户最关心的就是日志（启动失败要看错误信息）
+ * - 旧顺序"启动 → 核心版本"中间隔着 3 个不相关的菜单，跳转摩擦大
+ * - 启动按钮默认会把页面跳转到 /logs（详见 useStartComfyui），同位置触发更顺滑
  *
  * 实现要点：
  * - 使用 NMenu 标准 `icon` + `label` props（NMenu 在 collapsed 状态下会自动管理图标/文字显隐）
@@ -62,10 +67,10 @@ interface NavItem {
 
 const menus: readonly NavItem[] = [
   { key: "launch", label: "启动", icon: Rocket, path: "/launch" },
+  { key: "logs", label: "日志", icon: ScrollText, path: "/logs" },        // v3.4：上移到第 2 位
   { key: "core", label: "核心版本", icon: RefreshCw, path: "/core" },
   { key: "plugins", label: "插件管理", icon: Puzzle, path: "/plugins" },
   { key: "models", label: "模型路径", icon: Package, path: "/models" },
-  { key: "logs", label: "日志", icon: ScrollText, path: "/logs" },
   { key: "tasks", label: "任务进度", icon: BarChart3, path: "/tasks" },
   { key: "about", label: "关于", icon: Info, path: "/about" },
 ] as const;

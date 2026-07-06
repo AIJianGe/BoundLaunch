@@ -98,7 +98,8 @@ fn detect_cpu_model() -> String {
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("sysctl")
+        // v3.4：使用 new_command（macOS 上无窗口概念，但统一入口便于维护）
+        crate::common::process_util::new_command("sysctl")
             .arg("-n")
             .arg("machdep.cpu.brand_string")
             .output()

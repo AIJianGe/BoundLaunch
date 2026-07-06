@@ -589,3 +589,73 @@ fn parse_cuda_version(s: &str) -> CudaVersion {
         _ => CudaVersion::Cpu, // 兜底
     }
 }
+
+// ====================================================================
+// v3.4：start_comfyui - 启动 ComfyUI 主进程
+// ====================================================================
+
+/// 构造「启动 ComfyUI」任务（v3.4）
+///
+/// **设计要点（与 F1-F3 对齐）**：
+/// - action 闭包是薄壳：调 `service.start(args, app, &sender)` 把 ProgressSender 透传进去
+/// - start() 内部已经在 5 个关键点（10/20/30/50/60%）调 `sender.send_*`，
+///   这里不需要重复写进度上报
+/// - cancel_token 透传到 spawn_health_check（v3.4 同时改造支持）
+/// - 错误统一映射：`ProcessError → String` 走 task_scheduler 的 FinalErr::ActionFailed
+///
+/// **进度阶段**（由 service.start 内部 send_*，factory 不重复）：
+/// - 10% / 15%：校验环境
+/// - 20% / 25%：检查端口
+/// - 30% / 40%：生成 yaml
+/// - 50% / 55%：spawn 进程
+/// - 60% → 90%：等待 ComfyUI 就绪（health_check 每 1s 推一次）
+/// - 95% / 100%：超时 / 成功
+///
+/// **返回 TaskResult**：
+/// - `summary`：格式化启动信息（pid / port / mode）
+/// - `payload`：JSON 包含 pid, port, host（前端用于显示"ComfyUI 已就绪"）
+pub fn make_start_comfyui_task(
+    process_launcher: Arc<crate::process_launcher::ProcessLauncherService>,
+    app: tauri::AppHandle,
+    args: crate::process_launcher::LaunchArgs,
+) -> TaskDef {
+    TaskDef {
+        kind: TaskKind::StartComfyUI,
+        name: "启动 ComfyUI".to_string(),
+        priority: None, // 取 default_priority = High
+        action: Box::new(move |_cancel, sender| {
+            let launcher = process_launcher.clone();
+            let app = app.clone();
+            let args = args.clone();
+            Box::pin(async move {
+                // v3.4：失败处理
+                // - service.start() 内部已加 5s 早期死亡检测（5s 内 child 死 → EarlyExit）
+                // - EarlyExit 的 ProcessError Display 已含 stderr_tail（最近 50 行）
+                // - health_check 检测到 child 死（5s~60s 之间）→ emit process_crashed + 走 stop_impl
+                // - 此处 start() 返回 Err 时，错误信息已包含完整 stderr tail，前端 task_failed 事件可直接渲染
+                launcher
+                    .start(args.clone(), app, Some(&sender))
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "make_start_comfyui_task: start failed");
+                        // to_string() 走 ProcessError Display，EarlyExit 变体自带 stderr tail
+                        e.to_string()
+                    })?;
+
+                // 启动成功（service.start 返回 Ok 意味着 spawn 成功 + 早期检测通过 + pipeline 就绪）
+                // 注：实际"ComfyUI 就绪"由 health_check task 后续通过 process_started 事件通知
+                Ok(TaskResult {
+                    summary: format!(
+                        "ComfyUI 启动命令已提交 (mode={:?}, port={})",
+                        args.mode, args.listen_port
+                    ),
+                    payload: Some(serde_json::json!({
+                        "host": args.listen_host,
+                        "port": args.listen_port,
+                        "mode": format!("{:?}", args.mode).to_lowercase(),
+                    })),
+                })
+            })
+        }),
+    }
+}

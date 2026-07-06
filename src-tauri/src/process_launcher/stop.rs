@@ -16,6 +16,7 @@ use std::time::Duration;
 use chrono::Utc;
 use tokio::process::Child;
 
+use crate::common::process_util::decode_windows_bytes;
 use crate::error::ProcessError;
 use crate::process_launcher::models::{ProcessStatus, StopReason};
 
@@ -90,7 +91,10 @@ pub async fn terminate_process(pid: u32, force: bool) -> std::io::Result<()> {
 
         if !output.status.success() {
             // taskkill 返回非零：可能进程已退出，检查 stderr 内容
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            // v3.4.2 修复乱码：Windows taskkill 输出是 GBK 编码，直接 from_utf8_lossy 会乱码
+            // （特别是中文错误"找不到进程"会变成"鎵句笉鍒拌繘绋嬩箣绫"）
+            // 改用 encoding_rs 显式按 GBK 解码 → 统一 UTF-8 输出
+            let stderr = decode_windows_bytes(&output.stderr);
             // 错误码 128 表示进程不存在（即已退出）
             if stderr.contains("not found") || stderr.contains("找不到")
                 || stderr.contains("no such process")

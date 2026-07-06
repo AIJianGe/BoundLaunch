@@ -51,7 +51,8 @@ onMounted(async () => {
     try {
       // 拉取后端 RingBuffer 里的历史日志（最多 200 行）
       // v3.2.2：loadHistoryLogs 已同步填充 logBuffer + logEntries
-      await processStore.loadHistoryLogs(200);
+      // v3.4.2：append 模式，避免覆盖 in-memory 已有的日志
+      await processStore.loadHistoryLogs(200, true);
       historyLoaded.value = true;
     } catch (e) {
       console.warn("[TerminalPanel] loadHistoryLogs failed:", e);

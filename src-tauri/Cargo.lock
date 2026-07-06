@@ -193,6 +193,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "dirs 5.0.1",
+ "encoding_rs",
  "fs2",
  "futures",
  "git2",

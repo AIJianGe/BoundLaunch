@@ -44,7 +44,8 @@ impl LaunchArgs {
             mode: LaunchMode::GpuHigh,
             listen_host: "127.0.0.1".into(),
             listen_port: 8188,
-            preview_method: PreviewMethod::Latent,
+            // v3.4.1 修复：旧版 PreviewMethod::Latent（"latent"）已被 ComfyUI 移除
+            preview_method: PreviewMethod::Latent2Rgb,
             auto_launch: true,
             advanced: AdvancedArgs::default(),
             custom_args: None,

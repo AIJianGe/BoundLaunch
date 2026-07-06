@@ -58,7 +58,8 @@ async fn detect_nvidia() -> Vec<GpuInfo> {
     let result = timeout(
         Duration::from_secs(5),
         tokio::task::spawn_blocking(|| {
-            let output = Command::new("nvidia-smi")
+            // v3.4：用 new_command_sync 避免 Windows 上弹 cmd 窗口
+            let output = crate::common::process_util::new_command_sync("nvidia-smi")
                 .args([
                     "--query-gpu=name,memory.total,driver_version",
                     "--format=csv,noheader,nounits",
@@ -113,7 +114,10 @@ fn parse_nvidia_line(line: &str) -> Option<GpuInfo> {
 
 /// 从 `nvidia-smi` 头部提取 CUDA Version
 fn extract_cuda_version() -> Option<String> {
-    let output = Command::new("nvidia-smi").output().ok()?;
+    // v3.4：用 new_command_sync 避免 Windows 上 nvidia-smi 弹 cmd 窗口
+    let output = crate::common::process_util::new_command_sync("nvidia-smi")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -155,7 +159,8 @@ async fn detect_amd_linux() -> Vec<GpuInfo> {
     let result = timeout(
         Duration::from_secs(5),
         tokio::task::spawn_blocking(|| {
-            let output = Command::new("rocm-smi")
+            // v3.4：用 new_command_sync 统一入口
+            let output = crate::common::process_util::new_command_sync("rocm-smi")
                 .args(["--showproductname", "--csv"])
                 .output();
             match output {
@@ -212,7 +217,8 @@ async fn detect_amd_windows() -> Vec<GpuInfo> {
         Duration::from_secs(5),
         tokio::task::spawn_blocking(|| {
             // PowerShell: Get-CimInstance Win32_VideoController | Where Name -match "AMD|Radeon"
-            let output = Command::new("powershell")
+            // v3.4：用 new_command_sync 避免 Windows 上 PowerShell 弹控制台窗口
+            let output = crate::common::process_util::new_command_sync("powershell")
                 .args([
                     "-NoProfile",
                     "-Command",
@@ -266,7 +272,8 @@ async fn detect_intel_windows() -> Vec<GpuInfo> {
     let result = timeout(
         Duration::from_secs(5),
         tokio::task::spawn_blocking(|| {
-            let output = Command::new("powershell")
+            // v3.4：用 new_command_sync 避免 Windows 上 PowerShell 弹控制台窗口
+            let output = crate::common::process_util::new_command_sync("powershell")
                 .args([
                     "-NoProfile",
                     "-Command",
@@ -308,7 +315,8 @@ async fn detect_intel_unix() -> Vec<GpuInfo> {
     let result = timeout(
         Duration::from_secs(5),
         tokio::task::spawn_blocking(|| {
-            let output = Command::new("sycl-ls").output();
+            // v3.4：用 new_command_sync 统一入口
+            let output = crate::common::process_util::new_command_sync("sycl-ls").output();
             match output {
                 Ok(out) if out.status.success() => {
                     let text = String::from_utf8_lossy(&out.stdout);
@@ -345,7 +353,8 @@ async fn detect_apple() -> Vec<GpuInfo> {
     let result = timeout(
         Duration::from_secs(5),
         tokio::task::spawn_blocking(|| {
-            let output = Command::new("system_profiler")
+            // v3.4：用 new_command_sync 统一入口
+            let output = crate::common::process_util::new_command_sync("system_profiler")
                 .args(["SPDisplaysDataType", "-json"])
                 .output();
             match output {

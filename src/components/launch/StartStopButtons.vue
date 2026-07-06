@@ -10,6 +10,18 @@
  * - 按钮只显示"启动"或"停止"，保持启动器极简
  * - 环境未就绪时：按钮仍显示"▶ 启动"，sublabel 提示去设置页，点击 toast 引导
  *
+ * v3.4 变更（异步启动 + 进度可视化）：
+ * - 用 `useStartComfyui` 替代 `processStore.start()`，提交后立即返回 task_id
+ * - 启动后自动 `router.push('/logs')` 跳到日志页
+ * - 按钮下方加 NProgress 进度条 + 阶段消息（10%→100% 实时刷新）
+ * - 失败时 NModal 显示 stderr tail（来自 ProcessError::EarlyExit Display）
+ * - 5s~60s 期间 child 死亡 → process_crashed 事件 → 同样弹 stderr tail
+ *
+ * v3.4.2 变更（完全异步 + elapsed 倒计时）：
+ * - 启动按钮下方加 elapsed 倒计时（"已等待 Xs"）
+ * - 后端无 60s 超时限制：取消后由 cancel_token 控制，UI 不再被"超时"误导
+ * - 启动中加 NSpin 旋转图标
+ *
  * 单按钮状态机（按优先级排序）：
  *
  * | 状态 | label | type | 点击行为 |
@@ -30,13 +42,14 @@
  * exiting > env_switching > starting > running > crashed > stopped
  */
 
-import { computed } from "vue";
-import { NButton, NSpin } from "naive-ui";
+import { computed, onUnmounted, ref, watch } from "vue";
+import { NButton, NSpin, NProgress, NModal, NSpace, NText } from "naive-ui";
 import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
 import { useToast } from "@/composables/useToast";
 import { useConfirm } from "@/composables/useConfirm";
 import { useEnvInstaller } from "@/composables/useEnvInstaller";
+import { useStartComfyui } from "@/composables/useStartComfyui";
 
 const processStore = useProcessStore();
 const envStore = useEnvStore();
@@ -44,9 +57,63 @@ const toast = useToast();
 const { confirm: showConfirm } = useConfirm();
 const { installMissingSteps, installing: installingEnv } = useEnvInstaller();
 
+// v3.4：启动 ComfyUI 专用 composable（包装 processStart + useTaskProgress + 跳转 + 崩溃弹窗）
+const startComfyui = useStartComfyui();
+
+/** v3.4：失败详情弹窗（显示 stderr tail） */
+const showCrashModal = ref(false);
+const crashModalContent = ref("");
+
+// v3.4.2：启动耗时倒计时（提交启动后每秒 +1）
+const startElapsedSec = ref(0);
+let startTimerHandle: number | null = null;
+function startElapsedTimer() {
+  stopElapsedTimer();
+  startElapsedSec.value = 0;
+  startTimerHandle = window.setInterval(() => {
+    startElapsedSec.value += 1;
+  }, 1000);
+}
+function stopElapsedTimer() {
+  if (startTimerHandle !== null) {
+    clearInterval(startTimerHandle);
+    startTimerHandle = null;
+  }
+}
+function formatElapsed(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return m > 0 ? `${m}分${s}秒` : `${s}秒`;
+}
+// 启动/恢复时启动计时器，task 终态时停止
+// 监听 startComfyui.isRunning 的变化
+watch(
+  () => startComfyui.isRunning.value,
+  (running) => {
+    if (running) {
+      startElapsedTimer();
+    } else {
+      stopElapsedTimer();
+    }
+  },
+);
+
+onUnmounted(() => {
+  stopElapsedTimer();
+});
+
+/** v3.4：把 stderr tail 转成纯文本（用于 NModal 展示） */
+function formatStderrTail(stderrTail: string[]): string {
+  if (!stderrTail || stderrTail.length === 0) {
+    return "(无 stderr 输出，可能 stdout 报错或 main.py 启动前崩溃)";
+  }
+  return stderrTail.join("\n");
+}
+
 /** 6 态枚举（按优先级排序） */
 type ButtonState =
   | "exiting"
+  | "submitting" // v3.4.1：本地提交中（防连点，最高优先级）
   | "env_switching"
   | "starting"
   | "running"
@@ -55,17 +122,20 @@ type ButtonState =
 
 /** 当前按钮状态 */
 const currentState = computed<ButtonState>(() => {
-  // 1. F24 退出流程中（最高优先级，禁用所有按钮）
+  // 1. v3.4.1：本地提交中（防连点）— 同步检查，第一时间 disable
+  // 优先级最高，阻止任何后续点击进入 onStart()
+  if (startComfyui.submitting.value) return "submitting";
+  // 2. F24 退出流程中（次高优先级，禁用所有按钮）
   if (processStore.isExiting) return "exiting";
-  // 2. 环境切换中（torch 切换等，由 envStore.switchingTorch 驱动）
+  // 3. 环境切换中（torch 切换等，由 envStore.switchingTorch 驱动）
   if (envStore.switchingTorch) return "env_switching";
-  // 3. 启动中（process 状态机驱动）
+  // 4. 启动中（process 状态机驱动）
   if (processStore.isStarting) return "starting";
-  // 4. 运行中
+  // 5. 运行中
   if (processStore.isRunning) return "running";
-  // 5. 进程崩溃（可重启）
+  // 6. 进程崩溃（可重启）
   if (processStore.isCrashed) return "crashed";
-  // 6. 已就绪或未就绪，统一归 stopped 态（未就绪由 sublabel + 点击 toast 引导）
+  // 7. 已就绪或未就绪，统一归 stopped 态（未就绪由 sublabel + 点击 toast 引导）
   return "stopped";
 });
 
@@ -85,6 +155,15 @@ const envNotReady = computed(
 /** 按钮配置 */
 const buttonConfig = computed(() => {
   switch (currentState.value) {
+    // v3.4.1：提交中（连点守卫）— 立即 disabled，loading 显示防止误操作
+    case "submitting":
+      return {
+        type: "primary" as const,
+        loading: true,
+        disabled: true,
+        label: "🚀 正在提交",
+        showSublabel: true,
+      };
     case "exiting":
       return {
         type: "default" as const,
@@ -138,6 +217,9 @@ const buttonConfig = computed(() => {
 
 /** 副标题（未就绪提示 / 退出/切换中说明 / 崩溃原因） */
 const sublabel = computed(() => {
+  if (currentState.value === "submitting") {
+    return "启动请求已提交，请勿重复点击...";
+  }
   if (currentState.value === "exiting") {
     return "正在停止 ComfyUI 进程组并释放资源...";
   }
@@ -158,6 +240,7 @@ const sublabel = computed(() => {
 /** 主按钮点击入口（按状态分发） */
 async function onClick() {
   switch (currentState.value) {
+    case "submitting":
     case "exiting":
     case "env_switching":
     case "starting":
@@ -175,8 +258,17 @@ async function onClick() {
 
 /** 启动 ComfyUI（含 readiness 守卫） */
 async function onStart() {
+  // 守卫 0: v3.4.1 连点守卫（最优先级，同步检查）
+  // 必须在**任何 await 之前**置 submitting=true，这样按钮状态能同步变化，
+  // 后续连点全部在 guard 0 处被拦截。
+  if (startComfyui.submitting.value) {
+    return;
+  }
+  startComfyui.markSubmitting();
+
   // 守卫 1: 进程状态机
   if (processStore.isRunning || processStore.isStarting) {
+    startComfyui.unmarkSubmitting();
     toast.info("ComfyUI 已在运行中");
     return;
   }
@@ -217,10 +309,12 @@ async function onStart() {
           await envStore.checkReadiness();
           if (!envStore.readiness?.ready) {
             toast.error("环境未就绪", "安装过程中出现问题，请到「设置 → 路径配置」查看详情");
+            startComfyui.unmarkSubmitting();
             return;
           }
         } else {
           toast.error("环境安装失败", "请到「设置 → 路径配置」重试");
+          startComfyui.unmarkSubmitting();
           return;
         }
       } else {
@@ -229,6 +323,7 @@ async function onStart() {
           "环境未就绪",
           `请前往「设置 → 路径配置」\n手动操作 venv 路径或点击「一键补装」`,
         );
+        startComfyui.unmarkSubmitting();
         return;
       }
     } else {
@@ -237,6 +332,7 @@ async function onStart() {
         "环境未就绪",
         "请前往「设置 → 路径配置」点击「一键补装」",
       );
+      startComfyui.unmarkSubmitting();
       return;
     }
   }
@@ -258,12 +354,35 @@ async function onStart() {
   } catch (e) {
     console.warn("[start] checkConflicts failed:", e);
   }
+
+  // v3.4：用 useStartComfyui 替代 processStore.start()
+  // 行为变化：
+  // - 立即返回 task_id（不阻塞）
+  // - 进度通过 task_progress 事件推送（按钮下方 NProgress 显示）
+  // - 终态自动 router.push('/logs')
+  // - 失败时 NModal 显示 stderr tail
+  // - 5s~60s 期间 child 死亡 → process_crashed 事件 → 同样弹 stderr tail
   try {
-    await processStore.start();
-    toast.success("已发送启动命令");
-  } catch (e) {
-    toast.error("启动失败", e);
+    await startComfyui.start({
+      onCrashed: (event) => {
+        // 5s~60s 期间 child 死亡：弹窗显示 stderr tail
+        const reasonLabel =
+          event.reason === "health_check_detected"
+            ? "健康检查发现崩溃"
+            : "monitor 检测到退出";
+        crashModalContent.value = `ComfyUI ${reasonLabel}（exit code: ${event.exit_code ?? "未知"}）\n\n${formatStderrTail(event.stderr_tail)}`;
+        showCrashModal.value = true;
+      },
+    });
+  } catch {
+    // 错误已由 useStartComfyui 内部 toast.error 提示 + onError 回调
+    // 此处仅 catch 防止异常冒泡（按钮状态机回到 stopped）
+    // v3.4.1：start() 内部的 finally 块已经会把 submitting 置回 false，
+    // 这里不需要再 unmarkSubmitting
   }
+  // 兜底：万一 start() 同步完成且没有触发终态回调，确保 submitting 被重置
+  // （实际上 start() 内的 finally 已经处理了，但这里保留为双保险）
+  startComfyui.unmarkSubmitting();
 }
 
 /** 停止 ComfyUI（带 confirm，幂等） */
@@ -295,9 +414,9 @@ async function onStop() {
         {{ buttonConfig.label }}
       </NButton>
 
-      <!-- 旁置指示：启动中 / 环境切换中 -->
+      <!-- 旁置指示：提交中 / 启动中 / 环境切换中 -->
       <div
-        v-if="currentState === 'starting' || currentState === 'env_switching'"
+        v-if="currentState === 'submitting' || currentState === 'starting' || currentState === 'env_switching'"
         class="side-indicator indicator-warning"
       >
         <NSpin size="small" />
@@ -307,6 +426,42 @@ async function onStop() {
     <div v-if="buttonConfig.showSublabel && sublabel" class="sublabel">
       {{ sublabel }}
     </div>
+
+    <!-- v3.4.2：启动进度条 + elapsed 倒计时（useStartComfyui.isRunning 时显示） -->
+    <div v-if="startComfyui.isRunning.value" class="progress-section">
+      <NProgress
+        type="line"
+        :percentage="startComfyui.progress.value"
+        :indicator-placement="'inside'"
+        :height="14"
+        :border-radius="4"
+        processing
+      />
+      <div class="progress-message">
+        {{ startComfyui.message.value || "准备中..." }}
+      </div>
+      <div class="progress-elapsed">
+        <NSpin size="small" class="progress-spin" />
+        <span>已等待 {{ formatElapsed(startElapsedSec) }}</span>
+      </div>
+    </div>
+
+    <!-- v3.4：失败详情弹窗（显示 stderr tail） -->
+    <NModal
+      v-model:show="showCrashModal"
+      preset="card"
+      title="ComfyUI 启动失败"
+      style="max-width: 800px"
+      :bordered="false"
+      size="huge"
+    >
+      <NSpace vertical>
+        <NText depth="3">
+          以下是 ComfyUI 进程崩溃前的最后日志（最多 50 行）。可全选复制后到 GitHub Issues 搜索类似错误。
+        </NText>
+        <pre class="crash-stderr">{{ crashModalContent }}</pre>
+      </NSpace>
+    </NModal>
   </div>
 </template>
 
@@ -348,5 +503,50 @@ async function onStop() {
   color: var(--app-text-muted, #666);
   line-height: 1.5;
   word-break: break-all;
+}
+
+/* v3.4 进度条样式 */
+.progress-section {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.progress-message {
+  font-size: 12px;
+  color: var(--app-text-muted, #666);
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.progress-elapsed {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--app-warning, #f0a020);
+  font-weight: 500;
+}
+
+.progress-spin {
+  display: inline-flex;
+}
+
+/* v3.4 失败弹窗：stderr 区域 */
+.crash-stderr {
+  margin: 0;
+  padding: 12px;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border-radius: 4px;
+  font-family: "Cascadia Code", "Consolas", "Menlo", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 400px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
 }
 </style>

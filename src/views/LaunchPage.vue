@@ -65,7 +65,8 @@ onMounted(async () => {
     tasks.push(envStore.refresh().catch((e) => console.warn("env refresh:", e)));
   }
 
-  tasks.push(processStore.loadHistoryLogs(200).catch((e) => console.warn("history logs:", e)));
+  // v3.4.2：append 模式（避免覆盖 in-memory 已有的日志）
+  tasks.push(processStore.loadHistoryLogs(200, true).catch((e) => console.warn("history logs:", e)));
 
   await Promise.allSettled(tasks);
 

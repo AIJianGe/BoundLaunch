@@ -17,19 +17,30 @@ import { invoke } from "./index";
 import type { ProcessStatus, ShutdownReason, ShutdownReport } from "./types";
 
 /**
- * 启动 ComfyUI 进程
+ * 启动 ComfyUI 进程（v3.4 改造：从同步阻塞改为异步任务）
+ *
+ * v3.4 关键变化：
+ * - 之前：调 processStart 后等 ComfyUI 完全就绪（最坏 60s+）才返回
+ * - 现在：调 processStart 后立即返回 `task_id`（不等 ComfyUI 启动完成）
  *
  * 参数从 ConfigService 读取最新配置构造，前端无需传参。
- * 调用后立即返回（不等 ComfyUI 启动完成）。
  *
- * @throws `ApiError` 可能的错误：
- *   - "已有进程在运行" (AlreadyRunning)
- *   - "端口 X 已被占用" (PortInUse)
- *   - "环境未就绪" (EnvironmentNotReady)
- *   - "环境脏状态" (DirtyState)
+ * 进度跟踪（前端 useTaskProgress 订阅）：
+ * - `task_progress` 事件：5 段进度（10% 校验 → 20% 端口 → 30% yaml → 50% spawn → 60%→100% 健康检查）
+ * - `task_completed` 事件：spawn 成功 + 早期检测通过（注意：非"ComfyUI 就绪"，就绪由 `process_started` 事件通知）
+ * - `task_failed` 事件：失败时携带完整 stderr tail（来自 ProcessError::EarlyExit Display）
+ *
+ * 进程生命周期事件（仍由 processStore 订阅）：
+ * - `process_starting`：spawn 前 emit
+ * - `process_started`：health_check 通过后 emit
+ * - `process_stopped`：失败/超时/主动停止后 emit
+ * - `process_crashed`（v3.4 新增）：child 死亡时 emit，载荷含 exit_code + stderr_tail
+ *
+ * @returns task_id（UUID v4 字符串），前端用 useTaskProgress 跟踪进度
+ * @throws `ApiError` 提交失败时（队列满 / 内部错误）
  */
-export function processStart(): Promise<void> {
-  return invoke<void>("process_start");
+export function processStart(): Promise<string> {
+  return invoke<string>("process_start");
 }
 
 /**

@@ -285,7 +285,13 @@ pub async fn env_diagnose(state: State<'_, AppState>) -> Result<DiagnoseReport, 
         )
     };
 
-    Ok(recovery::diagnose(&state.python_env, &venv_path, &comfyui_root).await)
+    Ok(recovery::diagnose(
+        &state.python_env,
+        &venv_path,
+        &comfyui_root,
+        &state.event_bus,
+    )
+    .await)
 }
 
 /// 环境修复（v1.8 / F36-Phase2 新增）

@@ -182,7 +182,8 @@ pub async fn core_check_version_compatibility(
                 .map(|c| parse_requirements_simple(&c))
         } else {
             // 通过 git show 读指定 tag 的 requirements.txt
-            let output = std::process::Command::new("git")
+            // v3.4：用 process_util::new_command_sync 避免 Windows 上弹 cmd 窗口
+            let output = crate::common::process_util::new_command_sync("git")
                 .args(["show", &format!("{}:requirements.txt", tag)])
                 .current_dir(&comfyui_root)
                 .output()
@@ -403,15 +404,21 @@ pub async fn core_open_comfyui_dir(state: State<'_, AppState>) -> Result<(), Str
         return Err(format!("ComfyUI 目录不存在: {}", comfyui_root.display()));
     }
     let result = if cfg!(target_os = "windows") {
-        // cmd /c start 第一个 "" 是窗口标题（必需），第二个 "" 包裹路径（允许空格）
+        // v3.4：用 process_util::new_command 避免弹 cmd 窗口
+        // explorer.exe 直接打开目录，比 cmd /c start 更直接也不会闪窗
         let path_str = comfyui_root.display().to_string();
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", &path_str])
+        crate::common::process_util::new_command("explorer")
+            .arg(&path_str)
             .spawn()
     } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(&comfyui_root).spawn()
+        // macOS / Linux 用 new_command（POSIX 上无影响）
+        crate::common::process_util::new_command("open")
+            .arg(&comfyui_root)
+            .spawn()
     } else {
-        std::process::Command::new("xdg-open").arg(&comfyui_root).spawn()
+        crate::common::process_util::new_command("xdg-open")
+            .arg(&comfyui_root)
+            .spawn()
     };
     result.map(|_| ()).map_err(|e| {
         format!(

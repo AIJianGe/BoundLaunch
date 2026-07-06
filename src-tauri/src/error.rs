@@ -145,6 +145,17 @@ pub enum ProcessError {
     Io(String),
     #[error("进程已退出")]
     ProcessExited,
+    /// v3.4：spawn 后早期退出检测窗口（默认 5s）内 child 死亡
+    ///
+    /// 触发场景：ComfyUI 启动阶段即崩溃（ImportError / 参数错误 / 端口被占 / main.py 顶层异常 等）。
+    /// 载荷含 `exit_code` 和 `stderr_tail`（最近 50 行日志），前端可一次性看到 Python 报错全貌。
+    /// 与 `HealthCheckTimeout` 的区别：早期窗口 = spawn 失败，60s 健康检查 = 进程能跑但接口不响应。
+    #[error("ComfyUI 启动后 {window_secs}s 内退出 (exit code: {exit_code:?})\n\n最近日志：\n{stderr_tail}")]
+    EarlyExit {
+        exit_code: Option<i32>,
+        stderr_tail: String,
+        window_secs: u64,
+    },
 }
 
 impl From<std::io::Error> for ProcessError {

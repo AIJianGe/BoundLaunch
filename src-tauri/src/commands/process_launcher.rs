@@ -26,6 +26,8 @@ use tauri::{AppHandle, State};
 use crate::app_state::AppState;
 use crate::event_bus::ShutdownReason;
 use crate::process_launcher::models::{LaunchArgs, ProcessStatus, ShutdownReport};
+use crate::task_scheduler::factory::make_start_comfyui_task;
+use crate::task_scheduler::models::TaskKind;
 
 /// 从 Config 构造 LaunchArgs（运行时快照）
 ///
@@ -54,23 +56,55 @@ fn build_launch_args_from_config(cfg: &crate::config::Config) -> LaunchArgs {
 
 /// 启动 ComfyUI 进程
 ///
-/// 从 ConfigService 读取最新配置，构造 LaunchArgs 后调用 ProcessLauncherService::start。
+/// **v3.4 重大改造**：从「直接调 service.start 同步阻塞」改为「提交 TaskScheduler 任务」。
+/// - 立即返回 `task_id`，不阻塞前端
+/// - 进度由 task_scheduler 通过 `task_progress` 事件（100ms 聚合）推送给前端
+/// - 失败/成功/取消统一通过 `task_completed` / `task_failed` / `task_cancelled` 事件通知
+/// - 取消机制：前端可调 `task_cancel` 终止启动流程
 ///
-/// # 事件
-/// - `process_starting`：状态置为 Starting 时立即 emit
-/// - `process_started`：健康检查通过后 emit
-/// - `process_stopped`：启动失败 / 健康检查超时后 emit
+/// # 任务进度
+/// 任务 ID 可通过 `task_list` 查询，进度通过监听 `task_progress` 事件实时获取：
+/// - 0% → 入队
+/// - 10-55% → 校验 / 端口 / yaml / spawn
+/// - 60-90% → 等待 ComfyUI 就绪（health_check 推进）
+/// - 100% → spawn 成功（注：实际"ComfyUI 就绪"由 `process_started` 事件通知）
+///
+/// # 进程生命周期事件
+/// - `process_starting`：spawn 前 emit
+/// - `process_started`：health_check 通过后 emit
+/// - `process_stopped`：失败 / 超时 / 主动停止后 emit
 ///
 /// # 错误
 /// - `AlreadyRunning`：已有进程在运行
 /// - `PortInUse`：端口被占用
 /// - `EnvironmentNotReady`：venv 未就绪 / dirty 标记存在
 /// - `PythonNotFound` / `MainNotFound` / `SpawnFailed`
+///
+/// # 返回
+/// - `Ok(task_id)`：任务提交成功
+/// - `Err(String)`：提交失败（队列满 / 内部错误）
 #[tauri::command]
 pub async fn process_start(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<String, String> {
+    // **v3.4.1 后端幂等守卫**：检查是否已有 running/queued 的 start_comfyui 任务
+    // 防止用户连点 / 重复调用导致多个 ComfyUI 进程并发 spawn
+    if let Some(existing) = state.task_scheduler.find_active_by_kind(&TaskKind::StartComfyUI).await {
+        let phase = existing.status.as_str();
+        let existing_id = existing.id.clone();
+        tracing::warn!(
+            existing_task_id = %existing_id,
+            phase = %phase,
+            "process_start: 已有 start_comfyui 任务进行中，拒绝重复提交"
+        );
+        return Err(format!(
+            "ComfyUI 启动任务已在进行中（task_id={}, phase={}），请等待完成后再试",
+            existing_id, phase
+        ));
+    }
+
+    // 1. 从 Config 构造 LaunchArgs
     let args = {
         let cfg = state.config.get();
         build_launch_args_from_config(&cfg)
@@ -80,17 +114,21 @@ pub async fn process_start(
         mode = ?args.mode,
         host = %args.listen_host,
         port = args.listen_port,
-        "process_start invoked"
+        "process_start invoked (v3.4 async via TaskScheduler)"
+    );
+
+    // 2. 构造 task 并提交（立即返回 task_id）
+    let task_def = make_start_comfyui_task(
+        state.process_launcher.clone(),
+        app,
+        args,
     );
 
     state
-        .process_launcher
-        .start(args, app)
+        .task_scheduler
+        .submit(task_def)
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "process_start failed");
-            e.to_string()
-        })
+        .map_err(|e| format!("提交启动任务失败: {}", e))
 }
 
 /// 停止 ComfyUI 进程（幂等）
@@ -216,7 +254,8 @@ mod tests {
                 listen_host: "127.0.0.1".into(),
                 listen_port: 8188,
                 auto_open_browser: true,
-                preview_method: PreviewMethod::Latent,
+                // v3.4.1 修复：旧版 Latent 已被移除，改用 Latent2Rgb
+                preview_method: PreviewMethod::Latent2Rgb,
                 custom_args: custom_args.into(),
                 advanced: AdvancedArgs::default(),
             },
@@ -246,7 +285,8 @@ mod tests {
         assert_eq!(args.mode, LaunchMode::GpuHigh);
         assert_eq!(args.listen_port, 8188);
         assert_eq!(args.listen_host, "127.0.0.1");
-        assert_eq!(args.preview_method, PreviewMethod::Latent);
+        // v3.4.1 修复：旧版 Latent 已被移除
+        assert_eq!(args.preview_method, PreviewMethod::Latent2Rgb);
         assert!(args.auto_launch);
         assert!(args.custom_args.is_none(), "空字符串应转为 None");
     }

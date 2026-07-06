@@ -6,8 +6,10 @@
  *
  * 区块：
  * 1. 顶部工具栏：过滤（级别）+ 搜索框 + [清空] [导出]
- * 2. 实时流式日志区（等宽字体）
- * 3. 自动滚动到底部开关
+ * 2. v3.4 新增：ComfyUI 启动进度条（任务进行中时显示）
+ * 3. v3.4 新增：失败详情弹窗（process_crashed 事件触发）
+ * 4. 实时流式日志区（等宽字体）
+ * 5. 自动滚动到底部开关
  *
  * 行为：
  * - 实时日志来自 processStore.logBuffer（"log" 事件）
@@ -15,12 +17,16 @@
  * - 级别着色：ERROR 红 / WARN 黄 / INFO 蓝 / DEBUG 灰
  * - 搜索匹配高亮，非匹配变灰
  *
+ * v3.4 新增：
+ * - 启动任务进度条：从 taskStore 找 kind=start_comfyui 的 running 任务，订阅 task_progress 事件实时刷新
+ * - 失败弹窗：processStore.crashedReason（来自后端 process_crashed 事件载荷）触发 NModal
+ *
  * 设计模式：
- * - **Observer**：订阅 processStore.logBuffer 变化
+ * - **Observer**：订阅 processStore.logBuffer / taskStore.tasks / processStore.crashedReason 变化
  * - **Strategy**：不同 LogLevel 不同着色
  */
 
-import { ref, computed, watch, nextTick, onMounted } from "vue";
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from "vue";
 import {
   NCard,
   NSpace,
@@ -32,13 +38,19 @@ import {
   NEmpty,
   NTooltip,
   NPopconfirm,
+  NProgress,
+  NModal,
+  NText,
 } from "naive-ui";
 import { useProcessStore } from "@/stores/process";
+import { useTaskStore } from "@/stores/task";
 import { logQuery, logClear } from "@/api/log";
+import { listen, type UnlistenFn } from "@/api";
 import { useToast } from "@/composables/useToast";
-import type { LogEntry, LogLevel } from "@/api/types";
+import type { LogEntry, LogLevel, TaskProgressEvent, TaskTerminalEvent } from "@/api/types";
 
 const processStore = useProcessStore();
+const taskStore = useTaskStore();
 const toast = useToast();
 
 const logContainerRef = ref<HTMLElement | null>(null);
@@ -47,6 +59,24 @@ const searchKeyword = ref("");
 const useRegex = ref(false);
 const filterLevel = ref<LogLevel | "all">("all");
 const historyLogs = ref<LogEntry[]>([]);
+
+// v3.4.2：启动任务追踪（仅追踪 task_completed 事件，不再依赖 0-100% 进度条）
+const startTaskActive = ref(false);
+const startTaskMessage = ref<string | null>(null);
+let trackedStartTaskId: string | null = null;
+const taskUnlisteners: UnlistenFn[] = [];
+
+// v3.4.2：启动耗时计时器（task 开始时启动，task 结束时停止）
+const startElapsedSec = ref(0);
+let startTimerHandle: number | null = null;
+
+// v3.4：失败详情弹窗（从 processStore.crashedReason 同步）
+const showCrashModal = computed(() => processStore.crashedReason !== null);
+
+/** 关闭失败弹窗 */
+function dismissCrash() {
+  processStore.dismissCrashed();
+}
 
 const levelOptions = [
   { label: "全部", value: "all" },
@@ -103,7 +133,7 @@ const isMatched = (line: string): boolean => {
   if (!searchKeyword.value.trim()) return true;
   const q = searchKeyword.value;
   try {
-    if (useRegex.value) return new RegExp(q).test(line);
+    if (useRegex.value) return new RegExp(q).test(q);
     return line.toLowerCase().includes(q.toLowerCase());
   } catch {
     return true;
@@ -123,19 +153,118 @@ watch(
   },
 );
 
+/**
+ * v3.4：找到当前 start_comfyui 任务的 id
+ *
+ * 在 task_queued 事件后会被调用；后续 task_progress 事件就用这个 id 过滤
+ */
+function findActiveStartTask(): string | null {
+  const running = taskStore.tasks.find(
+    (t) => t.kind === "start_comfyui" && t.status.phase === "running",
+  );
+  return running?.id ?? null;
+}
+
+/** v3.4.2：订阅 task 事件，匹配 start_comfyui 任务（仅追踪 active 状态，不再依赖进度） */
+async function setupStartTaskListeners() {
+  taskUnlisteners.push(
+    await listen<TaskInfoLite>("task_queued", (e) => {
+      if (e.payload.kind === "start_comfyui") {
+        trackedStartTaskId = e.payload.id;
+        startTaskActive.value = true;
+        startTaskMessage.value = "排队中...";
+        startElapsedTimer();
+      }
+    }),
+    await listen<TaskProgressEvent>("task_progress", (e) => {
+      if (e.payload.task_id === trackedStartTaskId) {
+        // v3.4.2：仅更新阶段消息，不再依赖进度数值
+        startTaskMessage.value = e.payload.message;
+      }
+    }),
+    await listen<TaskTerminalEvent>("task_completed", (e) => {
+      if (e.payload.task_id === trackedStartTaskId) {
+        startTaskActive.value = false;
+        trackedStartTaskId = null;
+        startTaskMessage.value = null;
+        stopElapsedTimer();
+      }
+    }),
+  );
+}
+
+/** v3.4.2：启动/重置启动耗时计时器（每秒 +1） */
+function startElapsedTimer() {
+  stopElapsedTimer();
+  startElapsedSec.value = 0;
+  startTimerHandle = window.setInterval(() => {
+    startElapsedSec.value += 1;
+  }, 1000);
+}
+
+/** v3.4.2：停止启动耗时计时器 */
+function stopElapsedTimer() {
+  if (startTimerHandle !== null) {
+    clearInterval(startTimerHandle);
+    startTimerHandle = null;
+  }
+}
+
+/** v3.4.2：格式化耗时（秒 → "X分Y秒"） */
+function formatElapsed(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return m > 0 ? `${m}分${s}秒` : `${s}秒`;
+}
+
+/** task_queued 事件 payload 的最小子集（实际有更多字段） */
+interface TaskInfoLite {
+  id: string;
+  kind: string;
+}
+
 onMounted(async () => {
+  // 订阅 task_progress / task_completed 事件
+  await setupStartTaskListeners();
+
   // 加载历史日志
   try {
     historyLogs.value = await logQuery({ limit: 200 });
   } catch (e) {
     console.warn("log query:", e);
   }
-  // 加载进程日志缓冲
+  // 加载进程日志缓冲（v3.4.2：append 模式，避免覆盖 in-memory 已有的日志）
   try {
-    await processStore.loadHistoryLogs(200);
+    await processStore.loadHistoryLogs(200, true);
   } catch (e) {
     console.warn("history logs:", e);
   }
+
+  // 如果已有 start_comfyui 任务在跑，标记追踪（用户从其他页面切过来时）
+  try {
+    await taskStore.load();
+    const existing = findActiveStartTask();
+    if (existing) {
+      trackedStartTaskId = existing;
+      startTaskActive.value = true;
+      const t = taskStore.tasks.find((t) => t.id === existing);
+      if (t && t.status.phase === "running") {
+        // v3.4.2：task status 没有 message 字段，从 startTaskMessage 默认值即可
+        startTaskMessage.value = "进行中...";
+      }
+      // v3.4.2：恢复耗时计时器（从 task 创建时间算起）
+      startElapsedTimer();
+    }
+  } catch (e) {
+    console.warn("task load:", e);
+  }
+});
+
+onUnmounted(() => {
+  taskUnlisteners.forEach((un) => un());
+  taskUnlisteners.length = 0;
+  // v3.4.2：清理计时器
+  stopElapsedTimer();
 });
 
 async function onClearLogs() {
@@ -163,17 +292,51 @@ function onExport() {
 
 async function onRefresh() {
   try {
+    // v3.4.2：刷新 = 覆盖模式（强制拉最新 200 行）
     historyLogs.value = await logQuery({ limit: 200 });
-    await processStore.loadHistoryLogs(200);
+    await processStore.loadHistoryLogs(200, false);
     toast.success("日志已刷新");
   } catch (e) {
     toast.error("刷新失败", e);
+  }
+}
+
+/** v3.4：失败原因格式化 */
+function formatCrashReason(reason: string): string {
+  switch (reason) {
+    case "early_exit":
+      return "早期退出（spawn 后 5s 内崩溃）";
+    case "health_check_detected":
+      return "健康检查发现崩溃（5s~60s 之间）";
+    case "monitor_detected":
+      return "运行中崩溃（monitor 检测到退出）";
+    default:
+      return reason;
   }
 }
 </script>
 
 <template>
   <div class="logs-page">
+    <!-- v3.4.2：启动加载提示（task 跟踪中显示，无进度条 → 用户不再被"卡在 X%"误导） -->
+    <NCard v-if="startTaskActive" class="start-progress" :bordered="true" size="small">
+      <NSpace vertical>
+        <div class="start-progress-header">
+          <span class="start-progress-title">
+            <NSpin size="small" class="start-spin" />
+            🚀 ComfyUI 启动中...
+          </span>
+          <NTag size="small" type="info">已等待 {{ formatElapsed(startElapsedSec) }}</NTag>
+        </div>
+        <div class="start-progress-message">
+          {{ startTaskMessage || "准备中..." }}
+        </div>
+        <NText depth="3" class="start-progress-hint">
+          ⏳ ComfyUI 加载时间取决于机器性能与模型大小，请耐心等待。
+        </NText>
+      </NSpace>
+    </NCard>
+
     <NCard class="toolbar" :bordered="true" size="small">
       <div class="toolbar-row">
         <NSelect
@@ -243,6 +406,32 @@ async function onRefresh() {
         </div>
       </div>
     </NCard>
+
+    <!-- v3.4：失败详情弹窗（来自 process_crashed 事件） -->
+    <NModal
+      :show="showCrashModal"
+      preset="card"
+      title="💥 ComfyUI 进程崩溃"
+      style="max-width: 900px"
+      :bordered="false"
+      size="huge"
+      :on-update:show="(v: boolean) => !v && dismissCrash()"
+    >
+      <NSpace v-if="processStore.crashedReason" vertical>
+        <div class="crash-info">
+          <NText strong>原因：</NText>
+          <NText>{{ formatCrashReason(processStore.crashedReason.reason) }}</NText>
+        </div>
+        <div class="crash-info">
+          <NText strong>退出码：</NText>
+          <NText>{{ processStore.crashedReason.exit_code ?? "未知（被信号杀死）" }}</NText>
+        </div>
+        <NText depth="3">
+          以下是 ComfyUI 进程崩溃前的最后日志（最多 50 行）。可全选复制后到 GitHub Issues 搜索类似错误。
+        </NText>
+        <pre class="crash-stderr">{{ processStore.crashedReason.stderr_tail.join("\n") || "(无 stderr 输出)" }}</pre>
+      </NSpace>
+    </NModal>
   </div>
 </template>
 
@@ -251,6 +440,42 @@ async function onRefresh() {
   padding: 16px;
   max-width: 1400px;
   margin: 0 auto;
+}
+
+.start-progress {
+  margin-bottom: 12px;
+  background: linear-gradient(135deg, #e3f2fd 0%, #ffffff 100%);
+  border-color: #90caf9;
+}
+
+.start-progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.start-progress-title {
+  font-weight: 600;
+  color: #1976d2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.start-spin {
+  display: inline-flex;
+}
+
+.start-progress-message {
+  font-size: 12px;
+  color: var(--app-text-muted, #666);
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.start-progress-hint {
+  font-size: 11px;
+  margin-top: 4px;
 }
 
 .toolbar {
@@ -274,7 +499,7 @@ async function onRefresh() {
 }
 
 .log-card {
-  height: calc(100vh - 220px);
+  height: calc(100vh - 280px);
   min-height: 400px;
 }
 
@@ -342,5 +567,28 @@ async function onRefresh() {
 
 .log-plain {
   color: inherit;
+}
+
+/* v3.4：失败弹窗样式 */
+.crash-info {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.crash-stderr {
+  margin: 0;
+  padding: 12px;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border-radius: 4px;
+  font-family: "Cascadia Code", "Consolas", "Menlo", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 500px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
 }
 </style>

@@ -37,6 +37,7 @@
 //! - `env_inspector/gpu.rs::detect_cpu_model` (macOS 路径用 `std::process::Command`)：测试用，不影响用户体验
 
 use std::ffi::OsStr;
+use std::process::Command as StdCommand;
 
 use tokio::process::Command;
 
@@ -83,6 +84,62 @@ pub fn new_command<S: AsRef<OsStr>>(program: S) -> Command {
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
     cmd
+}
+
+/// 创建不弹 cmd 窗口的 std Command（同步版本）
+///
+/// 用法与 `new_command` 完全相同，只是返回 `std::process::Command` 而非 `tokio::process::Command`。
+/// 适用于：不能 await 的同步代码路径（spawn_blocking、闭包）。
+///
+/// ## 跨平台行为
+/// - **Windows**：自动加 `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` flag
+/// - **Linux / macOS**：等价于 `Command::new`（POSIX 进程无"窗口"概念）
+///
+/// ## 使用示例
+/// ```ignore
+/// let output = crate::common::process_util::new_command_sync("nvidia-smi")
+///     .args(["--query-gpu=name"])
+///     .output();
+/// ```
+pub fn new_command_sync<S: AsRef<OsStr>>(program: S) -> StdCommand {
+    let mut cmd = StdCommand::new(program);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd
+}
+
+/// v3.4.2：Windows 控制台输出编码转换（GBK → UTF-8）
+///
+/// - Windows 控制台默认代码页是 GBK（code page 936），
+///   `taskkill` / `wmic` / `nvidia-smi` 等命令行工具的 stdout/stderr 是 GBK 编码
+/// - 直接 `String::from_utf8_lossy` 在非 ASCII 范围会乱码（特别是中文错误信息）
+/// - 用 `encoding_rs` 显式按 GBK 解码 → 输出统一是 UTF-8，方便后续字符串处理
+/// - 非 Windows 平台直接按 UTF-8 解码（Linux / macOS 终端是 UTF-8）
+/// - GBK 解码失败时 fallback 到 UTF-8（罕见，可能是混合编码输出）
+///
+/// ## 使用示例
+/// ```ignore
+/// let output = new_command("taskkill").args(&["/PID", "1234"]).output().await?;
+/// if !output.status.success() {
+///     let stderr = decode_windows_bytes(&output.stderr);
+///     tracing::warn!("taskkill stderr: {}", stderr);
+/// }
+/// ```
+pub fn decode_windows_bytes(bytes: &[u8]) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let (decoded, _enc, had_errors) = encoding_rs::GBK.decode(bytes);
+        if had_errors {
+            return String::from_utf8_lossy(bytes).to_string();
+        }
+        decoded.into_owned()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        String::from_utf8_lossy(bytes).to_string()
+    }
 }
 
 #[cfg(test)]

@@ -32,16 +32,18 @@ use tauri::{AppHandle, Emitter};
 use tokio::process::Child;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::ConfigService;
 use crate::error::ProcessError;
 use crate::log_store::LogStoreService;
 use crate::model_path::ModelPathService;
 use crate::python_env::PythonEnvService;
+use crate::task_scheduler::progress::ProgressSender;
 
 use self::command_builder::build_command;
 use self::log_pipeline::{DEFAULT_BUFFER_CAPACITY, LogPipeline};
-use self::models::{HealthInfo, LaunchArgs, ProcessStatus, ShutdownReport, StopReason};
+use self::models::StopReason;
 use self::start::{
     check_port_available, spawn_health_check, spawn_process, spawn_stderr_reader,
     spawn_stdout_reader, verify_preconditions, venv_python_path, write_pid_file,
@@ -52,6 +54,9 @@ use self::state_machine::{
     transition_to_stopping,
 };
 use self::stop::{remove_pid_file, status_from_exit, stop_with_grace, terminate_process};
+
+// 重新导出数据模型供外部模块使用（v3.4：task_scheduler factory 需要 LaunchArgs）
+pub use self::models::{HealthInfo, LaunchArgs, ProcessStatus, ShutdownReport};
 
 pub mod command_builder;
 pub mod log_pipeline;
@@ -69,7 +74,10 @@ pub use self::shutdown::ShutdownCoordinator;
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 共享内部状态（spawn 闭包捕获用 Arc）
-struct Inner {
+///
+/// v3.4：改为 `pub` 以便 `start.rs::spawn_health_check` 接收 `Arc<Inner>` 后能 try_wait 共享 child
+/// （修复"child 0.5s 死，health_check 傻等 60s"的关键）
+pub struct Inner {
     /// 当前进程状态
     state: PlRwLock<ProcessStatus>,
     /// 当前启动参数（运行中才有，stop 后清空）
@@ -86,6 +94,15 @@ struct Inner {
     monitor_handle: TokioMutex<Option<JoinHandle<()>>>,
     /// 健康检查 task 句柄
     health_check_handle: TokioMutex<Option<JoinHandle<()>>>,
+    /// v3.4.2：取消令牌（用于终止 health_check / monitor / early_detect 三个 detached task）
+    ///
+    /// 之前用 `JoinHandle::abort()` 强杀，但 abort 不优雅（无法区分"自然完成"和"被取消"）。
+    /// 改用 `CancellationToken`：
+    /// - start() 启动时新建一个 token，存到这里
+    /// - 把 clone 分发给 health_check / monitor / early_detect 三个 task
+    /// - stop_impl() 时调 `token.cancel()` → 三个 task 在合适位置 `token.is_cancelled()` 检查后退出
+    /// - start() 完成（spawn 成功）后保留 token（直到 stop 时 cancel）
+    cancel_token: PlRwLock<Option<CancellationToken>>,
 
     // 依赖服务
     python_env: Arc<PythonEnvService>,
@@ -130,6 +147,7 @@ impl ProcessLauncherService {
                 instance_lock: TokioMutex::new(()),
                 monitor_handle: TokioMutex::new(None),
                 health_check_handle: TokioMutex::new(None::<JoinHandle<()>>),
+                cancel_token: PlRwLock::new(None),
                 python_env,
                 model_path,
                 log_store,
@@ -164,7 +182,25 @@ impl ProcessLauncherService {
     /// 10. 创建 LogPipeline + spawn reader tasks
     /// 11. spawn health_check task（成功 → Running）
     /// 12. spawn monitor task（轮询 try_wait 检测自然退出）
-    pub async fn start(&self, args: LaunchArgs, app: AppHandle) -> Result<(), ProcessError> {
+    ///
+    /// **v3.4 增强**：新增 `progress: Option<&ProgressSender>` 参数，
+    /// 拆分 5 阶段上报进度（10% 校验 / 20% 端口 / 30% yaml / 50% spawn / 60% 健康检查）。
+    /// - `None` 时走原行为（向后兼容 `kill_stale_process` 等内部调用）
+    /// - `Some(p)` 时每个关键点调 `p.send_percent(percent)` + `p.send_message(msg)`
+    /// - 注意：start() 本身不等 health_check（v3.2.2 修复），60% 阶段由 health_check 后续 task 推进
+    pub async fn start(
+        &self,
+        args: LaunchArgs,
+        app: AppHandle,
+        progress: Option<&ProgressSender>,
+    ) -> Result<(), ProcessError> {
+        // 进度汇报辅助闭包（None 时静默 no-op）
+        let report = |percent: u8, msg: &str| {
+            if let Some(p) = progress {
+                p.send_percent(percent);
+                p.send_message(msg);
+            }
+        };
         let _lock = self.inner.instance_lock.lock().await;
 
         // 2. refresh status（检测自然退出）
@@ -187,6 +223,9 @@ impl ProcessLauncherService {
         emit_status(&app, &next, "process_starting");
 
         // 5. verify_preconditions（路径热加载：读最新 venv + comfyui_root）
+        //
+        // v3.4 增强：阶段 1 - 校验环境（10%）
+        report(10, "校验环境...");
         let _env_info = match verify_preconditions(
             &self.inner.python_env,
             &self.current_venv_path(),
@@ -194,7 +233,10 @@ impl ProcessLauncherService {
         )
         .await
         {
-            Ok(info) => info,
+            Ok(info) => {
+                report(15, &format!("环境校验通过（python={:?}）", info.python_path));
+                info
+            }
             Err(e) => {
                 // 启动失败：回滚状态
                 *self.inner.state.write() = transition_to_crashed(
@@ -207,12 +249,19 @@ impl ProcessLauncherService {
         };
 
         // 6. check_port_available
+        //
+        // v3.4 增强：阶段 2 - 检查端口（20%）
+        report(20, &format!("检查端口 {} 是否空闲...", port));
         if let Err(e) = check_port_available(&args.listen_host, port).await {
             *self.inner.state.write() = ProcessStatus::Stopped;
             return Err(e);
         }
+        report(25, &format!("端口 {} 空闲", port));
 
         // 7. ensure yaml
+        //
+        // v3.4 增强：阶段 3 - 生成 extra_model_paths.yaml（30%）
+        report(30, "生成 extra_model_paths.yaml...");
         let models_config = self.inner.config.get().models.clone();
         if let Err(e) = self
             .inner
@@ -223,8 +272,12 @@ impl ProcessLauncherService {
             *self.inner.state.write() = ProcessStatus::Stopped;
             return Err(ProcessError::Io(format!("ensure yaml failed: {}", e)));
         }
+        report(40, "extra_model_paths.yaml 已生成");
 
         // 8. build_command + spawn
+        //
+        // v3.4 增强：阶段 4 - spawn ComfyUI 进程（50%）
+        report(50, "启动 ComfyUI 进程...");
         let cmd_args = build_command(&args);
         let venv_python = venv_python_path(&self.current_venv_path());
         tracing::info!(
@@ -244,6 +297,7 @@ impl ProcessLauncherService {
             .ok_or_else(|| ProcessError::SpawnFailed("no pid after spawn".into()))?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        report(55, &format!("ComfyUI 进程已 spawn（pid={}, port={}）", pid, port));
 
         // 9. write PID file
         let started_at = Utc::now();
@@ -269,22 +323,51 @@ impl ProcessLauncherService {
             spawn_stderr_reader(stderr, pipeline);
         }
 
-        // 11. spawn health check task
+        // 10.5 v3.4.2：创建取消令牌（控制 health_check / monitor / early_detect）
+        //
+        // 完全异步架构改造：
+        // - 之前 start() 内部有 5s 早期死亡检测的 `tokio::time::sleep(5s)`，
+        //   阻塞 start() 流程最多 5s + await time。
+        //   但 task_factory 已经把 start 包装成 detached task，sleep 不会阻塞前端 invoke，
+        //   但是 sleep 期间 start() 内部逻辑（包括 progress 推送、process_starting 事件）也无法被外部观察。
+        // - 现在彻底移除 5s 阻塞 sleep，改用 monitor 任务以 500ms 间隔轮询 try_wait，
+        //   0.5s 内 child 死了 monitor 立即检测到 → emit process_crashed + stop_impl。
+        // - health_check 改用 cancel_token 控制（移除 60s 超时限制，无限轮询直到 ready/cancelled/crash）。
+        // - start() 立即返回 Ok(())，task 完成；前端通过 process_started / process_crashed 事件跟踪。
+        let cancel_token = CancellationToken::new();
+        *self.inner.cancel_token.write() = Some(cancel_token.clone());
+
+        // 11. spawn health check task（detached + cancel_token 控制）
         //
         // v3.2.2 关键修复：start() 立即返回，不等 health_check 完成
-        // - 之前 `health_handle.await` 在 start() 流程内 await → 最坏阻塞 60s
-        // - 修复后 health_check 是完全独立的 task：
-        //   - ready → emit("process_started") + transition_to_running
-        //   - timeout → 自动 stop_impl（用户也能点启动按钮立即返回）
-        // - start() 立即返回 Ok(())，前端 invoke 不会阻塞
+        // v3.4.2 增强：
+        // - health_check 接收 cancel_token，取消时立即退出（无需等待 join handle abort）
+        // - 移除 60s 超时限制，无限轮询直到：
+        //   a) child 死了 → emit process_crashed
+        //   b) ComfyUI 就绪 → emit process_started
+        //   c) stop() 调用 → cancel_token.cancel() 触发 health_check 退出
+        //   d) 用户应用关闭 → cancel_token.cancel() 兜底
+        // - 每 30s 推一次 process_health_warning 事件（前端可显示"启动较慢"提示）
+        //
+        // v3.4 增强：spawn_health_check 额外接收 `Arc<Inner>`，每次轮询前 try_wait 共享 child
+        // 修复"child 启动 5s~60s 期间死亡，health_check 傻等 60s 才超时"的问题
+        report(60, &format!("等待 ComfyUI 在 {}:{} 就绪...", args.listen_host, port));
         let inner_for_health = self.inner.clone();
         let app_for_health = app.clone();
+        let progress_for_health = progress.cloned();
+        let cancel_for_health = cancel_token.clone();
         let health_handle = tokio::spawn(async move {
             // spawn_health_check 返回 JoinHandle<HealthCheckOutcome>，需要 await
             // 但 await 在独立 task 内，不阻塞 start() 主流程
-            let outcome = spawn_health_check(port, app_for_health.clone())
-                .await
-                .unwrap_or(HealthCheckOutcome::Timeout);
+            let outcome = spawn_health_check(
+                port,
+                app_for_health.clone(),
+                inner_for_health.clone(),
+                progress_for_health,
+                cancel_for_health,
+            )
+            .await
+            .unwrap_or(HealthCheckOutcome::Cancelled);
             match outcome {
                 HealthCheckOutcome::Ready => {
                     let _lock = inner_for_health.instance_lock.lock().await;
@@ -301,16 +384,35 @@ impl ProcessLauncherService {
                     }
                 }
                 HealthCheckOutcome::Timeout => {
-                    tracing::warn!("health check timeout, triggering stop");
-                    // 复用 stop_impl 走标准停止流程（emit process_stopped 等）
+                    // v3.4.2：移除 60s 超时后，这个分支基本不会触发了（health_check 现在无限轮询）
+                    // 保留兜底：万一未来又加了超时
+                    tracing::warn!("health check timeout (should not happen with v3.4.2), triggering stop");
                     let _ = stop_impl(&inner_for_health, &app_for_health, StopReason::HealthCheckTimeout).await;
+                }
+                HealthCheckOutcome::Crashed(exit_code) => {
+                    // v3.4.2：health_check 检测到 child 死亡（任何时间点）
+                    // 走标准停止流程，emit process_stopped 让前端状态机更新
+                    tracing::warn!(?exit_code, "health check detected child exit, triggering stop");
+                    let _ = stop_impl(&inner_for_health, &app_for_health, StopReason::ExternalSignal).await;
+                }
+                HealthCheckOutcome::Cancelled => {
+                    // v3.4.2：cancel_token 被 cancel（stop_impl 调用）→ 直接退出，不动状态
+                    // stop_impl 会负责把状态推进到 Stopped/Crashed
+                    tracing::info!("health check cancelled (likely stop requested)");
                 }
             }
         });
         *self.inner.health_check_handle.lock().await = Some(health_handle);
 
-        // 12. spawn monitor task
-        let monitor_handle = spawn_monitor(self.inner.clone(), app.clone());
+        // 12. spawn monitor task（detached + cancel_token 控制）
+        //
+        // v3.4.2 改造：
+        // - monitor 接收 cancel_token，cancel 时立即退出（无需 abort）
+        // - monitor 0.5s 轮询，**承担"早期死亡检测"职责**（替代之前的 5s sleep）
+        //   → 0.5s 内 child 死了 monitor 立即检测到 → emit process_crashed
+        //   → 之前要 5s sleep 才能检测到，现在 0.5s 即可
+        // - 移除 5s 早期死亡检测的 sleep（这是阻塞！），start() 立即返回
+        let monitor_handle = spawn_monitor(self.inner.clone(), app.clone(), cancel_token);
         *self.inner.monitor_handle.lock().await = Some(monitor_handle);
 
         tracing::info!(pid, port, "ComfyUI process spawned");
@@ -498,6 +600,16 @@ async fn stop_impl_generic<R: tauri::Runtime>(
 ) -> Result<(), ProcessError> {
     let _lock = inner.instance_lock.lock().await;
 
+    // v3.4.2：先触发取消令牌（health_check / monitor 立即退出）
+    // - 必须在 stop_with_grace 之前 cancel，让 health_check 不再继续发 HTTP 请求
+    // - clone 出 token 立即调 cancel()，再 take 出 inner.cancel_token 字段
+    // - 用 swap_remove 模式：take 出来 + cancel
+    {
+        if let Some(token) = inner.cancel_token.read().clone() {
+            token.cancel();
+        }
+    }
+
     // refresh（可能与 monitor 同时检测到退出，state 已 terminal 时直接返回）
     {
         let exit_status = {
@@ -574,7 +686,13 @@ async fn stop_impl_generic<R: tauri::Runtime>(
     Ok(())
 }
 
-/// 退出后清理：PID 文件、pid、launch_args、log_pipeline、monitor task
+/// 退出后清理：PID 文件、pid、launch_args、cancel_token、monitor/health task
+///
+/// v3.4.2 修复：**不再清空 log_pipeline**
+/// - 之前 `*inner.log_pipeline.write() = None;` 会让 LogPipeline drop，里面的 stdout/stderr reader 收到 EOF 退出
+/// - 后果：LogsPage 切换页面后再切回来，加载历史日志用的是 SQL（持久化的），内存里的就丢了
+/// - 修复：保留 log_pipeline 实例（reader 因 stdout/stderr EOF 已经自然退出，Arc 引用计数 0 后才 drop）
+/// - 用户体验：切换页面再回来，能看到完整的最近 5000 行日志
 async fn cleanup_after_exit(inner: &Arc<Inner>) {
     // Take child out (drop if Some)
     *inner.child.lock().await = None;
@@ -587,10 +705,15 @@ async fn cleanup_after_exit(inner: &Arc<Inner>) {
     *inner.pid.write() = None;
     *inner.launch_args.write() = None;
 
-    // Clear log_pipeline（readers 会因 stdout/stderr EOF 自动退出）
-    *inner.log_pipeline.write() = None;
+    // v3.4.2：清 cancel_token（释放 Arc 引用计数）
+    *inner.cancel_token.write() = None;
 
-    // Abort monitor task
+    // v3.4.2：不再清 log_pipeline
+    // - 保留 pipeline 实例，LogsPage 切换页面后回来还能看到完整最近日志
+    // - reader task 已在 stdout/stderr EOF 时自然退出（Arc 引用计数降为 0 时 drop）
+    // *inner.log_pipeline.write() = None; // ← 注释掉
+
+    // Abort monitor task（cancel_token 兜底，理论上已 cancel 退出）
     if let Some(handle) = inner.monitor_handle.lock().await.take() {
         handle.abort();
     }
@@ -603,10 +726,36 @@ async fn cleanup_after_exit(inner: &Arc<Inner>) {
 }
 
 /// 启动 monitor task：轮询 try_wait 检测自然退出
-fn spawn_monitor(inner: Arc<Inner>, app: AppHandle) -> JoinHandle<()> {
+///
+/// v3.4 增强：检测到 child exit 时，emit `process_crashed` 事件 + 附 stderr tail（最近 50 行）。
+/// 修复了之前"monitor 检测到退出只 log 一行，前端收不到任何崩溃通知"的问题。
+///
+/// v3.4.2 改造：
+/// - 接收 `cancel_token: CancellationToken`：
+///   - stop_impl 调用时调 `cancel_token.cancel()` → monitor 立即退出（无需 abort）
+///   - cancel_token 兜底（用户应用关闭）
+/// - 移除 5s 早期死亡检测的 sleep：
+///   - 之前 start() 内部有 5s 阻塞 sleep，作用是 spawn 后 5s 内检测 child 死亡
+///   - 现在 monitor 0.5s 间隔轮询，**0.5s 内即可检测**（甚至更早，因为 sleep 之前的部分逻辑也要耗时）
+///   - 0.5s vs 5s：提升响应速度 10 倍
+/// - tokio::select! 让 sleep 与 cancel 竞争，cancel 立即生效
+/// - 接收 monitor_handle 由 `monitor_handle: JoinHandle<()>` 注册到 inner，
+///   停止时 abort 兜底（cancel_token 失效时）
+fn spawn_monitor(
+    inner: Arc<Inner>,
+    app: AppHandle,
+    cancel_token: CancellationToken,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(MONITOR_POLL_INTERVAL).await;
+            // v3.4.2：用 tokio::select! 让 sleep 与 cancel 竞争
+            tokio::select! {
+                _ = tokio::time::sleep(MONITOR_POLL_INTERVAL) => {}
+                _ = cancel_token.cancelled() => {
+                    tracing::info!("monitor cancelled (likely stop requested)");
+                    return;
+                }
+            }
 
             let exit_status = {
                 let mut guard = inner.child.lock().await;
@@ -624,6 +773,49 @@ fn spawn_monitor(inner: Arc<Inner>, app: AppHandle) -> JoinHandle<()> {
 
             if let Some(status) = exit_status {
                 tracing::info!(?status, "monitor detected process exit");
+
+                // v3.4 增强：emit process_crashed 事件（前端跳转 + 弹窗用）
+                // 载荷：exit_code + stderr_tail（最近 50 行来自 LogPipeline）
+                let exit_code = status.code();
+                let stderr_tail = inner
+                    .log_pipeline
+                    .read()
+                    .as_ref()
+                    .map(|p| p.tail(50))
+                    .unwrap_or_default();
+
+                // v3.4.2：根据 elapsed 决定 reason 标签
+                // - 0~5s 内 child 死 → reason = "early_exit"（前端显示"早期退出"）
+                // - 5s 后 child 死 → reason = "monitor_detected"（前端显示"运行中崩溃"）
+                // 用 start_time 跟踪：monitor 自身在 spawn 后立即运行，state 里的 started_at 来自 Starting
+                let reason = {
+                    let current = inner.state.read();
+                    match &*current {
+                        ProcessStatus::Starting { started_at, .. }
+                        | ProcessStatus::Running { started_at, .. } => {
+                            let since_start = Utc::now()
+                                .signed_duration_since(*started_at)
+                                .num_seconds();
+                            if since_start <= 5 {
+                                "early_exit"
+                            } else {
+                                "monitor_detected"
+                            }
+                        }
+                        _ => "monitor_detected",
+                    }
+                };
+
+                use tauri::Emitter;
+                let _ = app.emit(
+                    "process_crashed",
+                    serde_json::json!({
+                        "exit_code": exit_code,
+                        "stderr_tail": stderr_tail,
+                        "reason": reason,
+                    }),
+                );
+
                 // 调用 stop_impl 处理退出（已退出则 stop_with_grace 立即返回）
                 let _ = stop_impl(&inner, &app, StopReason::ExternalSignal).await;
                 return;

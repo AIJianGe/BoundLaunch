@@ -294,6 +294,35 @@ impl TaskSchedulerService {
         tasks.get(id).map(|h| h.info.clone())
     }
 
+    /// **v3.4.1 新增**：检查是否存在指定 kind 的非终态任务（用于后端幂等守卫）
+    ///
+    /// 用法：调用方在 `submit` 前调用，避免重复入队。
+    /// - 返回 `Some(TaskInfo)`：已有同 kind 的 queued / running 任务
+    /// - 返回 `None`：可以提交
+    ///
+    /// ## 设计
+    /// - 只过滤"未终态"（Queued / Running），Completed / Failed / Cancelled 视为可再次提交
+    /// - 顺序：按 `started_at` 倒序，取最新的一条
+    /// - 不阻塞、不修改状态
+    pub async fn find_active_by_kind(&self, kind: &TaskKind) -> Option<TaskInfo> {
+        let tasks = self.inner.tasks.read();
+        tasks
+            .values()
+            .filter(|h| h.info.kind == *kind && !h.info.status.is_terminal())
+            .map(|h| h.info.clone())
+            .max_by(|a, b| {
+                let ka = match a.started_at {
+                    Some(t) => t,
+                    None => chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
+                };
+                let kb = match b.started_at {
+                    Some(t) => t,
+                    None => chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
+                };
+                kb.cmp(&ka)
+            })
+    }
+
     /// 阻塞等待任务完成，返回结果或错误
     ///
     /// 实现：每 20ms 查询 status，终态后返回缓存结果
@@ -436,6 +465,8 @@ mod tests {
     fn test_task_kind_as_str() {
         assert_eq!(TaskKind::CloneRepo.as_str(), "clone_repo");
         assert_eq!(TaskKind::FetchTags.as_str(), "fetch_tags");
+        // v3.4
+        assert_eq!(TaskKind::StartComfyUI.as_str(), "start_comfyui");
         assert_eq!(TaskKind::Custom.as_str(), "custom");
     }
 

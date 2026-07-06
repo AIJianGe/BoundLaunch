@@ -681,9 +681,12 @@ mod tests {
 
     #[test]
     fn test_switch_version_params_debug() {
+        use crate::core_manager::compat::SwitchMode;
         let p = SwitchVersionParams {
             target_tag: "v0.3.10".to_string(),
+            mode: SwitchMode::Preserve,
         };
         assert_eq!(p.target_tag, "v0.3.10");
+        assert!(matches!(p.mode, SwitchMode::Preserve));
     }
 }

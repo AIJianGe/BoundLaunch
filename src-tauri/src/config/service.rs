@@ -36,7 +36,22 @@ impl ConfigService {
         }
 
         let config = if path.exists() {
-            let content = tokio::fs::read_to_string(&path).await.map_err(io_err)?;
+            let raw_content = tokio::fs::read_to_string(&path).await.map_err(io_err)?;
+            // **v3.4.1**：旧 preview_method 值（"latent" / "latent-upscale" / "autoencoder"）
+            // 在新枚举中无法反序列化，会导致整个 Config 解析失败、用户配置被重置。
+            // 这里先做 TOML 文本层级的预处理，把旧值替换为新值，再走正常解析流程。
+            let (content, migrated_preview) = preprocess_legacy_toml(&raw_content);
+            if let Some((from, to)) = migrated_preview {
+                tracing::warn!(
+                    from = %from,
+                    to = %to,
+                    "v3.4.1: 旧版 preview_method 自动迁移到 ComfyUI 实际支持的值"
+                );
+            }
+            // 发生了迁移 → 立即把预处理后的文本写回磁盘（避免下次重复处理）
+            if content != raw_content {
+                save_raw_to_disk(&path, &content).await?;
+            }
             match toml::from_str::<Config>(&content) {
                 Ok(mut cfg) => {
                     // 自动迁移
@@ -361,6 +376,94 @@ fn io_err(e: std::io::Error) -> ConfigError {
     ConfigError::IoError(e.to_string())
 }
 
+/// 把原始 TOML 文本原子写回磁盘（不做序列化重整）
+///
+/// 用于 config 预处理后写回：保持原有顺序、注释、空行，不引入 toml 序列化差异。
+async fn save_raw_to_disk(path: &std::path::Path, content: &str) -> Result<(), ConfigError> {
+    use crate::config::atomic_write;
+    atomic_write::atomic_write(path, content)
+        .await
+        .map_err(|e| ConfigError::IoError(e.to_string()))
+}
+
+/// **v3.4.1**：预处理 TOML 文本，把旧版 `preview_method` 值替换为 ComfyUI 实际支持的新值
+///
+/// ## 背景
+/// - 旧 `PreviewMethod` 枚举：`Latent`("latent") / `LatentUpscale`("latent-upscale") /
+///   `Autoencoder`("autoencoder") / `None`("none")
+/// - 新 `PreviewMethod` 枚举（与 ComfyUI main.py argparse 对齐）：`None`("none") /
+///   `Auto`("auto") / `Latent2Rgb`("latent2rgb") / `Taesd`("taesd")
+/// - 旧值直接传 `--preview-method` 会让 main.py argparse 失败 → 进程退出码 2
+///
+/// ## 为什么不用 serde 兼容层
+/// - 直接改 `Deserialize` 实现增加 legacy 别名可行，但会让序列化输出非标准值
+/// - 在解析前替换文本更简单，且不污染运行时数据
+///
+/// ## 实现细节
+/// - 文本替换：仅处理 `preview_method = "..."` 这一行，**不**全局替换 `"latent"` 字符串
+///   （避免误伤其他无关字段）
+/// - 只在文件内确实出现旧值时才替换；命中旧值时返回 `(from, to)` 供调用方打日志
+/// - 不动 schema_version（preview_method 字符串迁移是**兼容性补丁**，不是 schema 升级）
+///
+/// ## 旧 → 新映射
+/// - `latent` → `latent2rgb`
+/// - `latent-upscale` → `taesd`
+/// - `autoencoder` → `auto`
+/// - 其他未知值 → `latent2rgb`（保守默认值）
+fn preprocess_legacy_toml(raw: &str) -> (String, Option<(String, String)>) {
+    use super::models::migrate_legacy_preview_method;
+
+    let mut out = String::with_capacity(raw.len());
+    let mut migrated: Option<(String, String)> = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        // 匹配 `preview_method = "..."`（不区分前后空白，但保留原缩进）
+        if trimmed.starts_with("preview_method") && trimmed.contains('=') {
+            // 拆 "preview_method" "=" 值
+            let parts: Vec<&str> = trimmed.splitn(2, '=').collect();
+            if parts.len() == 2 {
+                let value_part = parts[1].trim();
+                // 提取字符串字面量
+                let stripped = value_part
+                    .trim_start_matches('"')
+                    .trim_end_matches('"')
+                    .trim_end_matches('\'')
+                    .trim_start_matches('\'');
+                if let Some(new_val) = migrate_legacy_preview_method(stripped) {
+                    if migrated.is_none() && stripped != new_val {
+                        migrated = Some((stripped.to_string(), new_val.clone()));
+                    }
+                    // 重建这一行：保留前缀缩进 + key + = + 新的带引号值
+                    let indent = &line[..line.len() - trimmed.len()];
+                    // 原始 value 部分的引号风格
+                    let quote = if value_part.contains('"') { '"' } else { '\'' };
+                    let new_line = format!(
+                        "{}{} = {}{}{}",
+                        indent,
+                        "preview_method",
+                        quote,
+                        new_val,
+                        quote
+                    );
+                    out.push_str(&new_line);
+                    out.push('\n');
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    // 去掉最后多塞的 \n（如果原文以 \n 结尾会多一个）
+    if raw.ends_with('\n') && out.ends_with('\n') && out.len() > raw.len() {
+        out.pop();
+    }
+
+    (out, migrated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,4 +556,84 @@ mod tests {
     }
 
     use super::super::CudaVersion;
+
+    // === v3.4.1: preview_method 旧值迁移测试 ===
+
+    #[test]
+    fn test_preprocess_legacy_toml_latent_to_latent2rgb() {
+        let raw = r#"
+[launch]
+mode = "gpu_high"
+preview_method = "latent"
+listen_port = 8188
+"#;
+        let (out, migrated) = preprocess_legacy_toml(raw);
+        assert_eq!(migrated, Some(("latent".into(), "latent2rgb".into())));
+        assert!(out.contains(r#"preview_method = "latent2rgb""#));
+        assert!(!out.contains(r#"preview_method = "latent""#));
+    }
+
+    #[test]
+    fn test_preprocess_legacy_toml_latent_upscale() {
+        let raw = r#"preview_method = "latent-upscale"
+"#;
+        let (out, migrated) = preprocess_legacy_toml(raw);
+        assert_eq!(migrated, Some(("latent-upscale".into(), "taesd".into())));
+        assert!(out.contains(r#"preview_method = "taesd""#));
+    }
+
+    #[test]
+    fn test_preprocess_legacy_toml_autoencoder() {
+        let raw = r#"preview_method = "autoencoder"
+"#;
+        let (out, migrated) = preprocess_legacy_toml(raw);
+        assert_eq!(migrated, Some(("autoencoder".into(), "auto".into())));
+        assert!(out.contains(r#"preview_method = "auto""#));
+    }
+
+    #[test]
+    fn test_preprocess_legacy_toml_new_value_unchanged() {
+        let raw = r#"preview_method = "latent2rgb"
+"#;
+        let (out, migrated) = preprocess_legacy_toml(raw);
+        assert_eq!(migrated, None, "新值不应触发迁移");
+        assert!(out.contains(r#"preview_method = "latent2rgb""#));
+    }
+
+    #[test]
+    fn test_preprocess_legacy_toml_unknown_value_to_latent2rgb() {
+        let raw = r#"preview_method = "garbage_value"
+"#;
+        let (out, migrated) = preprocess_legacy_toml(raw);
+        assert_eq!(migrated, Some(("garbage_value".into(), "latent2rgb".into())));
+        assert!(out.contains(r#"preview_method = "latent2rgb""#));
+    }
+
+    #[test]
+    fn test_preprocess_legacy_toml_no_preview_method_field() {
+        let raw = r#"
+[launch]
+mode = "gpu_high"
+listen_port = 8188
+"#;
+        let (out, migrated) = preprocess_legacy_toml(raw);
+        assert_eq!(migrated, None);
+        assert_eq!(out.trim(), raw.trim());
+    }
+
+    #[test]
+    fn test_preprocess_legacy_toml_preserves_indent() {
+        let raw = "preview_method = \"latent\"\n";
+        let (out, _) = preprocess_legacy_toml(raw);
+        // 没有缩进，应当保持无缩进
+        assert!(out.starts_with(r#"preview_method = "latent2rgb""#));
+    }
+
+    #[test]
+    fn test_preprocess_legacy_toml_preserves_indent_with_tab() {
+        let raw = "\tpreview_method = \"latent\"\n";
+        let (out, _) = preprocess_legacy_toml(raw);
+        // tab 缩进应当保留
+        assert!(out.starts_with("\tpreview_method = \"latent2rgb\""));
+    }
 }

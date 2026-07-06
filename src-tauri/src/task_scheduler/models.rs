@@ -39,6 +39,9 @@ pub enum TaskKind {
     SwitchPython,
     /// v1.8 / F36：环境修复（诊断 + 自动修复），见 `python_env::recovery`
     EnvRepair,
+    /// v3.4：启动 ComfyUI 主进程（spawn + 健康检查）
+    /// 由 `process_start` command 提交，action 内部调 `service.start(args, app, &sender)`
+    StartComfyUI,
 }
 
 impl TaskKind {
@@ -56,7 +59,8 @@ impl TaskKind {
             | TaskKind::SwitchTorchVariant
             | TaskKind::RebuildVenv
             | TaskKind::SwitchPython
-            | TaskKind::EnvRepair => TaskPriority::High,
+            | TaskKind::EnvRepair
+            | TaskKind::StartComfyUI => TaskPriority::High, // v3.4：启动 ComfyUI 也是用户主动触发
             TaskKind::CloneRepo
             | TaskKind::FetchTags
             | TaskKind::InstallRequirements
@@ -85,6 +89,8 @@ impl TaskKind {
             TaskKind::RebuildVenv => "rebuild_venv",
             TaskKind::SwitchPython => "switch_python",
             TaskKind::EnvRepair => "env_repair",
+            // v3.4
+            TaskKind::StartComfyUI => "start_comfyui",
         }
     }
 }

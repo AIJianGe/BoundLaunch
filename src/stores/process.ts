@@ -3,7 +3,7 @@
  *
  * 设计模式：
  * - **Store (Flux)**：集中管理进程状态
- * - **Observer**：监听后端事件流（starting/started/stopping/stopped/log/stale_process）
+ * - **Observer**：监听后端事件流（starting/started/stopping/stopped/log/stale_process/crashed）
  * - **State Machine**：前端镜像后端 ProcessStatus 状态机
  *
  * 事件订阅清单：
@@ -11,6 +11,7 @@
  * - `process_started`：状态 → Running（含 pid / port）
  * - `process_stopping`：状态 → Stopping
  * - `process_stopped`：状态 → Stopped / Crashed
+ * - `process_crashed`（v3.4 新增）：child 死亡时立即 emit，载荷含 exit_code + stderr_tail
  * - `stale_process_detected`：遗留进程检测（前端弹窗确认是否强杀）
  * - `log`：实时日志行（追加到 logBuffer）
  * - `app_exiting` / `app_exited`：F24 退出流程事件
@@ -19,7 +20,7 @@
  * ```ts
  * const store = useProcessStore();
  * await store.subscribe(); // App.vue onMounted 调用一次
- * await store.start();      // 启动 ComfyUI
+ * await store.start();      // 启动 ComfyUI（v3.4：返回 task_id 已废弃，直接用 useStartComfyui）
  * await store.stop();       // 停止 ComfyUI
  * store.setExiting(true);   // F24 退出流程标记（启动页按钮置灰）
  * ```
@@ -47,6 +48,13 @@ export interface StaleProcessInfo {
   args: unknown;
 }
 
+/** v3.4 新增：process_crashed 事件 payload（对应后端 serde_json::json!） */
+export interface ProcessCrashedEvent {
+  exit_code: number | null;
+  stderr_tail: string[];
+  reason: "early_exit" | "health_check_detected" | "monitor_detected";
+}
+
 export const useProcessStore = defineStore("process", () => {
   // ========== State ==========
   const status = ref<ProcessStatus>({ kind: "stopped" });
@@ -63,6 +71,8 @@ export const useProcessStore = defineStore("process", () => {
   const isExiting = ref(false);
   /** F24 退出原因（来自 AppExiting 事件载荷） */
   const exitingReason = ref<ShutdownReason | null>(null);
+  /** v3.4 新增：最近一次 process_crashed 事件详情（前端弹窗 + LogsPage 顶部展示） */
+  const crashedReason = ref<ProcessCrashedEvent | null>(null);
 
   const unlisteners: UnlistenFn[] = [];
 
@@ -130,15 +140,45 @@ export const useProcessStore = defineStore("process", () => {
    *
    * v3.2.2：同步填充 logBuffer（兼容 LogsPage）和 logEntries（供 TerminalPanel）
    * 后端 tail_log 不区分 stdout/stderr，统一标记为 stdout
+   *
+   * v3.4.2：增加 `append` 参数
+   * - `append=false`（默认）：**替换**模式。清空 logBuffer + logEntries，加载最新 N 行
+   *   - 适用：App.vue 启动初始化、用户主动点"刷新"按钮
+   * - `append=true`：**追加**模式。在现有 logBuffer 末尾追加新行
+   *   - 适用：用户切换页面（LaunchPage / LogsPage / TerminalPanel）时挂载
+   *   - 解决"切换页面再回来，日志消失"问题（之前是替换模式 + 后端 log_pipeline drop → 没了）
+   *   - 可能产生少量重复（in-memory logBuffer 与后端 RingBuffer 有重叠区域），但不会丢日志
    */
-  async function loadHistoryLogs(lines = 200) {
+  async function loadHistoryLogs(lines = 200, append = false) {
     const history = await processTailLog(lines);
-    logBuffer.value = history;
-    logEntries.value = history.map((line) => ({
-      source: "stdout" as const,
-      line,
-      ts: new Date().toISOString(),
-    }));
+    if (append) {
+      // v3.4.2：追加模式 → 不清空已有 logBuffer
+      // 用 Set 去重：避免 in-memory 与后端 RingBuffer 重叠区域重复
+      const existing = new Set(logBuffer.value);
+      const newLines = history.filter((line) => !existing.has(line));
+      logBuffer.value = [...logBuffer.value, ...newLines];
+      // logEntries 同步
+      const existingEntries = new Set(
+        logEntries.value.map((e) => `${e.ts}:${e.line}`),
+      );
+      const newEntries = history
+        .filter((line) => !existing.has(line))
+        .map((line) => ({
+          source: "stdout" as const,
+          line,
+          ts: new Date().toISOString(),
+        }))
+        .filter((e) => !existingEntries.has(`${e.ts}:${e.line}`));
+      logEntries.value = [...logEntries.value, ...newEntries];
+    } else {
+      // 替换模式（默认）：完全覆盖
+      logBuffer.value = history;
+      logEntries.value = history.map((line) => ({
+        source: "stdout" as const,
+        line,
+        ts: new Date().toISOString(),
+      }));
+    }
   }
 
   /** 追加日志行（来自 "log" 事件） */
@@ -168,6 +208,13 @@ export const useProcessStore = defineStore("process", () => {
   /** 忽略遗留进程提示（前端关闭弹窗即可，PID 文件后端会自动清理） */
   function dismissStale() {
     staleProcess.value = null;
+  }
+
+  /**
+   * v3.4 新增：清掉 crashedReason（用户关闭 LogsPage 顶部弹窗 / 重新启动后调用）
+   */
+  function dismissCrashed() {
+    crashedReason.value = null;
   }
 
   /**
@@ -201,6 +248,8 @@ export const useProcessStore = defineStore("process", () => {
       await listen<ProcessStatus>("process_started", (e) => {
         status.value = e.payload;
         error.value = null;
+        // 启动成功 → 清掉 crashedReason（如果之前失败过）
+        crashedReason.value = null;
       }),
       await listen<ProcessStatus>("process_stopping", (e) => {
         status.value = e.payload;
@@ -211,6 +260,16 @@ export const useProcessStore = defineStore("process", () => {
         if (e.payload.kind === "crashed") {
           error.value = e.payload.error;
         }
+      }),
+      // v3.4 新增：process_crashed 事件
+      // - 5s 内 child 死：early_exit 路径（reason）
+      // - 5s~60s 之间 child 死：health_check_detected 路径
+      // - 运行期间 child 死：monitor_detected 路径
+      // 载荷含 exit_code + stderr_tail，前端 LogsPage / StartStopButtons 弹窗用
+      await listen<ProcessCrashedEvent>("process_crashed", (e) => {
+        crashedReason.value = e.payload;
+        error.value = `ComfyUI 已崩溃（exit code: ${e.payload.exit_code ?? "未知"}）`;
+        console.error("[processStore] process_crashed", e.payload);
       }),
       // v3.2.2 修复：事件名 `log` → `comfyui_log`（后端 log_pipeline.rs:185）
       // payload 是 { source, line, ts }，不是字符串
@@ -259,6 +318,7 @@ export const useProcessStore = defineStore("process", () => {
     staleProcess,
     isExiting,
     exitingReason,
+    crashedReason, // v3.4
     // getters
     isRunning,
     isStarting,
@@ -276,6 +336,7 @@ export const useProcessStore = defineStore("process", () => {
     clearLogs,
     killStale,
     dismissStale,
+    dismissCrashed, // v3.4
     setExiting,
     subscribe,
     unsubscribe,

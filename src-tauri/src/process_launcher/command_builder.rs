@@ -136,7 +136,8 @@ mod tests {
             mode,
             listen_host: "127.0.0.1".into(),
             listen_port: 8188,
-            preview_method: PreviewMethod::Latent,
+            // v3.4.1 修复：旧版 Latent 已被移除，改用 Latent2Rgb
+            preview_method: PreviewMethod::Latent2Rgb,
             auto_launch: false,
             advanced: AdvancedArgs::default(),
             custom_args: None,
