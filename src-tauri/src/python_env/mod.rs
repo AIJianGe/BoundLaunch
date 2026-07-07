@@ -12,10 +12,13 @@ pub mod freeze;
 pub mod models;
 pub mod recovery;
 pub mod torch_variant;
+pub mod transformers;
+pub mod transformers_index;
 pub mod uv_runner;
 pub mod verify;
 
 pub use torch_variant::TorchVariant;
+pub use transformers_index::TransformersVersionIndex;
 
 use std::path::{Path, PathBuf};
 
@@ -184,19 +187,54 @@ impl PythonEnvService {
         self.uv.install_python(version, cancel).await
     }
 
-    /// 安装 torch
+    /// 安装 torch（v3.7：F3 三阶段改造）
     ///
-    /// 完成后通过事件总线广播 `TorchInstalled`
+    /// 流程（每阶段 33% 进度）：
+    /// 1. `uv pip install torch torchvision torchaudio`（主包，最慢）
+    /// 2. `uv pip install six Pillow av pycocotools`（torchvision 可选依赖，修复 `ModuleNotFoundError: No module named 'six'`）
+    /// 3. `uv pip check`（F2：发现缺包时返回具体包名）
     ///
-    /// v3.6：接 `CancellationToken`，透传给 `uv.install_torch`
+    /// 完成后通过事件总线广播 `TorchInstalled`。
+    ///
+    /// v3.6：接 `CancellationToken`，透传给 `uv.install_torch` / `install_torch_extras` / `check_missing_deps`
+    /// v3.7（F1+F2+F3）：拆分三阶段 + torchvision 可选依赖 + pip check
+    /// v3.7（F4）：可选 `line_collector` 实时日志（None = 不收集）
     pub async fn install_torch(
         &self,
         venv_path: &Path,
         cuda_version: CudaVersion,
         cancel: &CancellationToken,
+        line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
-        self.uv.install_torch(venv_path, &cuda_version, cancel).await?;
+
+        // 阶段 1/3：装 torch + torchvision + torchaudio（主包）
+        self.uv.install_torch(venv_path, &cuda_version, cancel, line_collector).await?;
+
+        // 阶段 2/3：装 torchvision 可选依赖（six / Pillow / av / pycocotools）
+        // F1 修复 `ModuleNotFoundError: No module named 'six'`：
+        // torchvision 0.20 之前用 six 兼容 Py2/3；新版不再声明为强依赖。
+        // ComfyUI 不直接用 datasets/lsun，但 `import torchvision` 会触发整包加载 → 缺 six 就炸。
+        // 这一步对常用场景都是幂等的（已是最新版的包 uv 会跳过）。
+        self.uv.install_torch_extras(venv_path, cancel, line_collector).await?;
+
+        // 阶段 3/3：F2 `uv pip check` 校验，找出任何漏装的可选依赖
+        // 如果 check 报错，**不**中断流程（用户能看到 stderr 自行补装），
+        // 但用 warn 日志记录，让 LogsPage 能看到
+        match self.uv.check_missing_deps(venv_path).await {
+            Ok(None) => {
+                tracing::info!("uv pip check: all deps satisfied");
+            }
+            Ok(Some(missing)) => {
+                tracing::warn!(
+                    missing = ?missing,
+                    "uv pip check: 仍有缺包（通常不影响 ComfyUI 启动，但可能影响特定插件）"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "uv pip check 失败（不影响主流程）");
+            }
+        }
 
         // 通知其他模块（EnvironmentInspector 失效缓存，ProcessLauncher 重置 dirty 标记）
         self.event_bus
@@ -217,11 +255,13 @@ impl PythonEnvService {
     /// - 完成后通过事件总线广播 `TorchInstalled`（带 variant display name）
     /// - 失败时返回 Err，旧 torch 保留（不破坏 venv）
     /// - 调用方负责更新 Config（向后兼容字段 cuda_version + 新字段 torch_variant）
+    /// v3.7（F4）：可选 `line_collector` 实时日志
     pub async fn switch_torch_variant(
         &self,
         venv_path: &Path,
         variant: &TorchVariant,
         cancel: &CancellationToken,
+        line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
 
@@ -232,7 +272,7 @@ impl PythonEnvService {
             )));
         }
 
-        self.uv.install_torch_variant(venv_path, variant, cancel).await?;
+        self.uv.install_torch_variant(venv_path, variant, cancel, line_collector).await?;
 
         // 通知其他模块
         self.event_bus
@@ -244,6 +284,80 @@ impl PythonEnvService {
         Ok(())
     }
 
+    /// v3.7：切换 transformers 版本
+    ///
+    /// 复用 op_lock 防并发（与 install_torch / install_requirements 互斥），
+    /// 委托给 `transformers::switch_version`。
+    ///
+    /// 完成后 emit `RequirementsInstalled` 让 env cache 失效。
+    ///
+    /// v3.7（F4）：可选 `line_collector` 实时日志（透传给 `switch_version`）
+    pub async fn switch_transformers(
+        &self,
+        venv_path: &Path,
+        version: &str,
+        cancel: &CancellationToken,
+        line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
+    ) -> Result<(), EnvError> {
+        let _guard = self.op_lock.lock().await;
+
+        if !venv_path.exists() {
+            return Err(EnvError::VenvCreateFailed(format!(
+                "venv 不存在: {}（请先完成环境初始化）",
+                venv_path.display()
+            )));
+        }
+
+        crate::python_env::transformers::switch_version(
+            &self.uv,
+            &self.event_bus,
+            venv_path,
+            version,
+            cancel,
+            line_collector,
+        )
+        .await
+    }
+
+    /// v3.7：恢复默认 transformers 版本（按 ComfyUI requirements.txt 约束）
+    ///
+    /// 复用 op_lock 防并发，委托给 `transformers::restore_default`。
+    ///
+    /// 选版规则：从 `TransformersVersionIndex` 取版本列表，排除 5.x（破坏性 API 变更），
+    /// 选满足 `requirements.txt` 中 `transformers>=X.Y.Z` 约束的最新 4.x 版本。
+    ///
+    /// 返回选定的版本号（如 "4.57.3"）
+    ///
+    /// v3.7（F4）：可选 `line_collector` 实时日志（透传给 `restore_default`）
+    pub async fn restore_transformers_default(
+        &self,
+        venv_path: &Path,
+        comfyui_root: &Path,
+        version_index: &TransformersVersionIndex,
+        cancel: &CancellationToken,
+        line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
+    ) -> Result<String, EnvError> {
+        let _guard = self.op_lock.lock().await;
+
+        if !venv_path.exists() {
+            return Err(EnvError::VenvCreateFailed(format!(
+                "venv 不存在: {}（请完成环境初始化）",
+                venv_path.display()
+            )));
+        }
+
+        crate::python_env::transformers::restore_default(
+            &self.uv,
+            &self.event_bus,
+            venv_path,
+            comfyui_root,
+            version_index,
+            cancel,
+            line_collector,
+        )
+        .await
+    }
+
     /// 安装 requirements.txt
     ///
     /// v3.2 修复：成功后 emit `RequirementsInstalled` 事件让 env cache 失效。
@@ -253,15 +367,79 @@ impl PythonEnvService {
     /// `install_torch` 一直有 emit `TorchInstalled`，但 `install_requirements` 漏了。
     ///
     /// v1.8：自动应用 freeze constraints 防止 numpy 等包装到坏版本。
+    ///
+    /// v3.7（F2）：装完后跑 `uv pip check`，如有缺包用 warn 记录（不中断流程，
+    /// 因为 ComfyUI requirements 经常少装一些可选包）
+    /// v3.7（F4）：可选 `line_collector` 实时日志
+    /// v3.7（F1-fix-2）：如果 `uv pip check` 发现 **torchvision 关键依赖** 缺失
+    /// （six/av/Pillow/pycocotools），**自动调 `install_torch_extras` 补装**。
+    /// 这是修复"一键补装不成功"的关键：
+    /// - F1 的 `install_torch_extras` 只在 `install_torch` 阶段跑
+    /// - 如果用户已经跑过 `install_torch`（torch/torchvision 已装），再点"一键补装"
+    ///   只会触发 `install_requirements`，F1 的 extras 不会跑 → six 永远装不上 → ComfyUI 启动炸
+    /// - 修复后：任意路径触发 `install_requirements`，都会自动检测并补装 torchvision 关键依赖
+    /// - 幂等：`install_torch_extras` 用 `--upgrade` 已是最新版的包 uv 会跳过
     pub async fn install_requirements(
         &self,
         venv_path: &Path,
         requirements_file: &Path,
+        pytorch_index: Option<&str>,
         cancel: &CancellationToken,
+        line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
         let constraints = self.prepare_freeze_constraints(venv_path).await?;
-        self.uv.install_requirements(venv_path, requirements_file, Some(&constraints), cancel).await?;
+        // v3.10：传 pytorch_index 给底层，避免 uv 解析时把 torch 拉成 +cpu
+        self.uv
+            .install_requirements(venv_path, requirements_file, Some(&constraints), pytorch_index, cancel, line_collector)
+            .await?;
+
+        // v3.7（F2 + F1-fix-2）：uv pip check 检测缺包
+        // - 关键缺包（torchvision 必需）：**自动补装**（避免 ComfyUI 启动炸）
+        // - 非关键缺包：warn 记录，不补（避免中断流程，custom_nodes 各自负责）
+        const TORCHVISION_CRITICAL_EXTRAS: &[&str] = &["six", "av", "Pillow", "pycocotools"];
+
+        match self.uv.check_missing_deps(venv_path).await {
+            Ok(None) => {
+                tracing::info!("uv pip check: all deps satisfied after requirements install");
+            }
+            Ok(Some(missing)) => {
+                // 关键缺包：six/av/Pillow/pycocotools 任何一个缺失 → 自动补装全部
+                let need_extras: Vec<&str> = missing
+                    .iter()
+                    .map(|s| s.as_str())
+                    .filter(|m| TORCHVISION_CRITICAL_EXTRAS.contains(m))
+                    .collect();
+
+                if !need_extras.is_empty() {
+                    tracing::warn!(
+                        missing = ?need_extras,
+                        "检测到 torchvision 关键依赖缺失，自动调 install_torch_extras 补装"
+                    );
+                    // 补装 4 个全部（幂等：已装版本会被 uv 跳过）
+                    self.uv
+                        .install_torch_extras(venv_path, cancel, line_collector)
+                        .await?;
+                    tracing::info!("torchvision 关键依赖补装完成");
+                }
+
+                // 非关键缺包：仅 warn，不补（让用户自行决定）
+                let non_critical: Vec<&str> = missing
+                    .iter()
+                    .map(|s| s.as_str())
+                    .filter(|m| !TORCHVISION_CRITICAL_EXTRAS.contains(m))
+                    .collect();
+                if !non_critical.is_empty() {
+                    tracing::warn!(
+                        missing = ?non_critical,
+                        "uv pip check: requirements 装完后仍有非关键缺包（可能影响部分 custom_nodes，可手动 `uv pip install` 补齐）"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "uv pip check 失败（不影响主流程）");
+            }
+        }
 
         // v3.2：通知 EnvironmentInspector 失效 30s 缓存
         self.event_bus.emit(SystemEvent::RequirementsInstalled);
@@ -277,16 +455,20 @@ impl PythonEnvService {
     /// v1.8：自动应用 freeze constraints 防止 numpy 等包装到坏版本。
     ///
     /// v3.6：接 `CancellationToken`，透传给 `uv.install_requirements_upgrade`
+    /// v3.7（F4）：可选 `line_collector` 实时日志
+    /// v3.10：新增 `pytorch_index` 参数（与 install_requirements 一致）
     pub async fn install_requirements_upgrade(
         &self,
         venv_path: &Path,
         requirements_file: &Path,
+        pytorch_index: Option<&str>,
         cancel: &CancellationToken,
+        line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
         // 写入 constraints 到 venv（如已存在则覆盖更新）
         let constraints = self.prepare_freeze_constraints(venv_path).await?;
-        self.uv.install_requirements_upgrade(venv_path, requirements_file, Some(&constraints), cancel).await?;
+        self.uv.install_requirements_upgrade(venv_path, requirements_file, Some(&constraints), pytorch_index, cancel, line_collector).await?;
 
         // v3.2：通知 EnvironmentInspector 失效 30s 缓存
         self.event_bus.emit(SystemEvent::RequirementsInstalled);
@@ -360,10 +542,12 @@ impl PythonEnvService {
     /// 3. install_torch（cuda_version from Config）
     /// 4. install_requirements（comfyui_root/requirements.txt）
     /// 5. verify_venv 通过后 emit(VenvRebuilt)
+    /// v3.7（F4）：可选 `line_collector` 实时日志
     pub async fn rebuild_venv(
         &self,
         config: &Config,
         cancel: &CancellationToken,
+        line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
         let venv_path = PathBuf::from(&config.paths.venv_path);
@@ -383,14 +567,17 @@ impl PythonEnvService {
         // 2. 创建 venv
         self.uv.create_venv(&venv_path, python_version, cancel).await?;
 
-        // 3. 装 torch
-        self.uv.install_torch(&venv_path, &cuda_version, cancel).await?;
+        // 3. 装 torch（F3 三阶段 + F1 + F2 + F4 line_collector）
+        self.uv.install_torch(&venv_path, &cuda_version, cancel, line_collector).await?;
+        self.uv.install_torch_extras(&venv_path, cancel, line_collector).await?;
 
         // 4. 装 requirements
         let req_file = comfyui_root.join("requirements.txt");
         if req_file.exists() {
             let constraints = self.prepare_freeze_constraints(&venv_path).await?;
-            self.uv.install_requirements(&venv_path, &req_file, Some(&constraints), cancel).await?;
+            // v3.10：传 pytorch_index，防止 transformers 5.x 等依赖触发 torch 覆盖
+            let pytorch_index = crate::python_env::uv_runner::cuda_index_url(&cuda_version);
+            self.uv.install_requirements(&venv_path, &req_file, Some(&constraints), pytorch_index.as_deref(), cancel, line_collector).await?;
         }
 
         // 5. 校验
@@ -420,12 +607,15 @@ impl PythonEnvService {
     /// 6. verify_venv() 通过后删除备份，失败则恢复备份
     ///
     /// 进度通过 `progress_tx` 推送
+    /// v3.7（F4）：可选 `line_collector` 实时日志
+    #[allow(clippy::too_many_arguments)]
     pub async fn switch_python_version(
         &self,
         new_version: &str,
         config: &Config,
         progress_tx: mpsc::Sender<InstallProgress>,
         cancel: &CancellationToken,
+        line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
     ) -> Result<(), EnvError> {
         let _guard = self.op_lock.lock().await;
         let venv_path = PathBuf::from(&config.paths.venv_path);
@@ -458,7 +648,7 @@ impl PythonEnvService {
             return Err(e);
         }
 
-        // Step 4: 装 torch
+        // Step 4: 装 torch（+extras 三阶段，line_collector 透传）
         let _ = progress_tx
             .send(InstallProgress {
                 stage: InstallStage::InstallingTorch,
@@ -466,7 +656,11 @@ impl PythonEnvService {
                 percent: Some(50),
             })
             .await;
-        if let Err(e) = self.uv.install_torch(&venv_path, &cuda_version, cancel).await {
+        if let Err(e) = self.uv.install_torch(&venv_path, &cuda_version, cancel, line_collector).await {
+            restore_backup(&venv_path, &backup_path).await;
+            return Err(e);
+        }
+        if let Err(e) = self.uv.install_torch_extras(&venv_path, cancel, line_collector).await {
             restore_backup(&venv_path, &backup_path).await;
             return Err(e);
         }
@@ -481,9 +675,11 @@ impl PythonEnvService {
             .await;
         let req_file = comfyui_root.join("requirements.txt");
         if req_file.exists() {
+            // v3.10：传 pytorch_index，防止 transformers 5.x 等依赖触发 torch 覆盖
+            let pytorch_index = crate::python_env::uv_runner::cuda_index_url(&cuda_version);
             if let Err(e) = self
                 .uv
-                .install_requirements(&venv_path, &req_file, None, cancel)
+                .install_requirements(&venv_path, &req_file, None, pytorch_index.as_deref(), cancel, line_collector)
                 .await
             {
                 restore_backup(&venv_path, &backup_path).await;

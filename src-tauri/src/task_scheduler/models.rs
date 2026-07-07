@@ -51,6 +51,12 @@ pub enum TaskKind {
     /// v3.6：环境诊断（torch probe + pip list + requirements 比对）
     /// 由 `env_diagnose` command 提交，返回 DiagnoseReport 作为 payload
     Diagnose,
+    /// v3.7：切换 transformers 版本
+    /// 由 `env_switch_transformers` command 提交
+    SwitchTransformers,
+    /// v3.7：恢复 transformers 默认版本（按 ComfyUI requirements.txt 约束）
+    /// 由 `env_restore_transformers_default` command 提交
+    RestoreTransformersDefault,
 }
 
 impl TaskKind {
@@ -84,6 +90,8 @@ impl TaskKind {
             TaskKind::ScanModels => TaskPriority::Low,
             // v3.6：环境诊断是探查类，Normal 优先（可能耗时 90s，但非阻塞安装）
             TaskKind::Diagnose => TaskPriority::Normal,
+            // v3.7：transformers 版本切换是用户主动触发并等待的安装任务，High 优先
+            TaskKind::SwitchTransformers | TaskKind::RestoreTransformersDefault => TaskPriority::High,
         }
     }
 
@@ -112,6 +120,9 @@ impl TaskKind {
             TaskKind::CheckPrereq => "check_prereq",
             // v3.6
             TaskKind::Diagnose => "diagnose",
+            // v3.7
+            TaskKind::SwitchTransformers => "switch_transformers",
+            TaskKind::RestoreTransformersDefault => "restore_transformers_default",
         }
     }
 }
@@ -216,6 +227,9 @@ pub struct TaskInfo {
     pub status: TaskStatus,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// ✅ P2-1 新增：父任务 ID（None = 根任务）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<TaskId>,
 }
 
 /// TaskScheduler 错误类型

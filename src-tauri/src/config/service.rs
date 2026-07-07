@@ -494,14 +494,14 @@ mod tests {
         let svc = ConfigService::load(path.clone(), test_event_bus()).await.unwrap();
         svc.update(|cfg| {
             cfg.launch.listen_port = 9999;
-            cfg.torch.cuda_version = CudaVersion::Cu124;
+            cfg.torch.cuda_version = CudaVersion::Cu128;
             Ok(())
         }).await.unwrap();
 
         // 重新加载验证
         let svc2 = ConfigService::load(path, test_event_bus()).await.unwrap();
         assert_eq!(svc2.get().launch.listen_port, 9999);
-        assert_eq!(svc2.get().torch.cuda_version, CudaVersion::Cu124);
+        assert_eq!(svc2.get().torch.cuda_version, CudaVersion::Cu128);
     }
 
     #[tokio::test]

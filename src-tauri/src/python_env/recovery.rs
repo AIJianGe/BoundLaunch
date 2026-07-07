@@ -474,11 +474,14 @@ async fn check_requirements_match(
 ///
 /// 命令：`uv pip install "numpy<2.3,<2.4" --python <venv>`
 /// 装完再调 smoke_test_torch 验证。
+///
+/// v3.7（F4）：可选 `line_collector` 实时日志（透传到 uv_run_cmd_with_log）
 pub async fn quick_repair_numpy(
     uv: &UvRunner,
     venv_path: &Path,
     progress: &ProgressSender,
     cancel: &CancellationToken,
+    line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
 ) -> Result<(), EnvError> {
     if cancel.is_cancelled() {
         return Err(EnvError::RebuildFailed {
@@ -502,7 +505,7 @@ pub async fn quick_repair_numpy(
     let args: Vec<&str> = vec![
         "pip", "install", "--upgrade", &venv_arg, "-c", &constraints_arg, "numpy<2.3",
     ];
-    let output = uv_run_cmd(uv, &args, cancel).await?;
+    let output = uv_run_cmd_with_log(uv, &args, cancel, line_collector, "uv:repair-numpy").await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(EnvError::RebuildFailed {
@@ -520,6 +523,8 @@ pub async fn quick_repair_numpy(
 }
 
 /// 轻量修复：重装关键依赖（torch / torchvision / torchaudio / requirements）
+///
+/// v3.7（F4）：可选 `line_collector` 实时日志（透传到 install_torch / install_requirements）
 pub async fn quick_repair_reinstall(
     uv: &UvRunner,
     venv_path: &Path,
@@ -527,6 +532,7 @@ pub async fn quick_repair_reinstall(
     cuda_version: &CudaVersion,
     progress: &ProgressSender,
     cancel: &CancellationToken,
+    line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
 ) -> Result<(), EnvError> {
     if cancel.is_cancelled() {
         return Err(EnvError::RebuildFailed {
@@ -535,7 +541,7 @@ pub async fn quick_repair_reinstall(
     }
     progress.send_percent(10);
     progress.send_message(format!("重装 torch ({})...", cuda_version.display_name()));
-    uv.install_torch(venv_path, cuda_version, cancel).await?;
+    uv.install_torch(venv_path, cuda_version, cancel, line_collector).await?;
 
     progress.send_percent(50);
     let req_file = comfyui_root.join("requirements.txt");
@@ -546,7 +552,9 @@ pub async fn quick_repair_reinstall(
                 detail: format!("写 constraints 失败: {}", e),
             }
         })?;
-        uv.install_requirements(venv_path, &req_file, Some(&constraints), cancel).await?;
+        // v3.10：传 pytorch_index，避免 transformers 5.x 等依赖触发 torch 覆盖成 +cpu
+        let pytorch_index = crate::python_env::uv_runner::cuda_index_url(cuda_version);
+        uv.install_requirements(venv_path, &req_file, Some(&constraints), pytorch_index.as_deref(), cancel, line_collector).await?;
     }
 
     progress.send_percent(90);
@@ -561,12 +569,15 @@ pub async fn quick_repair_reinstall(
 /// 完整重建：删 venv → 重建 → 装 torch → 装 requirements → smoke test
 ///
 /// 最稳但最慢（2-5 分钟）。其他修复都失败时再用。
+///
+/// v3.7（F4）：可选 `line_collector` 实时日志（透传到 rebuild_venv）
 pub async fn rebuild_repair(
     python_env: &PythonEnvService,
     venv_path: &Path,
     config: &Config,
     progress: &ProgressSender,
     cancel: &CancellationToken,
+    line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
 ) -> Result<(), EnvError> {
     if cancel.is_cancelled() {
         return Err(EnvError::RebuildFailed {
@@ -577,7 +588,7 @@ pub async fn rebuild_repair(
     progress.send_message("重建 venv（5 步事务：删 → 建 → 装 torch → 装依赖 → 验证）".to_string());
 
     // 复用现有 rebuild_venv（已经是经过验证的事务）
-    python_env.rebuild_venv(config, cancel).await?;
+    python_env.rebuild_venv(config, cancel, line_collector).await?;
 
     progress.send_percent(90);
     progress.send_message("smoke test...".to_string());
@@ -585,6 +596,210 @@ pub async fn rebuild_repair(
 
     progress.send_percent(100);
     progress.send_message("venv 重建完成".to_string());
+    Ok(())
+}
+
+/// v3.10 新增：强制一致重装 torch/torchvision/torchaudio
+///
+/// ## 适用场景
+/// 用户 Config 已切换 cuda_version（如 cu128），但 venv 中的 torch/torchvision/torchaudio
+/// 来自不同源（PyPI base version + pytorch.org cu128 wheel），导致
+/// `torch.cuda.is_available() = False` 而 ComfyUI 启动时
+/// `import comfy.model_management` → `torch.cuda.current_device()` 抛
+/// `AssertionError: Torch not compiled with CUDA enabled`。
+///
+/// ## 修复策略
+/// **强制从 pytorch.org 源用 `--force-reinstall --no-deps` 重装**：
+/// 1. `uv pip install --index-url <pytorch.org/whl/cu{version}> --force-reinstall --no-deps torch torchvision torchaudio`
+///    - `--force-reinstall`：覆盖已有 wheel（即使版本号相同）
+///    - `--no-deps`：切断依赖链，避免 venv 中其他包影响
+///    - `--index-url`：严格只从 pytorch.org 找，**不走 PyPI**
+/// 2. 装 torch 关键依赖（numpy / psutil / six / av / Pillow / pycocotools）
+/// 3. 装 ComfyUI requirements（已过滤 torch 系列行）
+/// 4. smoke test 验证 `import torch; torch.cuda.is_available()` 返回 true
+///
+/// ## 进度细分
+/// - 10%：开始
+/// - 30%：强制重装 torch 系列（--force-reinstall --no-deps）
+/// - 60%：装 torch 关键依赖
+/// - 80%：装 ComfyUI requirements
+/// - 90%：smoke test
+/// - 100%：完成
+///
+/// ## 不破坏 venv 的其他包
+/// - 只重装 torch/torchvision/torchaudio 三个包
+/// - 其他包（transformers / safetensors / comfy-kitchen 等）保持不变
+pub async fn quick_repair_reinstall_consistent(
+    uv: &UvRunner,
+    venv_path: &Path,
+    comfyui_root: &Path,
+    cuda_version: &CudaVersion,
+    progress: &ProgressSender,
+    cancel: &CancellationToken,
+    line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
+) -> Result<(), EnvError> {
+    if cancel.is_cancelled() {
+        return Err(EnvError::RebuildFailed {
+            detail: "任务已取消".to_string(),
+        });
+    }
+
+    // 1. 计算 pytorch.org 源 URL（与 install_torch 内部逻辑一致）
+    let index_url = crate::python_env::uv_runner::cuda_index_url(cuda_version)
+        .ok_or_else(|| EnvError::RebuildFailed {
+            detail: format!("无法计算 pytorch.org 源 URL（cuda_version={:?}）", cuda_version),
+        })?;
+
+    progress.send_percent(10);
+    progress.send_message(format!(
+        "强制重装 torch/torchvision/torchaudio（来源：pytorch.org {}）",
+        index_url
+    ));
+
+    // 2. 强制重装 torch + torchvision + torchaudio
+    //    --force-reinstall：覆盖已有 wheel
+    //    --no-deps：切断依赖链
+    //    --index-url：严格只从 pytorch.org 找（不走 PyPI）
+    //    --upgrade：强制选 pytorch.org 上最新版本
+    let venv_arg = format!(
+        "--python={}",
+        crate::python_env::uv_runner::venv_python_path(venv_path).to_string_lossy()
+    );
+    let args: Vec<String> = vec![
+        "pip".to_string(),
+        "install".to_string(),
+        venv_arg.clone(),
+        "--index-url".to_string(),
+        index_url.clone(),
+        "--upgrade".to_string(),
+        "--force-reinstall".to_string(),
+        "--no-deps".to_string(),
+        "torch".to_string(),
+        "torchvision".to_string(),
+        "torchaudio".to_string(),
+    ];
+    let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let output = uv_run_cmd_with_log(uv, &args_ref, cancel, line_collector, "uv:repair-force-torch").await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(EnvError::RebuildFailed {
+            detail: format!("强制重装 torch 失败: {}", stderr),
+        });
+    }
+
+    if cancel.is_cancelled() {
+        return Err(EnvError::Cancelled);
+    }
+
+    // 3. 装 torch 关键依赖（numpy / psutil / six / av / Pillow / pycocotools）
+    progress.send_percent(60);
+    progress.send_message("装 torch 关键依赖（numpy/psutil/six/av/Pillow/pycocotools）...".to_string());
+    uv.install_torch_extras(venv_path, cancel, line_collector).await?;
+
+    if cancel.is_cancelled() {
+        return Err(EnvError::Cancelled);
+    }
+
+    // 4. 装 ComfyUI requirements（已过滤 torch 系列行）
+    progress.send_percent(80);
+    let req_file = comfyui_root.join("requirements.txt");
+    if req_file.exists() {
+        progress.send_message("重装 ComfyUI requirements...".to_string());
+        let constraints = freeze::write_constraints_to_venv(venv_path).map_err(|e| {
+            EnvError::RebuildFailed {
+                detail: format!("写 constraints 失败: {}", e),
+            }
+        })?;
+        // v3.10 关键修复：把 pytorch.org 作为 extra-index-url
+        // - 不传 → 走 PyPI 默认源 → transformers 5.x 等依赖触发 uv 重新拉 torch+cpu
+        // - 传 → uv 解析时同时查 PyPI 和 pytorch.org，torch 系列自动从 pytorch.org 拉
+        uv.install_requirements(venv_path, &req_file, Some(&constraints), Some(&index_url), cancel, line_collector).await?;
+    }
+
+    // 5. smoke test：验证 torch.cuda.is_available() = true
+    progress.send_percent(90);
+    progress.send_message("smoke test: 验证 torch.cuda.is_available()...".to_string());
+    uv.smoke_test_torch(venv_path, cancel).await?;
+
+    // v3.10 关键修复：循环兜底
+    //
+    // 即使步骤 2-4 走 extra-index-url，uv cache 中残留的 cpu wheel
+    // 仍可能在 install_requirements 后**触发** torch 重新解析成 cpu 版。
+    // 这里加一道兜底：smoke test 通过 + cuda_available=true 才算成功。
+    // 否则**强制从 pytorch.org 重装 torch**（不走 PyPI），最多 2 次。
+    progress.send_percent(95);
+    progress.send_message("校验 torch.cuda.is_available()...".to_string());
+    let mut cuda_ok = uv
+        .check_torch_cuda_available(venv_path, cancel)
+        .await
+        .unwrap_or(false);
+    let mut retry_count = 0;
+    const MAX_REPAIR_RETRY: u32 = 2;
+    while !cuda_ok && retry_count < MAX_REPAIR_RETRY {
+        retry_count += 1;
+        progress.send_message(format!(
+            "torch.cuda.is_available()=false，强制重装 torch（{}/{}）",
+            retry_count, MAX_REPAIR_RETRY
+        ));
+        tracing::warn!(
+            retry = retry_count,
+            max = MAX_REPAIR_RETRY,
+            index_url = %index_url,
+            "smoke test passed but cuda_available=false, force-reinstalling torch from pytorch.org"
+        );
+        // 强制从 pytorch.org 重装（不走 PyPI，避免再次被 cpu wheel 覆盖）
+        let venv_arg = format!(
+            "--python={}",
+            crate::python_env::uv_runner::venv_python_path(venv_path).to_string_lossy()
+        );
+        let args: Vec<String> = vec![
+            "pip".to_string(),
+            "install".to_string(),
+            venv_arg,
+            "--index-url".to_string(),
+            index_url.clone(),
+            "--upgrade".to_string(),
+            "--force-reinstall".to_string(),
+            "--no-deps".to_string(),
+            "torch".to_string(),
+            "torchvision".to_string(),
+            "torchaudio".to_string(),
+        ];
+        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let output = uv_run_cmd_with_log(uv, &args_ref, cancel, line_collector, "uv:repair-retry-torch")
+            .await
+            .map_err(|e| EnvError::RebuildFailed {
+                detail: format!("重试重装 torch 子进程失败: {}", e),
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EnvError::RebuildFailed {
+                detail: format!("重试重装 torch 失败: {}", stderr),
+            });
+        }
+        // 再次校验
+        cuda_ok = uv
+            .check_torch_cuda_available(venv_path, cancel)
+            .await
+            .unwrap_or(false);
+    }
+    if !cuda_ok {
+        return Err(EnvError::RebuildFailed {
+            detail: format!(
+                "经过 {} 次重试，torch.cuda.is_available() 仍为 false。请检查 NVIDIA 驱动版本是否与 torch 兼容",
+                MAX_REPAIR_RETRY
+            ),
+        });
+    }
+    if retry_count > 0 {
+        progress.send_message(format!(
+            "✓ torch CUDA 校验通过（重试 {} 次）",
+            retry_count
+        ));
+    }
+
+    progress.send_percent(100);
+    progress.send_message("torch 强制一致重装完成".to_string());
     Ok(())
 }
 
@@ -615,6 +830,38 @@ async fn uv_run_cmd(
                 }
             }
         })
+}
+
+/// 包装 uv 子进程调用（带 CancellationToken + 实时日志）（v3.7：F4 新增）
+///
+/// 与 `uv_run_cmd` 区别：stdout/stderr 实时推给 collector。
+async fn uv_run_cmd_with_log(
+    uv: &UvRunner,
+    args: &[&str],
+    cancel: &CancellationToken,
+    line_collector: Option<&std::sync::Arc<crate::common::line_collector::LineCollector>>,
+    source: &str,
+) -> Result<std::process::Output, EnvError> {
+    if let Some(collector) = line_collector {
+        // 带日志的分支
+        let mut cmd = crate::common::process_util::new_command(uv.binary_path());
+        cmd.args(args);
+        crate::common::subprocess::run_with_cancel_and_log(&mut cmd, cancel, collector, source)
+            .await
+            .map_err(|e| match e {
+                crate::common::subprocess::SubprocessError::Cancelled => EnvError::Cancelled,
+                crate::common::subprocess::SubprocessError::Io(e) => EnvError::RebuildFailed {
+                    detail: format!("uv 子进程启动失败: {}", e),
+                },
+                crate::common::subprocess::SubprocessError::Exit { code, stderr } => {
+                    EnvError::RebuildFailed {
+                        detail: format!("uv 子进程退出码 {}: {}", code, stderr),
+                    }
+                }
+            })
+    } else {
+        uv_run_cmd(uv, args, cancel).await
+    }
 }
 
 /// v1.8 一次性迁移：检查并降级 numpy 2.4.x → 2.2.x
@@ -672,7 +919,7 @@ pub async fn run_startup_numpy_migration(
     let cuda = config.torch.cuda_version;
     let dummy_progress = ProgressSender::no_op();
     let uv = python_env.uv();
-    if let Err(e) = quick_repair_numpy(uv, venv_path, &dummy_progress, &cancel).await {
+    if let Err(e) = quick_repair_numpy(uv, venv_path, &dummy_progress, &cancel, None).await {
         let msg = format!("numpy 启动迁移失败（{}）: {}", ver, e);
         tracing::error!(error = %msg, "startup numpy migration failed");
         event_bus.emit(crate::event_bus::SystemEvent::RequirementsInstalled);

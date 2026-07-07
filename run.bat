@@ -14,11 +14,16 @@ REM ============================================================================
 REM Switch to script directory (double-click may start in System32)
 cd /d "%~dp0"
 
+REM 【关键】把 UTF-8 编码切换放在 setlocal 之前
+REM - 否则后续 echo 中文 + Rust 编译中文路径可能显示乱码
+REM - 用户曾误把 "warning: 变量不需要 mut" 当成 ERROR（乱码显示为"报错"）
+chcp 65001 >nul 2>&1
+
 setlocal EnableDelayedExpansion
 
 echo.
 echo ============================================================
-echo   无界启动器 Dev Runner (Windows)
+echo    ޽        Dev Runner (Windows)
 echo   Command: npm run tauri dev
 echo ============================================================
 echo.

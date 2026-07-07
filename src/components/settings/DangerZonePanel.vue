@@ -63,7 +63,7 @@ async function onInitEnv() {
   try {
     await envStore.createVenv(configStore.config?.paths.python_version || "3.11");
     if (configStore.launchMode !== "cpu") {
-      await envStore.installTorch(configStore.config?.torch.cuda_version || "cu121");
+      await envStore.installTorch(configStore.config?.torch.cuda_version || "cu128");
     }
     await envStore.refresh();
     toast.success("环境初始化完成");

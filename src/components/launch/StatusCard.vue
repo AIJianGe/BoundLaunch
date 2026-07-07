@@ -16,7 +16,8 @@
  */
 
 import { computed, ref } from "vue";
-import { NCard, NButton, NSpin, NTooltip, NTag, NSpace } from "naive-ui";
+import { useRouter } from "vue-router";
+import { NCard, NButton, NSpin, NTooltip, NTag, NSpace, NAlert } from "naive-ui";
 import { useEnvStore } from "@/stores/env";
 import { useProcessStore } from "@/stores/process";
 import { useConfigStore } from "@/stores/config";
@@ -221,8 +222,33 @@ const showRepairWizard = ref(false);
 const torchBroken = computed(
   () => envInfo.value !== null && !envInfo.value.torch_installed,
 );
+
+/**
+ * v3.10：检测 torch.cuda_available 与 launch_mode 是否匹配
+ *
+ * 当用户选了 Gpu* 模式但 venv 中 torch 不支持 CUDA 时，提示 mismatch。
+ * - 提示类型：warning
+ * - 位置：状态卡片顶部
+ * - 操作：[去设置修复] 跳到 PyTorch 设置页
+ */
+const cudaMismatch = computed(() => {
+  if (!envInfo.value) return false;
+  if (!envInfo.value.torch_installed) return false;
+  const mode = configStore.launchMode;
+  if (!mode) return false;
+  const gpuMode =
+    mode === "gpu_high" || mode === "gpu_low" || mode === "gpu_no_vram";
+  return gpuMode && !envInfo.value.cuda_available;
+});
+
 function onOpenRepair() {
   showRepairWizard.value = true;
+}
+
+// v3.10：跳到 PyTorch 设置页
+const router = useRouter();
+function onJumpToTorchSettings() {
+  router.push("/settings/torch");
 }
 </script>
 
@@ -248,6 +274,33 @@ function onOpenRepair() {
     </div>
 
     <div v-else class="status-grid">
+      <!-- v3.10：torch mismatch 警告横幅 -->
+      <NAlert
+        v-if="cudaMismatch"
+        type="warning"
+        :show-icon="true"
+        class="mismatch-banner"
+        title="PyTorch 不支持 CUDA"
+        closable
+      >
+        <template #header>
+          <span>⚠ PyTorch 不支持 CUDA</span>
+        </template>
+        当前 venv 中的 PyTorch（{{ envInfo.torch_version || "未知" }}）不支持 CUDA，
+        但启动模式是 <strong>{{ configStore.launchMode }}</strong>（需要 GPU）。
+        点击「启动」会立即报错：
+        <code>AssertionError: Torch not compiled with CUDA enabled</code>
+        <div style="margin-top: 8px;">
+          <NButton
+            type="primary"
+            size="small"
+            @click="onJumpToTorchSettings"
+          >
+            去设置页修复
+          </NButton>
+        </div>
+      </NAlert>
+
       <NTooltip placement="top">
         <template #trigger>
           <div class="status-item">

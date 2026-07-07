@@ -17,7 +17,7 @@ use std::path::Path;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Config;
+use crate::config::{Config, LaunchMode};
 use crate::core_manager::CoreManagerService;
 use crate::env_inspector::models::{DepStatus, DependencyInfo, EnvInfo};
 use crate::python_env::PythonEnvService;
@@ -31,6 +31,17 @@ pub struct ReadinessResult {
     pub missing_steps: Vec<ReadinessStep>,
     /// 各分项状态（前端 UI 详情展示用）
     pub checks: ReadinessChecks,
+    /// 当前生效的启动模式（来自 `config.launch.mode`，前端用其判断 CUDA 模式冲突）
+    ///
+    /// v3.10 新增：与 `cuda_available` 配合，前端可在用户点击"启动"时
+    /// 检测"模式 = CPU / 实际 CUDA 可用"或"模式 = GPU / 实际 CUDA 不可用"两类不匹配，
+    /// 给出引导（避免启动时 AssertionError）。
+    pub launch_mode: LaunchMode,
+    /// torch 在当前 venv 中是否实际可用 CUDA
+    ///
+    /// v3.10 新增：来源 `EnvSnapshot.cuda_available`。
+    /// 注意：此字段反映"torch 库是否就绪"，不等同于"驱动 / 硬件是否支持 CUDA"。
+    pub cuda_available: bool,
 }
 
 /// 分项检查结果
@@ -108,11 +119,15 @@ pub async fn check_readiness(
                     torch_installed: false,
                     requirements_ok: false,
                 },
+                launch_mode: config.launch.mode,
+                // 兜底：检测失败时假设 CUDA 不可用（保守）
+                cuda_available: false,
             };
         }
     };
 
     let torch_installed = env_info.torch.installed;
+    let cuda_available = env_info.torch.cuda_available;
 
     // 5. requirements 是否全部满足
     let (requirements_ok, missing_required) =
@@ -152,6 +167,8 @@ pub async fn check_readiness(
             torch_installed,
             requirements_ok,
         },
+        launch_mode: config.launch.mode,
+        cuda_available,
     }
 }
 
@@ -167,12 +184,15 @@ fn count_requirements_status(deps: &[DependencyInfo]) -> (bool, usize) {
 }
 
 /// 把 `CudaVersion` 枚举转为后端命令接受的字符串
+///
+/// v3.7：支持 cu118 / cu126 / cu128 / cu130
 pub fn cuda_version_to_string(cuda: &crate::config::CudaVersion) -> String {
     use crate::config::CudaVersion::*;
     match cuda {
         Cpu => "cpu".to_string(),
         Cu118 => "cu118".to_string(),
-        Cu121 => "cu121".to_string(),
-        Cu124 => "cu124".to_string(),
+        Cu126 => "cu126".to_string(),
+        Cu128 => "cu128".to_string(),
+        Cu130 => "cu130".to_string(),
     }
 }

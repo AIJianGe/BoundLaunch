@@ -60,7 +60,7 @@ export function useEnvInstaller(): UseEnvInstallerReturn {
         (s) => s.kind === "InstallTorch",
       );
       const cudaVersion =
-        (step && "params" in step && step.params?.cuda_version) || "cu121";
+        (step && "params" in step && step.params?.cuda_version) || "cu128";
       await envStore.installTorch(cudaVersion);
     },
     InstallRequirements: async () => {

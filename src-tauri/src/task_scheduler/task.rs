@@ -25,6 +25,11 @@ pub struct TaskDef {
     pub name: String,
     /// None 时取 kind 的默认优先级
     pub priority: Option<TaskPriority>,
+    /// ✅ P2-1 新增：父任务 ID（None = 根任务）
+    ///
+    /// 由 `TaskSchedulerService::submit_child` 自动注入，
+    /// 业务工厂（make_create_venv_task 等）通常不需要直接设置。
+    pub parent_id: Option<TaskId>,
     /// action 闭包：接收取消令牌与进度发送器，返回业务结果
     pub action: Box<
         dyn FnOnce(CancellationToken, ProgressSender) -> BoxFuture<'static, Result<TaskResult, String>>
@@ -38,6 +43,7 @@ impl std::fmt::Debug for TaskDef {
             .field("kind", &self.kind)
             .field("name", &self.name)
             .field("priority", &self.priority)
+            .field("parent_id", &self.parent_id)
             .field("action", &"<closure>")
             .finish()
     }
@@ -52,6 +58,8 @@ pub(crate) struct TaskHandle {
     pub join: Option<JoinHandle<FinalOutcome>>,
     /// action 的最终结果（终态后填充，wait 直接返回缓存）
     pub final_result: Option<Result<TaskResult, FinalErr>>,
+    /// ✅ P2-1 新增：父任务 ID（None = 根任务）
+    pub parent_id: Option<TaskId>,
 }
 
 /// 调度 task 完成后通过 JoinHandle 传递给主表的最终产物
@@ -70,7 +78,13 @@ pub(crate) enum FinalErr {
 
 impl TaskHandle {
     /// 创建新任务句柄（初始状态 Queued）
-    pub fn new(id: TaskId, kind: TaskKind, name: String, priority: TaskPriority) -> (Self, CancellationToken) {
+    pub fn new(
+        id: TaskId,
+        kind: TaskKind,
+        name: String,
+        priority: TaskPriority,
+        parent_id: Option<TaskId>,
+    ) -> (Self, CancellationToken) {
         let token = CancellationToken::new();
         let info = TaskInfo {
             id: id.clone(),
@@ -80,12 +94,14 @@ impl TaskHandle {
             status: TaskStatus::Queued,
             started_at: None,
             completed_at: None,
+            parent_id: parent_id.clone(),
         };
         let handle = Self {
             info,
             cancel_token: Some(token.clone()),
             join: None,
             final_result: None,
+            parent_id,
         };
         (handle, token)
     }

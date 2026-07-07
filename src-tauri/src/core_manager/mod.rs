@@ -152,6 +152,11 @@ impl CoreManagerService {
     /// 避免用户首次启动时停留在 master 分支（不是稳定版）。
     /// - 找 latest_stable 失败 → 回退到 master（不阻塞 onboarding）
     /// - checkout 失败 → 回退到 master + 记录 warn
+    ///
+    /// **v3.10 改进**：onboarding 默认选「patch = 0 或 1」的稳定版
+    /// （如 v0.29.0、v0.28.1），避免首次装到 v0.27.5 等经过多次 patch 的版本。
+    /// - `update_latest_stable_for_installation` 失败 → 回退到 `update_latest_stable`
+    /// - 两者都失败 → 回退到 master（不阻塞 onboarding）
     pub async fn ensure_cloned(&self) -> Result<(), CoreError> {
         if self.is_cloned().await {
             tracing::debug!("comfyui repo already cloned, skipping");
@@ -162,14 +167,30 @@ impl CoreManagerService {
         let url = self.current_repo_url();
         self.clone_repo(&url).await?;
 
-        // clone 完成后，自动切到最新稳定版（onboarding 体验优化）
+        // clone 完成后，自动切到「引导安装默认版本」
         // 失败不阻塞（用户可能想用 master / 网络问题拉不到 tags）
-        match self.update_latest_stable().await {
+        match self.update_latest_stable_for_installation().await {
             Ok(tag) => {
-                tracing::info!(tag = %tag, "onboarding auto-switched to latest stable");
+                tracing::info!(tag = %tag, "onboarding auto-switched to installation-default stable");
             }
             Err(e) => {
-                tracing::warn!(error = %e, "onboarding auto-switch to latest_stable failed, staying on master");
+                tracing::warn!(
+                    error = %e,
+                    "onboarding auto-switch to installation-default failed, falling back to latest_stable"
+                );
+                // 兜底 1：再试一次「SemVer 最大稳定版」
+                match self.update_latest_stable().await {
+                    Ok(tag) => {
+                        tracing::info!(tag = %tag, "onboarding fell back to latest_stable");
+                    }
+                    Err(e2) => {
+                        // 兜底 2：停留在 master
+                        tracing::warn!(
+                            error = %e2,
+                            "onboarding auto-switch to latest_stable failed, staying on master"
+                        );
+                    }
+                }
             }
         }
 
@@ -418,6 +439,31 @@ impl CoreManagerService {
 
         self.checkout(&latest).await?;
         Ok(latest)
+    }
+
+    /// v3.10：更新到「引导安装默认版本」
+    ///
+    /// 区别于 `update_latest_stable`：
+    /// - `update_latest_stable`：选 SemVer 最大的稳定版（v0.27.5 也会被选）
+    /// - **本函数**：选"发布日期最后 + patch = 0 或 1"的稳定版
+    ///   （如 v0.29.0、v0.28.1），更适合 onboarding 首次安装。
+    ///
+    /// 兜底：若过滤后无符合规则的 tag，回退到 `update_latest_stable` 行为。
+    ///
+    /// 用例：`ensure_cloned`（首次启动）调用本函数，避免默认装到 v0.27.5。
+    pub async fn update_latest_stable_for_installation(&self) -> Result<String, CoreError> {
+        let tags = self.list_tags(true).await?;
+        let target = tags::latest_stable_for_installation(&tags).ok_or_else(|| {
+            CoreError::GitError("no stable tag found for installation".to_string())
+        })?;
+
+        let status = self.current_version().await?;
+        if status.current_version.as_deref() == Some(&target) {
+            return Ok(target);
+        }
+
+        self.checkout(&target).await?;
+        Ok(target)
     }
 
     /// 检查工作区是否有未提交改动

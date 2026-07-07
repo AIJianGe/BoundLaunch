@@ -49,6 +49,19 @@ pub const FROZEN_CONSTRAINTS: &[(&str, &str)] = &[
     // setuptools 80+ 不再支持 Python 3.8（若 venv 装 3.8 会 break）
     // 保留上界确保 venv 创建时不会装上
     ("setuptools", "<80"),
+    // v3.10：transformers 锁 <5.0
+    //
+    // 业务原因：
+    // - ComfyUI `requirements.txt` 写 `transformers>=4.50.3`，只锁下界
+    // - 不锁上界时，uv 自动从 PyPI 拉最新，会直接跳到 5.x（跨主版本）
+    // - transformers 5.x 对 ComfyUI 0.4.x 系列是**未测试**的实验版
+    //   （ComfyUI 0.4.x 发布时 transformers 4.57.6 是稳定版）
+    // - 自动修复路径必须保持稳定版（除非用户手动切换）
+    //
+    // 兜底：未来 ComfyUI 正式推荐 5.x 时，只需把此条改为 `<6.0` 或删除
+    ("transformers", "<5.0"),
+    // v3.10：tokenizers 跟随 transformers 主版本（避免 4.x 升到 5.x 时 tokenizers 仍 0.x）
+    ("tokenizers", "<1.0"),
 ];
 
 /// 生成 constraints.txt 内容（PEP 508 格式）

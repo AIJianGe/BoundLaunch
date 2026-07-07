@@ -92,6 +92,7 @@ pub fn make_switch_version_task(params: SwitchVersionParams, ctx: SwitchContext)
         kind: TaskKind::Checkout,
         name: format!("切换 ComfyUI 版本到 {}", params.target_tag),
         priority: None, // default = High
+        parent_id: None,
         action: Box::new(move |cancel_token: CancellationToken, progress: ProgressSender| {
             let params = params.clone();
             let ctx = ctx;
@@ -147,9 +148,18 @@ async fn run_switch_version_impl(
     progress.send_message(format!("开始切换到 {}", params.target_tag));
 
     // 实时日志收集器（供所有 git / uv 操作使用）
-    // LineCollector::new(cap) 返回 (Arc<Self>, Receiver)，
-    // 直接取 .0 即 Arc<LineCollector>，不要再包一层 Arc
-    let log_collector = LineCollector::new(500).0;
+    // ✅ P0-2 修复：创建 collector 同时拿到 rx，启动 forwarder 把日志推到 ProgressSender
+    // 这样父任务的 git status / fetch / checkout 输出会实时显示在前端
+    let (log_collector, log_rx) = LineCollector::new(500);
+    // ✅ P0-2 修复：clone 一份给 forwarder，避免后续 send_message/send_percent 报 moved 错
+    let progress_for_forwarder = progress.clone();
+    let _log_forwarder = tokio::spawn(async move {
+        let mut rx = log_rx;
+        while let Some(line) = rx.recv().await {
+            progress_for_forwarder.send_log(line.source, line.text);
+        }
+        tracing::debug!("switcher log forwarder exited");
+    });
 
     // ========== 步骤 1：前置检查 ==========
     progress.send_message("检查 ComfyUI 进程状态".to_string());
@@ -349,6 +359,10 @@ async fn run_switch_version_impl(
     // ========== 步骤 8-10：依 effective_mode 处理 venv ==========
     // v3.5：步骤 8/9/10 改为 submit 子任务（无 await 阻塞）
     let mut requirements_reinstalled = false;
+    // v3.10：提前读 cuda_version，Preserve 模式也需要它计算 pytorch_index
+    let config_for_pytorch_index = ctx.config.get();
+    let cuda_version = config_for_pytorch_index.torch.cuda_version;
+    drop(config_for_pytorch_index);
     match effective_mode {
         SwitchMode::Clean => {
             // 删除旧 venv（同步 IO，无 cancel 需求）
@@ -424,7 +438,7 @@ async fn run_switch_version_impl(
             }
 
             let config_for_install = ctx.config.get();
-            let cuda_version = config_for_install.torch.cuda_version;
+            // v3.10：cuda_version 已在外层 match 之前读取，这里只读 torch_variant_json
             let torch_variant_json = config_for_install.torch.torch_variant.clone();
             drop(config_for_install);
 
@@ -508,10 +522,13 @@ async fn run_switch_version_impl(
             progress.send_message("安装 requirements.txt（提交子任务）".to_string());
             let req_file = comfyui_root.join("requirements.txt");
             if req_file.exists() {
+                // v3.10：传 pytorch_index，防止 transformers 5.x 等依赖触发 torch 覆盖成 +cpu
+                let pytorch_index = crate::python_env::uv_runner::cuda_index_url(&cuda_version);
                 let req_task = crate::task_scheduler::factory::make_install_requirements_task(
                     ctx.python_env.clone(),
                     venv_path.clone(),
                     req_file,
+                    pytorch_index,
                 );
                 if let Err(e) = submit_and_wait_with_cancel(
                     ctx.task_scheduler.clone(),
@@ -547,9 +564,11 @@ async fn run_switch_version_impl(
             if req_file.exists() {
                 // Preserve 模式：直接 await install_requirements_upgrade（不是 submit 子任务，
                 // 因为这一步是"复用 venv"的特殊路径，复用现有 python_env 内部实现）
+                // v3.10：传 pytorch_index，防止 transformers 5.x 等依赖触发 torch 覆盖成 +cpu
+                let pytorch_index = crate::python_env::uv_runner::cuda_index_url(&cuda_version);
                 if let Err(e) = ctx
                     .python_env
-                    .install_requirements_upgrade(&venv_path, &req_file, &cancel_token)
+                    .install_requirements_upgrade(&venv_path, &req_file, pytorch_index.as_deref(), &cancel_token, None)
                     .await
                 {
                     return Err(format!("pip install --upgrade 失败: {}（git 已切换）", e));
@@ -605,7 +624,7 @@ async fn run_switch_version_impl(
 /// 提交子任务并等待完成（v3.5 嵌套子任务核心）
 ///
 /// 行为：
-/// 1. submit 子任务拿到 child_id
+/// 1. submit_child 子任务（自动注入 parent_id）拿到 child_id
 /// 2. **可选**：若有 AppHandle，spawn child_progress_forwarder：
 ///    - 监听 task_progress 事件并映射到父任务进度段
 ///    - 监听 task_log 事件并写入父任务 LineCollector
@@ -622,10 +641,22 @@ async fn submit_and_wait_with_cancel(
     parent_log_collector: &Arc<LineCollector>,
     app_handle: Option<&AppHandle>,
 ) -> Result<TaskResult, String> {
-    let child_id = task_scheduler
-        .submit(child_task)
-        .await
-        .map_err(|e| format!("提交子任务失败: {}", e))?;
+    // ✅ P2-1 修复：用 submit_child 自动注入 parent_id
+    //    这样子任务的 task_log 事件带 parent_task_id，前端 useTaskProgress 跟踪父任务时
+    //    也能把子任务的 uv/git 进度日志显示到父任务的实时日志面板。
+    let parent_task_id = parent_progress.task_id.clone();
+    let child_id = if parent_task_id.is_empty() {
+        // 测试场景：ProgressSender::no_op() 的 task_id 为空字符串，走普通 submit
+        task_scheduler
+            .submit(child_task)
+            .await
+            .map_err(|e| format!("提交子任务失败: {}", e))?
+    } else {
+        task_scheduler
+            .submit_child(child_task, parent_task_id)
+            .await
+            .map_err(|e| format!("提交子任务失败: {}", e))?
+    };
 
     // v3.5：若 AppHandle 可用，spawn 进度/日志 forwarder
     // （让父任务进度条反映子任务进度，实时日志能合并到父任务的日志面板）

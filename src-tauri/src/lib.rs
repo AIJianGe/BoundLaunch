@@ -43,6 +43,7 @@ use crate::plugin_manager::PluginManagerService;
 use crate::process_launcher::ProcessLauncherService;
 use crate::process_launcher::ShutdownCoordinator;
 use crate::python_env::PythonEnvService;
+use crate::python_env::TransformersVersionIndex;
 use crate::task_scheduler::TaskSchedulerService;
 
 pub fn run() {
@@ -203,6 +204,16 @@ pub fn run() {
                     task_scheduler_arc.clone(),
                 ));
 
+                // v3.7：transformers 版本索引（PyPI 拉取 + 三层缓存）
+                // 缓存文件位于 app_data_dir/transformers_versions.json
+                // 注：此处仅构造，spawn_refresh 在 manage 之后调用（避免 manage 前 spawn 访问 State 失败）
+                let transformers_cache_file = paths::app_data_dir().join("transformers_versions.json");
+                let transformers_index = std::sync::Arc::new(TransformersVersionIndex::new(
+                    transformers_cache_file,
+                    (*event_bus).clone(),
+                    handle.clone(),
+                ));
+
                 app_state::AppState {
                     event_bus,
                     config: config.clone(),
@@ -215,11 +226,19 @@ pub fn run() {
                     task_scheduler: task_scheduler_arc,
                     process_launcher: std::sync::Arc::new(process_launcher),
                     shutdown_coordinator,
+                    transformers_index,
                 }
             });
 
             handle.manage(app_state);
             tracing::info!("Tauri app initialized");
+
+            // v3.7：启动后台拉取 transformers 版本索引（非阻塞，spawn 内部用 tokio::spawn）
+            // 放在 manage 之后：spawn_refresh 内部若需访问 AppState（当前未访问，但保留扩展性）可从 State 取
+            {
+                let state = handle.state::<app_state::AppState>();
+                state.transformers_index.spawn_refresh();
+            }
 
             // 初始化系统托盘（详见 tray.rs）
             if let Err(e) = tray::setup(&handle) {
@@ -304,6 +323,14 @@ pub fn run() {
             // v1.8 / F36-Phase2：环境诊断 + 修复
             commands::python_env::env_diagnose,
             commands::python_env::env_repair,
+            // v3.10：torch 一致性诊断（mismatch 检测）
+            commands::python_env::env_check_torch_consistency,
+            // v3.10：强制一致重装 torch（修复 venv 状态混乱）
+            commands::python_env::env_repair_consistent,
+            // v3.7：transformers 版本切换
+            commands::python_env::env_list_transformers_versions,
+            commands::python_env::env_switch_transformers,
+            commands::python_env::env_restore_transformers_default,
             // CoreManager
             commands::core_manager::core_clone,
             commands::core_manager::core_ensure_cloned,
@@ -360,6 +387,7 @@ pub fn run() {
             commands::system::system_detect_gpus,
             commands::system::system_clear_gpu_cache,
             commands::system::system_recommend_torch,
+            commands::system::system_check_driver_compat,
             // Dev 诊断
             commands::dev_log::dev_log,
         ])

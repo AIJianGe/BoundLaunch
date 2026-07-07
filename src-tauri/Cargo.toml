@@ -84,6 +84,7 @@ default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
+# 测试中用 tempfile::tempdir() 创建临时目录
 tempfile = "3.10"
 
 [profile.release]

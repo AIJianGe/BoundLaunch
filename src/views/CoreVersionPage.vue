@@ -160,14 +160,19 @@ onMounted(async () => {
   unlisteners.push(
     await listen<{ from: string | null; to: string }>(
       "core_version_switched",
-      (e) => {
+      async (e) => {
         console.info(
           `[core] version switched: ${e.payload.from} → ${e.payload.to}`,
         );
         // v3.5：不在这里 clearSwitchingTask，由 useSwitchVersion.onComplete 处理
-        coreStore.refresh().catch((err) =>
-          console.warn("[core] refresh after switch failed:", err),
-        );
+        // ✅ P0-4 修复：await refresh + 兜底，确保 currentVersion 同步更新
+        // 之前 fire-and-forget + 不 await 导致切菜单后 UI 不刷新
+        try {
+          await coreStore.refresh();
+          console.info("[core] refresh after switch ok, currentVersion =", coreStore.currentVersion);
+        } catch (err) {
+          console.warn("[core] refresh after switch failed:", err);
+        }
       },
     ),
   );

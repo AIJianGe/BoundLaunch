@@ -22,8 +22,10 @@ use crate::python_env::models::{CompatibilityReport, PythonEnvStatus};
 use crate::python_env::recovery::RepairAction;
 use crate::task_scheduler::factory::{
     make_create_venv_task, make_diagnose_task, make_env_repair_task,
-    make_install_requirements_task, make_install_torch_task, make_rebuild_venv_task,
-    make_switch_python_task, make_switch_torch_variant_task,
+    make_force_reinstall_torch_consistent_task, make_install_requirements_task,
+    make_install_torch_task, make_rebuild_venv_task,
+    make_restore_transformers_default_task, make_switch_python_task,
+    make_switch_torch_variant_task, make_switch_transformers_task,
 };
 
 // ====================================================================
@@ -250,11 +252,14 @@ pub async fn env_switch_python(
 pub async fn env_install_requirements(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let (venv_path, req_file) = {
+    let (venv_path, req_file, pytorch_index) = {
         let config = state.config.get();
         let venv = PathBuf::from(&config.paths.venv_path);
         let comfyui = PathBuf::from(&config.paths.comfyui_root);
-        (venv, comfyui.join("requirements.txt"))
+        // v3.10：计算 pytorch.org 源 URL（与 install_torch 内部一致）
+        // - 防止 transformers 5.x 等依赖触发 torch 覆盖成 +cpu
+        let pytorch_index = crate::python_env::uv_runner::cuda_index_url(&config.torch.cuda_version);
+        (venv, comfyui.join("requirements.txt"), pytorch_index)
     };
 
     if !req_file.exists() {
@@ -268,6 +273,7 @@ pub async fn env_install_requirements(
         state.python_env.clone(),
         venv_path,
         req_file,
+        pytorch_index,
     );
 
     state
@@ -373,17 +379,101 @@ pub async fn env_repair(
 }
 
 // ====================================================================
+// v3.7：transformers 版本切换
+// ====================================================================
+
+/// 列出所有可用 transformers 版本（v3.7 新增）
+///
+/// 从 `TransformersVersionIndex` 获取版本列表（三层缓存：L1 内存 → L2 文件 → L3 fallback）。
+/// 同步返回，不阻塞。
+///
+/// 版本列表降序排列（最新在前），包含 4.x 和 5.x。
+/// 前端应将 5.x 标记为「实验」（破坏性 API 变更）。
+#[tauri::command]
+pub async fn env_list_transformers_versions(
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    Ok(state.transformers_index.get_versions())
+}
+
+/// 切换 transformers 版本（v3.7 新增）
+///
+/// 返回 task_id，实际执行由 TaskScheduler 调度。
+/// - 进度通过 `task_progress` 事件推送（10% 开始 / 50% uv pip install / 90% 校验 / 100% 完成）
+/// - 完成后通过 `task_completed` 事件通知前端
+/// - 完成后自动 emit `RequirementsInstalled` 让 env cache 失效
+///
+/// 参数：
+/// - `version`：目标版本号（如 "4.57.3" 或 "5.13.0"）
+#[tauri::command]
+pub async fn env_switch_transformers(
+    version: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let venv_path = {
+        let config = state.config.get();
+        PathBuf::from(&config.paths.venv_path)
+    };
+
+    let task_def =
+        make_switch_transformers_task(state.python_env.clone(), venv_path, version);
+
+    state
+        .task_scheduler
+        .submit(task_def)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 恢复默认 transformers 版本（v3.7 新增）
+///
+/// 按 ComfyUI `requirements.txt` 中的 `transformers>=X.Y.Z` 约束，
+/// 从版本列表选满足约束的最新 4.x 版本（排除 5.x 破坏性变更）切换。
+///
+/// 返回 task_id，实际执行由 TaskScheduler 调度。
+/// `task_completed` 事件的 payload 包含选定的版本号：`{ "version": "4.57.3" }`
+#[tauri::command]
+pub async fn env_restore_transformers_default(
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let (venv_path, comfyui_root) = {
+        let config = state.config.get();
+        (
+            PathBuf::from(&config.paths.venv_path),
+            PathBuf::from(&config.paths.comfyui_root),
+        )
+    };
+
+    let task_def = make_restore_transformers_default_task(
+        state.python_env.clone(),
+        state.transformers_index.clone(),
+        venv_path,
+        comfyui_root,
+    );
+
+    state
+        .task_scheduler
+        .submit(task_def)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ====================================================================
 // 辅助函数
 // ====================================================================
 
 /// 解析 CUDA 版本字符串
+///
+/// v3.7：支持 cu118 / cu126 / cu128 / cu130
+/// 旧值 cu121 / cu124（已弃用）返回 Err，触发前端重新选择
 fn parse_cuda_version(s: &str) -> Result<CudaVersion, String> {
     match s.to_lowercase().as_str() {
         "cpu" => Ok(CudaVersion::Cpu),
         "cu118" => Ok(CudaVersion::Cu118),
-        "cu121" => Ok(CudaVersion::Cu121),
-        "cu124" => Ok(CudaVersion::Cu124),
-        _ => Err(format!("invalid cuda version: {}", s)),
+        "cu126" => Ok(CudaVersion::Cu126),
+        "cu128" => Ok(CudaVersion::Cu128),
+        "cu130" => Ok(CudaVersion::Cu130),
+        _ => Err(format!("unsupported cuda version: {} (v3.7 已弃用 cu121/cu124)", s)),
     }
 }
 
@@ -397,4 +487,154 @@ fn parse_repair_action(s: &str) -> Result<RepairAction, String> {
         "rebuild_venv" => Ok(RepairAction::RebuildVenv),
         _ => Err(format!("invalid repair action: {}", s)),
     }
+}
+
+// ====================================================================
+// v3.10：torch 一致性诊断（mismatch 检测）
+// ====================================================================
+
+/// torch 一致性报告（前端可见）
+///
+/// v3.10 新增：检测 venv 中的实际 torch 状态是否与 Config 期望一致。
+/// 用于解决「Config 写 cu128，但 venv 实际是 +cpu」这种 mismatch 问题。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TorchConsistencyReport {
+    /// 是否完全一致
+    pub consistent: bool,
+    /// Config 期望的 cuda_version（如 "cu128" / "cpu"）
+    pub config_cuda_version: String,
+    /// venv 中实际 torch 版本（如 "2.12.1+cpu"）
+    pub venv_torch_version: Option<String>,
+    /// venv 中 torch.cuda.is_available()
+    pub venv_cuda_available: bool,
+    /// 人类可读的问题列表
+    pub issues: Vec<String>,
+    /// 修复建议
+    pub recommendation: TorchConsistencyRecommendation,
+}
+
+/// 一致性问题的修复建议
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TorchConsistencyRecommendation {
+    /// 状态完全一致，无需操作
+    NoAction,
+    /// 建议重装 torch（venv 与 Config 不一致，但 venv 结构良好）
+    ReinstallTorch,
+    /// 建议重装 venv（严重不一致）
+    RebuildVenv,
+    /// 建议检查 NVIDIA 驱动（Config 期望 GPU 但 torch 不支持）
+    CheckDriver,
+}
+
+/// v3.10 新增：检测 venv 中的 torch 状态是否与 Config 一致
+///
+/// 返回 `TorchConsistencyReport`：
+/// - `consistent: true` → venv 状态匹配 Config，不需要重装
+/// - `consistent: false` → venv 状态与 Config 不一致，建议重装
+/// - `recommendation` → 修复建议
+///
+/// 调用方式：前端在启动 ComfyUI 前自动调用，或在「一键补装」流程中显式调用
+#[tauri::command]
+pub async fn env_check_torch_consistency(
+    state: State<'_, AppState>,
+) -> Result<TorchConsistencyReport, String> {
+    use tokio_util::sync::CancellationToken;
+
+    let (venv_path, config_cuda_version) = {
+        let config = state.config.get();
+        (
+            PathBuf::from(&config.paths.venv_path),
+            format!("{:?}", config.torch.cuda_version).to_lowercase(),
+        )
+    };
+
+    // 同步调用 verify_venv（30s 缓存命中时 <1ms，未命中时 <2s）
+    let cancel = CancellationToken::new();
+    let info = state
+        .python_env
+        .verify_venv(&venv_path, &cancel)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut issues = Vec::new();
+    let mut recommendation = TorchConsistencyRecommendation::NoAction;
+
+    if !info.torch_installed {
+        issues.push(format!("torch 未安装（venv 路径：{}）", venv_path.display()));
+        recommendation = TorchConsistencyRecommendation::ReinstallTorch;
+    } else {
+        let venv_torch_str = info.torch_version.as_deref().unwrap_or("?");
+        let config_cuda_lower = config_cuda_version.as_str();
+
+        // 检查 1：Config 期望 CUDA，但 venv 中 torch 不支持 CUDA
+        //        （用 cuda_available 推断，cuda_available=false 说明 torch 没有 CUDA 编译）
+        if config_cuda_lower != "cpu" && !info.cuda_available {
+            issues.push(format!(
+                "Config 期望 {}，但 venv 中 torch={}（cuda_available={}）",
+                config_cuda_lower, venv_torch_str, info.cuda_available
+            ));
+            recommendation = TorchConsistencyRecommendation::ReinstallTorch;
+        }
+        // 检查 2：Config 期望 CPU，但 venv 中 torch 支持 CUDA（warning，不是 error）
+        else if config_cuda_lower == "cpu" && info.cuda_available {
+            issues.push(format!(
+                "Config 期望 CPU 模式，但 venv 中 torch 支持 CUDA（{}）。\n\
+                 这不会导致 ComfyUI 启动失败，但会浪费 CUDA 资源。",
+                venv_torch_str
+            ));
+            // 不强制重装，标记为 NoAction（让用户决定）
+        }
+    }
+
+    Ok(TorchConsistencyReport {
+        consistent: issues.is_empty(),
+        config_cuda_version,
+        venv_torch_version: info.torch_version,
+        venv_cuda_available: info.cuda_available,
+        issues,
+        recommendation,
+    })
+}
+
+/// v3.10 新增：强制一致重装 torch（修复 venv 状态混乱）
+///
+/// 用 `--force-reinstall --no-deps --index-url pytorch.org` 强制覆盖重装
+/// torch/torchvision/torchaudio，**不破坏 venv 中的其他包**。
+///
+/// 返回 task_id，由 TaskScheduler 异步执行：
+/// - 进度通过 `task_progress` 事件推送（10% / 30% / 60% / 80% / 90% / 100%）
+/// - 完成后通过 `task_completed` 事件通知前端
+/// - 完成后自动 emit `TorchInstalled` 让 env cache 失效
+///
+/// **典型调用场景**：
+/// - 用户 Config 写 `cu128`，但 venv 中 `torch.cuda.is_available() = False`
+/// - `env_check_torch_consistency` 返回 `consistent: false, recommendation: reinstall_torch`
+/// - 前端调 `env_repair_consistent("cu128")` 修复
+#[tauri::command]
+pub async fn env_repair_consistent(
+    cuda_version: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let cuda = parse_cuda_version(&cuda_version)?;
+
+    let (venv_path, comfyui_root) = {
+        let config = state.config.get();
+        (
+            PathBuf::from(&config.paths.venv_path),
+            PathBuf::from(&config.paths.comfyui_root),
+        )
+    };
+
+    let task_def = make_force_reinstall_torch_consistent_task(
+        state.python_env.clone(),
+        venv_path,
+        comfyui_root,
+        cuda,
+    );
+    state
+        .task_scheduler
+        .submit(task_def)
+        .await
+        .map_err(|e| e.to_string())
 }

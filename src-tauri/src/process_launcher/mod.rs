@@ -230,6 +230,7 @@ impl ProcessLauncherService {
             &self.inner.python_env,
             &self.current_venv_path(),
             &self.current_comfyui_root(),
+            args.mode,  // v3.10 新增：检查 cuda_available 与 launch_mode 匹配
         )
         .await
         {

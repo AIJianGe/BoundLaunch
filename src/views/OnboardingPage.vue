@@ -72,7 +72,7 @@ const form = reactive({
   venv_path: "",
   python_version: "3.11",
   mode: "gpu_high" as LaunchMode,
-  cuda_version: "cu121" as CudaVersion,
+  cuda_version: "cu128" as CudaVersion,
 });
 
 // ========== 初始化：自动填充 launcher 工作目录作为默认根目录 ==========
@@ -478,8 +478,9 @@ class InitStageError extends Error {
           <NFormItem label="CUDA 版本">
             <NRadioGroup v-model:value="form.cuda_version">
               <NRadio value="cu118">CUDA 11.8</NRadio>
-              <NRadio value="cu121">CUDA 12.1（推荐）</NRadio>
-              <NRadio value="cu124">CUDA 12.4</NRadio>
+              <NRadio value="cu126">CUDA 12.6</NRadio>
+              <NRadio value="cu128">CUDA 12.8（推荐）</NRadio>
+              <NRadio value="cu130">CUDA 13.0（最新）</NRadio>
             </NRadioGroup>
           </NFormItem>
         </NForm>

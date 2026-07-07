@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::process_util::decode_windows_bytes;
+use crate::config::LaunchMode;
 use crate::error::ProcessError;
 use crate::process_launcher::models::LaunchArgs;
 use crate::process_launcher::log_pipeline::LogPipeline;
@@ -67,17 +68,25 @@ const MAIN_PY: &str = "main.py";
 // 前置校验
 // ============================================================================
 
-/// 启动前置校验：verify_venv + dirty 标记
+/// 启动前置校验：verify_venv + dirty 标记 + CUDA 模式匹配
 ///
 /// 失败时返回的 ProcessError 会让前端展示具体提示：
-/// - `EnvironmentNotReady`：venv 损坏 / torch 缺失
+/// - `EnvironmentNotReady`：venv 损坏 / torch 缺失 / CUDA 模式不匹配
 /// - `DirtyState`：检测到 .launcher-dirty 标记
 /// - `PythonNotFound`：python 二进制不存在
 /// - `MainNotFound`：ComfyUI main.py 不存在
+///
+/// **v3.10 关键修复**：增加 `mode` 参数，检查 `cuda_available` 与 `LaunchMode` 是否匹配
+/// - 背景：之前只检查 `torch_installed`，导致 torch+cpu 也能 spawn，ComfyUI 启动时
+///   `import comfy.model_management` → `torch.cuda.current_device()` 抛
+///   `AssertionError: Torch not compiled with CUDA enabled`
+/// - 修复：Gpu* 模式时强制要求 `cuda_available=true`；Cpu 模式不要求；
+///   Custom 模式信任用户（不强制检查）
 pub async fn verify_preconditions(
     python_env: &PythonEnvService,
     venv_path: &Path,
     comfyui_root: &Path,
+    mode: LaunchMode,
 ) -> Result<EnvInfo, ProcessError> {
     // 1. venv python 存在性检查（提前失败，避免 spawn 后才发现）
     let python_path = venv_python_path(venv_path);
@@ -118,10 +127,41 @@ pub async fn verify_preconditions(
         });
     }
 
+    // 5. v3.10 新增：检查 cuda_available 与 launch_mode 是否匹配
+    //    解决 torch+cpu + GpuHigh 启动后 AssertionError 的问题
+    //    Custom 模式信任用户（用户可能自定义了 --cpu / --highvram），不强制检查
+    let gpu_mode_required = matches!(
+        mode,
+        LaunchMode::GpuHigh | LaunchMode::GpuLow | LaunchMode::GpuNoVram
+    );
+    if gpu_mode_required && !info.cuda_available {
+        let torch_ver = info.torch_version.as_deref().unwrap_or("?");
+        tracing::error!(
+            torch = %torch_ver,
+            cuda_available = info.cuda_available,
+            mode = ?mode,
+            "launch mode requires GPU but torch.cuda_available=false"
+        );
+        return Err(ProcessError::EnvironmentNotReady {
+            detail: format!(
+                "检测到 PyTorch 不支持 CUDA（torch={}），\n\
+                 但启动模式为 {:?}（需要 GPU）。\n\n\
+                 解决方法：\n\
+                 1. 到「设置 → 关键依赖」点击「重新安装 PyTorch」（选择正确的 cuda 版本）\n\
+                 2. 或在「基础参数 → 运行模式」中切换到「CPU 模式」\n\n\
+                 常见原因：\n\
+                 • 安装时选错了 cuda 版本\n\
+                 • venv 是早期版本装的，torch/torchvision/torchaudio 来自不同源（版本不一致）",
+                torch_ver, mode,
+            ),
+        });
+    }
+
     tracing::info!(
         python = %info.python_version,
         torch = ?info.torch_version,
         cuda_available = info.cuda_available,
+        mode = ?mode,
         "preconditions verified"
     );
     Ok(info)

@@ -41,6 +41,8 @@ pub(crate) enum ProgressMsg {
 #[derive(Clone)]
 pub struct ProgressSender {
     pub(crate) tx: mpsc::UnboundedSender<ProgressMsg>,
+    /// ✅ P2-1 新增：本发送器所属任务 ID（供 submit_child / 子任务日志 parent_task_id 注入）
+    pub task_id: TaskId,
 }
 
 impl ProgressSender {
@@ -79,7 +81,10 @@ impl ProgressSender {
     pub fn no_op() -> Self {
         // 创建会立即 drop 的 channel，所有 send 都被静默丢弃
         let (tx, _rx) = mpsc::unbounded_channel();
-        Self { tx }
+        Self {
+            tx,
+            task_id: String::new(),
+        }
     }
 }
 
@@ -97,6 +102,12 @@ pub struct ProgressEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEvent {
     pub task_id: TaskId,
+    /// ✅ P2-1 新增：父任务 ID（子任务的日志有值，根任务为 None）
+    ///
+    /// 前端 useTaskProgress 跟踪父任务时，把 parent_task_id == self
+    /// 的日志也一并显示（解决"父任务切换看不到子任务 uv 进度"的问题）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<TaskId>,
     pub source: String,
     pub text: String,
     /// ms since epoch，前端可直接显示
@@ -112,10 +123,13 @@ pub struct LogEvent {
 ///
 /// v3.5 扩展：Log 消息**不聚合**，每条立即 emit（前端订阅日志流）。
 /// - 但为防止 uv 大流量输出压垮 IPC，单任务 50ms 内最多 emit 1 个 log 批次。
+///
+/// ✅ P2-1 扩展：`parent_id` 用于子任务日志（透传到前端的 `parent_task_id` 字段）。
 pub(crate) fn spawn_flush_loop(
     app: Option<AppHandle>,
     task_id: TaskId,
     mut rx: mpsc::UnboundedReceiver<ProgressMsg>,
+    parent_id: Option<TaskId>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_millis(100);
@@ -143,7 +157,7 @@ pub(crate) fn spawn_flush_loop(
                             // Log 消息累积到 batch，每 50ms emit 一次（节流）
                             log_batch.push((source, text));
                             if last_log_emit.elapsed() >= Duration::from_millis(50) && !log_batch.is_empty() {
-                                emit_log_batch(&app, &task_id, &mut log_batch);
+                                emit_log_batch(&app, &task_id, &parent_id, &mut log_batch);
                                 last_log_emit = std::time::Instant::now();
                             }
                         }
@@ -153,7 +167,7 @@ pub(crate) fn spawn_flush_loop(
                                 emit_progress(&app, &task_id, latest_progress, latest_message.clone(), "running");
                             }
                             if !log_batch.is_empty() {
-                                emit_log_batch(&app, &task_id, &mut log_batch);
+                                emit_log_batch(&app, &task_id, &parent_id, &mut log_batch);
                             }
                             break;
                         }
@@ -166,7 +180,7 @@ pub(crate) fn spawn_flush_loop(
                         dirty = false;
                     }
                     if !log_batch.is_empty() && last_log_emit.elapsed() >= Duration::from_millis(50) {
-                        emit_log_batch(&app, &task_id, &mut log_batch);
+                        emit_log_batch(&app, &task_id, &parent_id, &mut log_batch);
                         last_log_emit = std::time::Instant::now();
                     }
                 }
@@ -175,8 +189,16 @@ pub(crate) fn spawn_flush_loop(
     })
 }
 
-/// 批量 emit 日志（v3.5）
-fn emit_log_batch(app: &Option<AppHandle>, task_id: &TaskId, batch: &mut Vec<(String, String)>) {
+/// 批量 emit 日志（v3.5 + ✅ P2-1）
+///
+/// `parent_id` 透传到 `LogEvent.parent_task_id`，前端 useTaskProgress
+/// 据此把子任务日志合并到父任务的实时日志面板。
+fn emit_log_batch(
+    app: &Option<AppHandle>,
+    task_id: &TaskId,
+    parent_id: &Option<TaskId>,
+    batch: &mut Vec<(String, String)>,
+) {
     if batch.is_empty() {
         return;
     }
@@ -187,6 +209,7 @@ fn emit_log_batch(app: &Option<AppHandle>, task_id: &TaskId, batch: &mut Vec<(St
             .drain(..)
             .map(|(source, text)| LogEvent {
                 task_id: task_id.clone(),
+                parent_task_id: parent_id.clone(),
                 source,
                 text,
                 ts_ms: now,
@@ -302,7 +325,7 @@ mod tests {
     #[tokio::test]
     async fn test_progress_sender_clamps_percent() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sender = ProgressSender { tx };
+        let sender = ProgressSender { tx, task_id: "t1".to_string() };
         sender.send_percent(150);
         sender.send_percent(200);
         if let Some(ProgressMsg::Update(p)) = rx.recv().await {
@@ -313,7 +336,7 @@ mod tests {
     #[tokio::test]
     async fn test_progress_sender_message() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sender = ProgressSender { tx };
+        let sender = ProgressSender { tx, task_id: "t1".to_string() };
         sender.send_message("hello");
         if let Some(ProgressMsg::Message(m)) = rx.recv().await {
             assert_eq!(m, "hello");
@@ -324,10 +347,10 @@ mod tests {
     async fn test_spawn_flush_loop_no_app_no_panic() {
         // 无 AppHandle 也不应 panic，仅记录日志
         let (tx, rx) = mpsc::unbounded_channel();
-        let sender = ProgressSender { tx };
+        let sender = ProgressSender { tx, task_id: "t1".to_string() };
         sender.send_percent(50);
         drop(sender);
-        let handle = spawn_flush_loop(None, "t1".to_string(), rx);
+        let handle = spawn_flush_loop(None, "t1".to_string(), rx, None);
         // 等待 flush loop 退出
         let _ = handle.await;
     }

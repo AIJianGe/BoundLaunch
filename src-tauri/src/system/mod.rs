@@ -14,4 +14,7 @@ pub mod recommend;
 
 pub use gpu::{detect_gpus, GpuInfo, GpuVendor};
 pub use gpu_cache::{clear_gpu_cache, detect_and_cache, get_cached_gpus, get_or_detect};
-pub use recommend::{recommend_torch_variant, recommend_torch_variant_with_gpus};
+pub use recommend::{
+    check_driver_compatibility, check_driver_compatibility_full, recommend_torch_variant,
+    recommend_torch_variant_with_gpus, DriverCompatReport, DriverCompatSeverity,
+};

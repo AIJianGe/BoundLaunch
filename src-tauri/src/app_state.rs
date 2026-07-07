@@ -13,6 +13,7 @@ use crate::plugin_manager::PluginManagerService;
 use crate::process_launcher::ProcessLauncherService;
 use crate::process_launcher::ShutdownCoordinator;
 use crate::python_env::PythonEnvService;
+use crate::python_env::TransformersVersionIndex;
 use crate::task_scheduler::TaskSchedulerService;
 use std::sync::Arc;
 
@@ -34,6 +35,8 @@ pub struct AppState {
     pub process_launcher: Arc<ProcessLauncherService>,
     /// F24 退出流程编排器（防重入 + 5 步事务 + 30s 超时兜底）
     pub shutdown_coordinator: Arc<ShutdownCoordinator>,
+    /// v3.7 新增：transformers 版本索引（PyPI 拉取 + 三层缓存）
+    pub transformers_index: Arc<TransformersVersionIndex>,
 }
 
 impl AppState {
@@ -98,6 +101,15 @@ impl AppState {
             (*event_bus).clone(),
             task_scheduler.clone(),
         ));
+        // v3.7：transformers 版本索引（测试用临时缓存文件，不 spawn_refresh 避免网络调用）
+        let transformers_cache_file = std::env::temp_dir().join(format!(
+            "bl-test-transformers-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let transformers_index = Arc::new(TransformersVersionIndex::new_for_test(
+            transformers_cache_file,
+            (*event_bus).clone(),
+        ));
         Self {
             event_bus,
             config,
@@ -110,6 +122,7 @@ impl AppState {
             task_scheduler,
             process_launcher,
             shutdown_coordinator,
+            transformers_index,
         }
     }
 }

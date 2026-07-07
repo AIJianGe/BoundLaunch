@@ -228,17 +228,23 @@ pub struct TorchConfig {
 /// CUDA 版本
 ///
 /// 设计模式：Strategy - 不同 CUDA 版本对应不同 torch wheel 索引
+///
+/// v3.7：对齐 PyTorch 2.11 官方 wheel
+/// - 删除 Cu121 / Cu124（PyTorch 2.9+ 不再提供）
+/// - 新增 Cu126 / Cu128 / Cu130
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CudaVersion {
     /// CPU 版本
     Cpu,
-    /// CUDA 11.8
+    /// CUDA 11.8（旧版兼容）
     Cu118,
-    /// CUDA 12.1
-    Cu121,
-    /// CUDA 12.4
-    Cu124,
+    /// CUDA 12.6（稳定）
+    Cu126,
+    /// CUDA 12.8（稳定）
+    Cu128,
+    /// CUDA 13.0（最新）
+    Cu130,
 }
 
 impl CudaVersion {
@@ -247,8 +253,9 @@ impl CudaVersion {
         match self {
             Self::Cpu => "cpu",
             Self::Cu118 => "cu118",
-            Self::Cu121 => "cu121",
-            Self::Cu124 => "cu124",
+            Self::Cu126 => "cu126",
+            Self::Cu128 => "cu128",
+            Self::Cu130 => "cu130",
         }
     }
 
@@ -257,8 +264,9 @@ impl CudaVersion {
         match self {
             Self::Cpu => "CPU",
             Self::Cu118 => "CUDA 11.8",
-            Self::Cu121 => "CUDA 12.1",
-            Self::Cu124 => "CUDA 12.4",
+            Self::Cu126 => "CUDA 12.6",
+            Self::Cu128 => "CUDA 12.8",
+            Self::Cu130 => "CUDA 13.0",
         }
     }
 }
@@ -336,7 +344,8 @@ impl Default for Config {
                 advanced: AdvancedArgs::default(),
             },
             torch: TorchConfig {
-                cuda_version: CudaVersion::Cu121,
+                // v3.7：默认 CUDA 12.8（PyTorch 2.11 稳定版推荐）
+                cuda_version: CudaVersion::Cu128,
                 torch_variant: None,
             },
             models: ModelsConfig {
@@ -536,7 +545,7 @@ mod tests {
     fn test_default_config() {
         let cfg = Config::default();
         assert_eq!(cfg.launch.listen_port, 8188);
-        assert_eq!(cfg.torch.cuda_version, CudaVersion::Cu121);
+        assert_eq!(cfg.torch.cuda_version, CudaVersion::Cu128);
         assert_eq!(cfg.ui.language, "zh-CN");
         assert_eq!(cfg.schema_version, 1);
     }
@@ -550,7 +559,8 @@ mod tests {
 
     #[test]
     fn test_cuda_version_display() {
-        assert_eq!(CudaVersion::Cu121.display_name(), "CUDA 12.1");
+        assert_eq!(CudaVersion::Cu128.display_name(), "CUDA 12.8");
+        assert_eq!(CudaVersion::Cu130.display_name(), "CUDA 13.0");
         assert_eq!(CudaVersion::Cpu.to_torch_index(), "cpu");
     }
 

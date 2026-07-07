@@ -239,6 +239,50 @@ async function onInstallMissing() {
   }
 }
 
+/**
+ * v3.10：点击「修复 torch 不一致」按钮
+ *
+ * 解决"Config 写 cu128，但 venv 中 torch 是 +cpu"这种 mismatch 问题。
+ * 用 `--force-reinstall --no-deps --index-url pytorch.org` 强制覆盖重装
+ * torch/torchvision/torchaudio，**不破坏 venv 中的其他包**。
+ *
+ * 进度：1-3 分钟（含下载），异步执行，可观察 TaskPanel 进度。
+ */
+const isRepairingConsistent = ref(false);
+async function onRepairConsistent() {
+  if (isRepairingConsistent.value) return;
+  const config = configStore.config;
+  const cuda = config?.torch?.cuda_version ?? "cpu";
+  const cudaLabel =
+    cuda === "cpu" ? "CPU" : cuda.toUpperCase();
+  const ok = await showConfirm({
+    title: "修复 torch 一致性",
+    content:
+      `将强制重装 torch/torchvision/torchaudio（来源：pytorch.org ${cudaLabel} 源）。\n\n` +
+      `操作：\n` +
+      `1. 用 --force-reinstall --no-deps 覆盖现有 wheel\n` +
+      `2. 装 torch 关键依赖（numpy/psutil/six/av/Pillow/pycocotools）\n` +
+      `3. 重装 ComfyUI requirements（已过滤 torch 系列行）\n` +
+      `4. smoke test 验证 torch.cuda.is_available()\n\n` +
+      `预计耗时 1-3 分钟。`,
+    positiveText: "开始修复",
+    negativeText: "取消",
+  });
+  if (!ok) return;
+
+  isRepairingConsistent.value = true;
+  try {
+    const cudaStr =
+      cuda === "cpu" ? "cpu" : (cuda as string);
+    await envStore.repairConsistent(cudaStr);
+    toast.success("torch 强制一致重装完成");
+  } catch (e) {
+    toast.error("修复失败", String(e));
+  } finally {
+    isRepairingConsistent.value = false;
+  }
+}
+
 /** NAlert 按钮文案（v3.2：上下文感知） */
 const installButtonText = computed(() => {
   if (installingEnv.value) return installStepText.value;
@@ -315,6 +359,22 @@ const torchBroken = computed(
         </NButton>
         <span class="diagnose-hint">
           扫描 venv + torch import + 关键依赖，定位隐蔽问题并自动修复
+        </span>
+      </NSpace>
+
+      <!-- v3.10：torch 一致性修复（修复 Config 与 venv 不一致） -->
+      <NSpace :size="8" align="center" class="diagnose-row" style="margin-top: 8px;">
+        <NButton
+          size="small"
+          type="warning"
+          :loading="isRepairingConsistent"
+          :disabled="isRepairingConsistent || envStore.repairing"
+          @click="onRepairConsistent"
+        >
+          🔄 修复 torch 不一致
+        </NButton>
+        <span class="diagnose-hint">
+          强制从 pytorch.org 源覆盖重装 torch/torchvision/torchaudio（解决"venv 是混乱状态"问题）
         </span>
       </NSpace>
     </div>

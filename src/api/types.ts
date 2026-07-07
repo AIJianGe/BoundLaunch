@@ -17,7 +17,7 @@
 
 export type LaunchMode = "cpu" | "gpu_high" | "gpu_low" | "gpu_no_vram" | "custom";
 export type PreviewMethod = "latent" | "latent_upscale" | "autoencoder" | "none";
-export type CudaVersion = "cpu" | "cu118" | "cu121" | "cu124";
+export type CudaVersion = "cpu" | "cu118" | "cu126" | "cu128" | "cu130";
 export type ModelsMode = "default" | "custom_root" | "advanced";
 export type Theme = "light" | "dark" | "auto";
 
@@ -254,6 +254,21 @@ export interface ReadinessCheckResult {
   ready: boolean;
   missing_steps: ReadinessStep[];
   checks: ReadinessChecks;
+  /**
+   * 当前生效的启动模式（来自 `config.launch.mode`）
+   *
+   * v3.10 新增：前端用于检测模式不匹配。
+   * - `mode = "cpu"` 但 `cuda_available = true`：可提示用户切换到 GPU 模式
+   * - `mode = "gpu_*"` 但 `cuda_available = false`：阻止启动并引导修复
+   */
+  launch_mode: LaunchMode;
+  /**
+   * torch 在当前 venv 中是否实际可用 CUDA
+   *
+   * v3.10 新增：来源 `EnvSnapshot.cuda_available`。
+   * 与 `launch_mode` 配合决定启动按钮状态。
+   */
+  cuda_available: boolean;
 }
 
 // ============================================================================
@@ -519,6 +534,12 @@ export interface TaskInfo {
   status: TaskStatus;
   started_at: string | null;
   completed_at: string | null;
+  /**
+   * P2-1：父任务 ID（None = 根任务）。
+   * 前端 useTaskProgress 跟踪父任务时，把 parent_id == self 的子任务日志
+   * 也一并显示到父任务的实时日志面板。
+   */
+  parent_id?: string | null;
 }
 
 /**
@@ -652,16 +673,20 @@ export interface TaskHistoryRecord {
  * 后端 `src-tauri/src/python_env/torch_variant.rs::TorchVariant` 的 serde 形式：
  * `#[serde(tag = "vendor", content = "version", rename_all = "snake_case")]`
  *
+ * v3.7：对齐 PyTorch 2.11 官方 wheel
+ * - NVIDIA CUDA: cu118 / cu126 / cu128 / cu130（删除已弃用的 cu121/cu124）
+ * - AMD ROCm: rocm6.3 / 6.4 / 7.0 / 7.1 / 7.2（删除过时的 5.7/6.0/6.1）
+ *
  * 对应格式：
- * - `{ vendor: "nvidia_cuda", version: "cu118" | "cu121" | "cu124" }`
- * - `{ vendor: "amd_rocm",  version: "rocm5.7" | "rocm6.0" | "rocm6.1" }`
+ * - `{ vendor: "nvidia_cuda", version: "cu118" | "cu126" | "cu128" | "cu130" }`
+ * - `{ vendor: "amd_rocm",  version: "rocm6.3" | "rocm6.4" | "rocm7.0" | "rocm7.1" | "rocm7.2" }`
  * - `{ vendor: "intel_xpu" }`
  * - `{ vendor: "apple_silicon" }`
  * - `{ vendor: "cpu_only" }`
  */
 export type TorchVariant =
-  | { vendor: "nvidia_cuda"; version: "cu118" | "cu121" | "cu124" }
-  | { vendor: "amd_rocm"; version: "rocm5.7" | "rocm6.0" | "rocm6.1" }
+  | { vendor: "nvidia_cuda"; version: "cu118" | "cu126" | "cu128" | "cu130" }
+  | { vendor: "amd_rocm"; version: "rocm6.3" | "rocm6.4" | "rocm7.0" | "rocm7.1" | "rocm7.2" }
   | { vendor: "intel_xpu" }
   | { vendor: "apple_silicon" }
   | { vendor: "cpu_only" };

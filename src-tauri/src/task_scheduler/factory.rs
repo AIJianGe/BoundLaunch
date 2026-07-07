@@ -45,6 +45,7 @@ pub fn make_create_venv_task(
         kind: TaskKind::CreateVenv,
         name: format!("创建 venv (Python {})", python_version),
         priority: None, // 用默认 High
+        parent_id: None,
         action: Box::new(
             move |cancel: CancellationToken, progress: ProgressSender| {
                 let python_env = python_env.clone();
@@ -104,6 +105,7 @@ pub fn make_install_torch_task(
         kind: TaskKind::InstallTorch,
         name: format!("安装 torch ({})", cuda_version_label(&cuda_version)),
         priority: None,
+        parent_id: None,
         action: Box::new(
             move |cancel: CancellationToken, progress: ProgressSender| {
                 let python_env = python_env.clone();
@@ -125,7 +127,7 @@ pub fn make_install_torch_task(
 
                     // 主流程：install_torch（内部会 emit TorchInstalled 事件）
                     python_env
-                        .install_torch(&venv_path, cuda_version, &cancel)
+                        .install_torch(&venv_path, cuda_version, &cancel, None)
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -177,6 +179,7 @@ pub fn make_switch_torch_variant_task(
         kind: TaskKind::SwitchTorchVariant,
         name: format!("切换 torch 变体 ({})", variant_label),
         priority: None,
+        parent_id: None,
         action: Box::new(
             move |cancel: CancellationToken, progress: ProgressSender| {
                 let python_env = python_env.clone();
@@ -211,7 +214,7 @@ pub fn make_switch_torch_variant_task(
                     progress.send_percent(60);
                     progress.send_message(format!("切换 torch: {}", variant_label));
                     python_env
-                        .switch_torch_variant(&venv_path, &variant, &cancel)
+                        .switch_torch_variant(&venv_path, &variant, &cancel, None)
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -260,20 +263,26 @@ pub fn make_switch_torch_variant_task(
 /// - 50%：uv pip install -r requirements.txt
 /// - 90%：校验
 /// - 100%：完成
+///
+/// v3.10 新增 `pytorch_index` 参数：传 Some(url) 时 uv 解析时同时查 PyPI 和 pytorch.org，
+/// 防止 transformers 5.x 等依赖触发 torch 覆盖成 +cpu。
 pub fn make_install_requirements_task(
     python_env: Arc<PythonEnvService>,
     venv_path: PathBuf,
     req_file: PathBuf,
+    pytorch_index: Option<String>,
 ) -> TaskDef {
     TaskDef {
         kind: TaskKind::InstallRequirements,
         name: "安装 ComfyUI 依赖".to_string(),
         priority: None,
+        parent_id: None,
         action: Box::new(
             move |cancel: CancellationToken, progress: ProgressSender| {
                 let python_env = python_env.clone();
                 let venv_path = venv_path.clone();
                 let req_file = req_file.clone();
+                let pytorch_index = pytorch_index.clone();
                 Box::pin(async move {
                     progress.send_percent(10);
                     progress.send_message(format!("安装依赖: {}", req_file.display()));
@@ -286,8 +295,15 @@ pub fn make_install_requirements_task(
                     progress.send_message("uv pip install -r requirements.txt...");
 
                     // 主流程：install_requirements（内部会 emit RequirementsInstalled 事件）
+                    // v3.10：传 pytorch_index，防止 transformers 5.x 等依赖触发 torch 覆盖
                     python_env
-                        .install_requirements(&venv_path, &req_file, &cancel)
+                        .install_requirements(
+                            &venv_path,
+                            &req_file,
+                            pytorch_index.as_deref(),
+                            &cancel,
+                            None,
+                        )
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -334,6 +350,7 @@ pub fn make_rebuild_venv_task(
         kind: TaskKind::RebuildVenv,
         name: "重建 venv".to_string(),
         priority: None,
+        parent_id: None,
         action: Box::new(
             move |cancel: CancellationToken, progress: ProgressSender| {
                 let python_env = python_env.clone();
@@ -352,7 +369,7 @@ pub fn make_rebuild_venv_task(
                     progress.send_message("删除旧 venv + 创建新 venv + 安装 torch + 安装依赖...");
 
                     python_env
-                        .rebuild_venv(&config, &cancel)
+                        .rebuild_venv(&config, &cancel, None)
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -395,6 +412,7 @@ pub fn make_switch_python_task(
         kind: TaskKind::SwitchPython,
         name: format!("切换 Python 版本到 {}", new_version),
         priority: None,
+        parent_id: None,
         action: Box::new(
             move |cancel: CancellationToken, progress: ProgressSender| {
                 let python_env = python_env.clone();
@@ -423,7 +441,7 @@ pub fn make_switch_python_task(
 
                     // 调用 switch_python_version（内部会按 5 步上报进度）
                     let result = python_env
-                        .switch_python_version(&new_version, &config, tx, &cancel)
+                        .switch_python_version(&new_version, &config, tx, &cancel, None)
                         .await
                         .map_err(|e| e.to_string());
 
@@ -479,6 +497,7 @@ pub fn make_env_repair_task(
         kind: TaskKind::EnvRepair,
         name,
         priority: None,
+        parent_id: None,
         action: Box::new(
             move |cancel: CancellationToken, progress: ProgressSender| {
                 let python_env = python_env.clone();
@@ -508,6 +527,7 @@ pub fn make_env_repair_task(
                                 &venv_path,
                                 &progress,
                                 &cancel,
+                                None,
                             )
                             .await
                             .map_err(|e| e.to_string())
@@ -520,6 +540,7 @@ pub fn make_env_repair_task(
                                 &cuda_version,
                                 &progress,
                                 &cancel,
+                                None,
                             )
                             .await
                             .map_err(|e| e.to_string())
@@ -533,6 +554,7 @@ pub fn make_env_repair_task(
                                 &cuda_version,
                                 &progress,
                                 &cancel,
+                                None,
                             )
                             .await
                             .map_err(|e| e.to_string())
@@ -544,6 +566,7 @@ pub fn make_env_repair_task(
                                 &config,
                                 &progress,
                                 &cancel,
+                                None,
                             )
                             .await
                             .map_err(|e| e.to_string())
@@ -589,6 +612,7 @@ pub fn make_diagnose_task(
         kind: TaskKind::Diagnose,
         name: "环境诊断".to_string(),
         priority: None,
+        parent_id: None,
         action: Box::new(
             move |cancel: CancellationToken, progress: ProgressSender| {
                 let python_env = python_env.clone();
@@ -794,6 +818,7 @@ pub fn make_check_compat_task(
         kind: TaskKind::CheckCompat,
         name: format!("检查版本兼容性: {}", target_tag),
         priority: None, // default = Low
+        parent_id: None,
         action: Box::new(move |cancel, progress| {
             let core_manager = core_manager.clone();
             let config = config.clone();
@@ -959,6 +984,7 @@ pub fn make_check_prereq_task(
         kind: TaskKind::CheckPrereq,
         name: "检查切换前置条件".to_string(),
         priority: None, // default = High
+        parent_id: None,
         action: Box::new(move |cancel, progress| {
             let core_manager = core_manager.clone();
             let process_launcher = process_launcher.clone();
@@ -1015,6 +1041,7 @@ pub fn make_switch_version_task(
         kind: TaskKind::Checkout,
         name: format!("切换 ComfyUI 版本到 {}", target_tag),
         priority: None, // default = High
+        parent_id: None,
         action: Box::new(move |cancel, progress| {
             let params = params.clone();
             let ctx = ctx;
@@ -1038,8 +1065,9 @@ fn cuda_version_label(cuda: &CudaVersion) -> &'static str {
     match cuda {
         CudaVersion::Cpu => "CPU",
         CudaVersion::Cu118 => "CUDA 11.8",
-        CudaVersion::Cu121 => "CUDA 12.1",
-        CudaVersion::Cu124 => "CUDA 12.4",
+        CudaVersion::Cu126 => "CUDA 12.6",
+        CudaVersion::Cu128 => "CUDA 12.8",
+        CudaVersion::Cu130 => "CUDA 13.0",
     }
 }
 
@@ -1048,8 +1076,9 @@ fn parse_cuda_version(s: &str) -> CudaVersion {
     match s.to_lowercase().as_str() {
         "cpu" => CudaVersion::Cpu,
         "cu118" => CudaVersion::Cu118,
-        "cu121" => CudaVersion::Cu121,
-        "cu124" => CudaVersion::Cu124,
+        "cu126" => CudaVersion::Cu126,
+        "cu128" => CudaVersion::Cu128,
+        "cu130" => CudaVersion::Cu130,
         _ => CudaVersion::Cpu, // 兜底
     }
 }
@@ -1087,6 +1116,7 @@ pub fn make_start_comfyui_task(
         kind: TaskKind::StartComfyUI,
         name: "启动 ComfyUI".to_string(),
         priority: None, // 取 default_priority = High
+        parent_id: None,
         action: Box::new(move |_cancel, sender| {
             let launcher = process_launcher.clone();
             let app = app.clone();
@@ -1121,5 +1151,191 @@ pub fn make_start_comfyui_task(
                 })
             })
         }),
+    }
+}
+
+// ====================================================================
+// v3.7：transformers 版本切换（前端设置页）
+// ====================================================================
+
+/// 构造「切换 transformers 版本」任务（v3.7）
+///
+/// 异步执行 `uv pip install transformers==<version>`，
+/// 避免大版本下载阻塞 UI 线程。
+///
+/// 进度细分：
+/// - 10%：开始
+/// - 50%：uv pip install transformers==<version>
+/// - 90%：校验
+/// - 100%：完成
+pub fn make_switch_transformers_task(
+    python_env: Arc<PythonEnvService>,
+    venv_path: PathBuf,
+    version: String,
+) -> TaskDef {
+    let version_for_name = version.clone();
+    TaskDef {
+        kind: TaskKind::SwitchTransformers,
+        name: format!("切换 transformers 到 {}", version_for_name),
+        priority: None, // default = Normal
+        parent_id: None,
+        action: Box::new(move |cancel, progress| {
+            let python_env = python_env.clone();
+            let venv_path = venv_path.clone();
+            let version = version.clone();
+            Box::pin(async move {
+                progress.send_percent(10);
+                progress.send_message(format!("切换 transformers 到 {}...", version));
+                if cancel.is_cancelled() {
+                    return Err("任务已取消".to_string());
+                }
+
+                progress.send_percent(50);
+                progress.send_message(format!("uv pip install transformers=={}", version));
+                python_env
+                    .switch_transformers(&venv_path, &version, &cancel, None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                progress.send_percent(100);
+                Ok(TaskResult {
+                    summary: format!("transformers 切换成功: {}", version),
+                    payload: Some(serde_json::json!({ "version": version })),
+                })
+            })
+        }),
+    }
+}
+
+/// 构造「恢复默认 transformers 版本」任务（v3.7）
+///
+/// 按 ComfyUI `requirements.txt` 中 `transformers>=X.Y.Z` 约束，从版本列表
+/// 选满足约束的最新 4.x 版本（排除 5.x 破坏性 API 变更）切换。
+///
+/// 进度细分：
+/// - 10%：开始
+/// - 50%：选版 + uv pip install
+/// - 90%：校验
+/// - 100%：完成
+///
+/// 返回 TaskResult.payload 包含选定的版本号：`{ "version": "4.57.3" }`
+pub fn make_restore_transformers_default_task(
+    python_env: Arc<PythonEnvService>,
+    version_index: Arc<crate::python_env::TransformersVersionIndex>,
+    venv_path: PathBuf,
+    comfyui_root: PathBuf,
+) -> TaskDef {
+    TaskDef {
+        kind: TaskKind::SwitchTransformers,
+        name: "恢复默认 transformers 版本".to_string(),
+        priority: None, // default = Normal
+        parent_id: None,
+        action: Box::new(move |cancel, progress| {
+            let python_env = python_env.clone();
+            let version_index = version_index.clone();
+            let venv_path = venv_path.clone();
+            let comfyui_root = comfyui_root.clone();
+            Box::pin(async move {
+                progress.send_percent(10);
+                progress.send_message("恢复默认 transformers 版本...".to_string());
+                if cancel.is_cancelled() {
+                    return Err("任务已取消".to_string());
+                }
+
+                progress.send_percent(50);
+                progress.send_message("选版 + uv pip install...".to_string());
+
+                let selected_version = python_env
+                    .restore_transformers_default(
+                        &venv_path,
+                        &comfyui_root,
+                        &version_index,
+                        &cancel,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                progress.send_percent(100);
+                Ok(TaskResult {
+                    summary: format!("已恢复默认 transformers 版本: {}", selected_version),
+                    payload: Some(serde_json::json!({ "version": selected_version })),
+                })
+            })
+        }),
+    }
+}
+
+// ====================================================================
+// 9. force_reinstall_torch_consistent（v3.10 新增）
+// ====================================================================
+
+/// 构造「强制一致重装 torch」任务
+///
+/// v3.10 新增：解决 venv 中 torch/torchvision/torchaudio 来自不同源的"混乱状态"。
+/// 用 `--force-reinstall --no-deps --index-url` 强制从 pytorch.org 源覆盖重装。
+///
+/// 进度细分：
+/// - 10%：开始
+/// - 30%：强制重装 torch 系列（--force-reinstall --no-deps）
+/// - 60%：装 torch 关键依赖
+/// - 80%：装 ComfyUI requirements
+/// - 90%：smoke test
+/// - 100%：完成
+pub fn make_force_reinstall_torch_consistent_task(
+    python_env: Arc<PythonEnvService>,
+    venv_path: PathBuf,
+    comfyui_root: PathBuf,
+    cuda_version: CudaVersion,
+) -> TaskDef {
+    TaskDef {
+        kind: TaskKind::InstallTorch, // 复用 InstallTorch 类型（语义相近）
+        name: format!("强制一致重装 torch ({})", cuda_version_label(&cuda_version)),
+        priority: None,
+        parent_id: None,
+        action: Box::new(
+            move |cancel: CancellationToken, progress: ProgressSender| {
+                let python_env = python_env.clone();
+                let venv_path = venv_path.clone();
+                let comfyui_root = comfyui_root.clone();
+                let cuda_version = cuda_version;
+                Box::pin(async move {
+                    progress.send_percent(10);
+                    progress.send_message(format!(
+                        "强制一致重装 torch: {}",
+                        cuda_version_label(&cuda_version)
+                    ));
+
+                    if cancel.is_cancelled() {
+                        return Err("任务已取消".to_string());
+                    }
+
+                    // 主流程：quick_repair_reinstall_consistent
+                    // 内部已经做了详细进度汇报，这里只作为"包装"
+                    crate::python_env::recovery::quick_repair_reinstall_consistent(
+                        python_env.uv(),
+                        &venv_path,
+                        &comfyui_root,
+                        &cuda_version,
+                        &progress,
+                        &cancel,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                    progress.send_percent(100);
+                    Ok(TaskResult {
+                        summary: format!(
+                            "torch 强制一致重装完成（{}）",
+                            cuda_version_label(&cuda_version)
+                        ),
+                        payload: Some(serde_json::json!({
+                            "cuda_version": cuda_version_label(&cuda_version),
+                        })),
+                    })
+                })
+            },
+        ),
     }
 }

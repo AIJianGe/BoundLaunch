@@ -16,7 +16,7 @@ use crate::error::EnvError;
 
 /// 探查 torch 的 Python 脚本
 ///
-/// 输出 JSON：`{"torch": {...}, "platform": {...}}`
+/// 输出 JSON：`{"torch": {...}, "torchvision": {...}, "platform": {...}}`
 ///
 /// **v1.8 关键修复（torch "已装但显示未装" 问题）**：
 /// 之前的 `except ImportError` 会默默吞掉所有 `import torch` 失败的真实原因
@@ -29,19 +29,32 @@ use crate::error::EnvError;
 /// 2. 把错误类型 / 消息 / traceback 一并写入 JSON
 /// 3. 前端 StatusCard 看到 `_error_type` 时直接显示原文
 ///
+/// **v3.8 D-L3 扩展**：增加 torchvision 子模块校验
+/// - 历史上用户 venv 出现 "torch 装对了，但 torchvision 是 0.1.6 远古版" 的惨案
+///   → `from torchvision.ops import roi_align` 失败，ComfyUI 启动炸
+/// - probe 现在同时检查 `from torchvision.ops import roi_align` 和 `from torchvision.io import read_image`
+/// - 失败时返回 `_error_type: "IncompleteTorchvision"`，触发 D-L4 自动重装
+///
 /// JSON 结构：
-/// - 成功：`{"torch": {"installed": true, "version": ..., "cuda_available": ...}}`
-/// - 失败：`{"torch": {"installed": false, "_error_type": "ImportError",
-///                    "_error_msg": "...", "_traceback": "..."}}`
+/// - 成功：`{"torch": {"installed": true, ...},
+///            "torchvision": {"installed": true, "version": "0.22.0+cu128",
+///                            "ops_available": true, "io_available": true},
+///            "platform": {...}}`
+/// - 失败：`{"torch": {...}, "torchvision": {"installed": false,
+///                    "_error_type": "IncompleteTorchvision", "_error_msg": "..."},
+///            "platform": {...}}`
 ///
 /// ⚠ 下划线开头的字段前端 JSON 反序列化时会被 TS 类型忽略（TS 类型只有
 /// installed / version / cuda_available 等），但通过 raw JSON 透传给 StatusCard
 /// 的诊断面板（见 frontend/src/components/launch/StatusCard.vue）。
 const PROBE_TORCH_SCRIPT: &str = r#"
 import sys, json, platform, traceback
+result = {"platform": {"system": platform.system(), "release": platform.release()}}
+
+# ========== torch 探查 ==========
 try:
     import torch
-    torch_info = {
+    result["torch"] = {
         "installed": True,
         "version": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
@@ -57,16 +70,73 @@ except Exception as e:
     # - ImportError: numpy 2.4.4 wheel 缺 exceptions.py → import torch 失败
     # - RuntimeError: torch C 扩展加载失败（CUDA driver 不匹配等）
     # - OSError: torch 共享库加载失败
-    torch_info = {
+    result["torch"] = {
         "installed": False,
         "_error_type": type(e).__name__,
         "_error_msg": str(e)[:500],  # 截断防止 traceback 过长
         "_traceback": traceback.format_exc()[-500:],  # 取最后 500 字符（最有信息量的栈底）
     }
-result = {
-    "torch": torch_info,
-    "platform": {"system": platform.system(), "release": platform.release()},
-}
+
+# ========== v3.8 D-L3：torchvision 探查（子模块强校验）==========
+try:
+    import torchvision
+    tv_version = getattr(torchvision, "__version__", None)
+    # 关键：0.1.6 远古版没有 __version__ 属性（其 __init__.py 只有 4 行 from ... import）
+    if tv_version is None:
+        raise ImportError(
+            "torchvision.__version__ 不存在，疑似远古版（0.1.6 之前），"
+            "torchvision.ops / io 等现代子模块也不可用"
+        )
+
+    # 尝试 import 关键子模块（C++ 扩展）
+    try:
+        from torchvision.ops import roi_align  # noqa: F401
+        ops_available = True
+        ops_error = None
+    except Exception as e_ops:
+        ops_available = False
+        ops_error = "{}: {}".format(type(e_ops).__name__, str(e_ops)[:200])
+
+    try:
+        from torchvision.io import read_image  # noqa: F401
+        io_available = True
+        io_error = None
+    except Exception as e_io:
+        io_available = False
+        io_error = "{}: {}".format(type(e_io).__name__, str(e_io)[:200])
+
+    if ops_available and io_available:
+        result["torchvision"] = {
+            "installed": True,
+            "version": tv_version,
+            "ops_available": True,
+            "io_available": True,
+        }
+    else:
+        # 子模块残缺（典型场景：装到一半被中断，或装上 0.1.6 远古版）
+        result["torchvision"] = {
+            "installed": False,
+            "version": tv_version,
+            "ops_available": ops_available,
+            "io_available": io_available,
+            "_error_type": "IncompleteTorchvision",
+            "_error_msg": "ops={}, io={}".format(
+                "ok" if ops_available else "fail: " + (ops_error or "?"),
+                "ok" if io_available else "fail: " + (io_error or "?"),
+            ),
+            "_traceback": "torchvision {} 子模块校验失败：ops={}, io={}".format(
+                tv_version, ops_available, io_available
+            ),
+        }
+except Exception as e:
+    # import torchvision 本身失败（完全没装 / 装到一半被中断 / 版本太老）
+    result["torchvision"] = {
+        "installed": False,
+        "_error_type": type(e).__name__,
+        "_error_msg": str(e)[:500],
+        "_traceback": traceback.format_exc()[-500:],
+    }
+
 print(json.dumps(result))
 "#;
 
@@ -257,6 +327,7 @@ pub async fn probe_torch_script(
 /// - `installed`：是否能成功 import torch
 /// - `version` / `cuda_available` 等：仅在 installed=true 时有值
 /// - `error_type` / `error_msg` / `traceback`：仅在 installed=false 且 import 抛异常时有值
+/// - `torchvision`：v3.8 D-L3 新增，torchvision 子模块强校验结果
 #[derive(Debug, Clone, Serialize)]
 pub struct TorchProbeResult {
     pub installed: bool,
@@ -270,6 +341,46 @@ pub struct TorchProbeResult {
     pub error_msg: Option<String>,
     /// traceback 末尾（截断到 500 字符）
     pub traceback_tail: Option<String>,
+    /// v3.8 D-L3：torchvision 子模块强校验结果
+    pub torchvision: TorchvisionProbeInfo,
+}
+
+/// v3.8 D-L3：torchvision 子模块校验结果
+///
+/// **何时 installed=false**：
+/// 1. `import torchvision` 本身失败（包未装 / 半装被中断）
+/// 2. `torchvision.__version__` 不存在（0.1.6 远古版没这属性）
+/// 3. `from torchvision.ops import roi_align` 失败（缺 C++ 扩展）
+/// 4. `from torchvision.io import read_image` 失败（缺 io 子包）
+///
+/// **何时 installed=true**：
+/// 1. `import torchvision` 成功
+/// 2. `__version__` 存在（>= 0.2）
+/// 3. `torchvision.ops.roi_align` 和 `torchvision.io.read_image` 都能 import
+#[derive(Debug, Clone, Serialize)]
+pub struct TorchvisionProbeInfo {
+    pub installed: bool,
+    pub version: Option<String>,
+    pub ops_available: bool,
+    pub io_available: bool,
+    /// 错误类型（IncompleteTorchvision / ImportError / AttributeError 等）
+    pub error_type: Option<String>,
+    pub error_msg: Option<String>,
+    pub traceback_tail: Option<String>,
+}
+
+impl Default for TorchvisionProbeInfo {
+    fn default() -> Self {
+        Self {
+            installed: false,
+            version: None,
+            ops_available: false,
+            io_available: false,
+            error_type: None,
+            error_msg: None,
+            traceback_tail: None,
+        }
+    }
 }
 
 /// 解析 torch 探针 JSON 输出
@@ -285,6 +396,7 @@ pub fn parse_torch_probe(json_output: &str) -> TorchProbeResult {
         error_type: None,
         error_msg: None,
         traceback_tail: None,
+        torchvision: TorchvisionProbeInfo::default(),
     };
     let parsed: Value = match serde_json::from_str(json_output) {
         Ok(v) => v,
@@ -310,6 +422,16 @@ pub fn parse_torch_probe(json_output: &str) -> TorchProbeResult {
             result.error_msg = t.get("_error_msg").and_then(|v| v.as_str()).map(String::from);
             result.traceback_tail = t.get("_traceback").and_then(|v| v.as_str()).map(String::from);
         }
+    }
+    // v3.8 D-L3：解析 torchvision 字段
+    if let Some(tv) = parsed.get("torchvision") {
+        result.torchvision.installed = tv.get("installed").and_then(|v| v.as_bool()).unwrap_or(false);
+        result.torchvision.version = tv.get("version").and_then(|v| v.as_str()).map(String::from);
+        result.torchvision.ops_available = tv.get("ops_available").and_then(|v| v.as_bool()).unwrap_or(false);
+        result.torchvision.io_available = tv.get("io_available").and_then(|v| v.as_bool()).unwrap_or(false);
+        result.torchvision.error_type = tv.get("_error_type").and_then(|v| v.as_str()).map(String::from);
+        result.torchvision.error_msg = tv.get("_error_msg").and_then(|v| v.as_str()).map(String::from);
+        result.torchvision.traceback_tail = tv.get("_traceback").and_then(|v| v.as_str()).map(String::from);
     }
     result
 }

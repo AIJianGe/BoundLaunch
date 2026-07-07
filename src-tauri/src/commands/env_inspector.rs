@@ -144,6 +144,7 @@ pub async fn env_readiness_check(
     // 这里假设 true（运行期不会变化）；若需精确值，前端可单独调 env_uv_available
     let uv_available = true;
     let torch_installed = snapshot.torch_installed;
+    let cuda_available = snapshot.cuda_available;
 
     // requirements_ok：检查 dependencies 中是否有 Missing / NeedsUpgrade
     let requirements_ok = snapshot
@@ -182,6 +183,10 @@ pub async fn env_readiness_check(
             torch_installed,
             requirements_ok,
         },
+        // v3.10 新增：把启动模式 + 实际 CUDA 可用性一并返回，
+        // 前端可据此检测模式不匹配并给出引导
+        launch_mode: cfg.launch.mode,
+        cuda_available,
     }))
 }
 

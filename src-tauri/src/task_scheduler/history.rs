@@ -93,6 +93,7 @@ mod tests {
             status: TaskStatus::Completed,
             started_at: Some(DateTime::parse_from_rfc3339("2026-07-04T00:00:00Z").unwrap().with_timezone(&Utc)),
             completed_at: Some(DateTime::parse_from_rfc3339("2026-07-04T00:00:05Z").unwrap().with_timezone(&Utc)),
+            parent_id: None,
         };
         assert_eq!(duration_ms(&info), Some(5000));
     }
@@ -109,6 +110,7 @@ mod tests {
             status: TaskStatus::Completed,
             started_at: Some(Utc::now()),
             completed_at: Some(Utc::now()),
+            parent_id: None,
         };
         let result = record(&store, &info).await;
         assert!(result.is_ok());

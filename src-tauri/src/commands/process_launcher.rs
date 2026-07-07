@@ -260,7 +260,7 @@ mod tests {
                 advanced: AdvancedArgs::default(),
             },
             torch: TorchConfig {
-                cuda_version: crate::config::CudaVersion::Cu121,
+                cuda_version: crate::config::CudaVersion::Cu128,
                 torch_variant: None,
             },
             models: crate::config::ModelsConfig {

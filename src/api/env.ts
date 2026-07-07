@@ -109,7 +109,7 @@ export function envCreateVenv(pythonVersion: string): Promise<string> {
 /**
  * 安装 torch（F32 改造：返回 task_id）
  *
- * @param cudaVersion CUDA 版本（如 "cu121" / "cpu"）
+ * @param cudaVersion CUDA 版本（如 "cu128" / "cpu"）
  * @returns task_id，前端通过 `task_progress` / `task_completed` 事件跟踪进度
  */
 export function envInstallTorch(cudaVersion: string): Promise<string> {
@@ -256,4 +256,108 @@ export function envDiagnose(): Promise<string> {
  */
 export function envRepair(action: RepairAction): Promise<string> {
   return invoke<string>("env_repair", { action });
+}
+
+// ============================================================================
+// v3.10：torch 一致性诊断（mismatch 检测）
+// ============================================================================
+
+/**
+ * torch 一致性建议
+ */
+export type TorchConsistencyRecommendation =
+  | "no_action"
+  | "reinstall_torch"
+  | "rebuild_venv"
+  | "check_driver";
+
+/**
+ * torch 一致性报告
+ */
+export interface TorchConsistencyReport {
+  /** 是否完全一致 */
+  consistent: boolean;
+  /** Config 期望的 cuda_version（如 "cu128" / "cpu"） */
+  config_cuda_version: string;
+  /** venv 中实际 torch 版本（如 "2.12.1+cpu"） */
+  venv_torch_version: string | null;
+  /** venv 中 torch.cuda.is_available() */
+  venv_cuda_available: boolean;
+  /** 人类可读的问题列表 */
+  issues: string[];
+  /** 修复建议 */
+  recommendation: TorchConsistencyRecommendation;
+}
+
+/**
+ * 检测 venv 中的 torch 状态是否与 Config 一致（v3.10 新增）
+ *
+ * 调用方式：
+ * - 启动 ComfyUI 前自动调用
+ * - 「一键补装」流程中显式调用
+ * - 「关键依赖」页面用户点「诊断」时调用
+ */
+export function envCheckTorchConsistency(): Promise<TorchConsistencyReport> {
+  return invoke<TorchConsistencyReport>("env_check_torch_consistency");
+}
+
+/**
+ * 强制一致重装 torch（v3.10 新增）
+ *
+ * 用 `--force-reinstall --no-deps --index-url pytorch.org` 强制覆盖重装
+ * torch/torchvision/torchaudio，**不破坏 venv 中的其他包**。
+ *
+ * 返回 task_id，由 TaskScheduler 异步执行。
+ */
+export function envRepairConsistent(cudaVersion: string): Promise<string> {
+  return invoke<string>("env_repair_consistent", { cudaVersion });
+}
+
+// ============================================================================
+// v3.7：transformers 版本切换
+// ============================================================================
+
+/**
+ * 列出所有可用 transformers 版本（v3.7 新增）
+ *
+ * 从后端 `TransformersVersionIndex` 获取版本列表（三层缓存：L1 内存 → L2 文件 → L3 fallback）。
+ * 同步返回，不阻塞。
+ *
+ * 版本列表降序排列（最新在前），包含 4.x 和 5.x。
+ * 前端应将 5.x 标记为「实验」（破坏性 API 变更）。
+ *
+ * 后端启动时会自动后台拉取 PyPI 最新版本列表，前端也可监听
+ * `transformers_versions_updated` 事件以接收刷新后的列表。
+ */
+export function envListTransformersVersions(): Promise<string[]> {
+  return invoke<string[]>("env_list_transformers_versions");
+}
+
+/**
+ * 切换 transformers 版本（v3.7 新增）
+ *
+ * F32 模式：返回 task_id，实际执行由 TaskScheduler 调度。
+ * - 进度通过 `task_progress` 事件推送（10% 开始 / 50% uv pip install / 90% 校验 / 100% 完成）
+ * - 完成后通过 `task_completed` 事件通知前端
+ * - 完成后自动 emit `RequirementsInstalled` 让 env cache 失效
+ *
+ * @param version 目标版本号（如 "4.57.3" 或 "5.13.0"）
+ * @returns task_id，前端通过 `waitForTask` 等待完成
+ */
+export function envSwitchTransformers(version: string): Promise<string> {
+  return invoke<string>("env_switch_transformers", { version });
+}
+
+/**
+ * 恢复默认 transformers 版本（v3.7 新增）
+ *
+ * 按 ComfyUI `requirements.txt` 中的 `transformers>=X.Y.Z` 约束，
+ * 从版本列表选满足约束的最新 4.x 版本（排除 5.x 破坏性变更）切换。
+ *
+ * F32 模式：返回 task_id，`task_completed` 事件的 payload 包含选定的版本号：`{ "version": "4.57.3" }`
+ *
+ * @returns task_id
+ */
+export function envRestoreTransformersDefault(): Promise<string> {
+  return invoke<string>("env_restore_transformers_default");
 }

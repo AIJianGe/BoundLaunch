@@ -70,74 +70,80 @@ function shortCommit(sha: string): string {
   return sha.length > 7 ? sha.slice(0, 7) : sha;
 }
 
-/** 表格列定义 */
-const columns = computed<DataTableColumns<TagInfo>>(() => [
-  {
-    title: "版本号",
-    key: "name",
-    width: 200,
-    render: (row) => {
-      const isCurrent = row.name === props.currentVersion;
-      return h(
-        "div",
-        { class: "version-cell" },
-        [
-          h("span", { class: "version-name" }, row.name),
-          isCurrent
-            ? h(
-                NTag,
-                { size: "small", type: "success", class: "current-badge" },
-                () => "当前",
-              )
-            : null,
-        ],
-      );
-    },
-  },
-  {
-    title: "提交",
-    key: "commit",
-    width: 100,
-    render: (row) =>
-      h(
-        NEllipsis,
-        { class: "commit-cell" },
-        { default: () => shortCommit(row.commit) },
-      ),
-  },
-  {
-    title: "发布日期",
-    key: "date",
-    width: 120,
-    render: (row) => h("span", { class: "date-cell" }, formatDate(row.date)),
-  },
-  {
-    title: "操作",
-    key: "actions",
-    width: 120,
-    fixed: "right",
-    render: (row) => {
-      const isCurrent = row.name === props.currentVersion;
-      if (isCurrent) {
+/** 表格列定义（✅ P0-4 修复：computed 显式依赖 props.currentVersion） */
+const columns = computed<DataTableColumns<TagInfo>>(() => {
+  // 读取 props.currentVersion 到局部变量，让 Vue 追踪这个依赖
+  // 之前在 render 函数里直接读 props.currentVersion，computed 不一定能追踪到
+  // （Vue 3 多数情况能追踪到，但显式读一次最稳）
+  const cur = props.currentVersion;
+  return [
+    {
+      title: "版本号",
+      key: "name",
+      width: 200,
+      render: (row) => {
+        const isCurrent = row.name === cur;
         return h(
-          NTag,
-          { size: "small", type: "default", bordered: false },
-          () => "已是当前",
+          "div",
+          { class: "version-cell" },
+          [
+            h("span", { class: "version-name" }, row.name),
+            isCurrent
+              ? h(
+                  NTag,
+                  { size: "small", type: "success", class: "current-badge" },
+                  () => "当前",
+                )
+              : null,
+          ],
         );
-      }
-      return h(
-        NButton,
-        {
-          size: "small",
-          type: "primary",
-          disabled: props.disabled,
-          onClick: () => emit("switch", row),
-        },
-        () => "切换到此版本",
-      );
+      },
     },
-  },
-]);
+    {
+      title: "提交",
+      key: "commit",
+      width: 100,
+      render: (row) =>
+        h(
+          NEllipsis,
+          { class: "commit-cell" },
+          { default: () => shortCommit(row.commit) },
+        ),
+    },
+    {
+      title: "发布日期",
+      key: "date",
+      width: 120,
+      render: (row) => h("span", { class: "date-cell" }, formatDate(row.date)),
+    },
+    {
+      title: "操作",
+      key: "actions",
+      width: 120,
+      fixed: "right",
+      render: (row) => {
+        const isCurrent = row.name === cur;
+        if (isCurrent) {
+          return h(
+            NTag,
+            { size: "small", type: "default", bordered: false },
+            () => "已是当前",
+          );
+        }
+        return h(
+          NButton,
+          {
+            size: "small",
+            type: "primary",
+            disabled: props.disabled,
+            onClick: () => emit("switch", row),
+          },
+          () => "切换到此版本",
+        );
+      },
+    },
+  ];
+});
 
 /** 空状态 */
 const isEmpty = computed(

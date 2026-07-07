@@ -18,7 +18,7 @@ use super::task::{FinalErr, FinalOutcome, TaskDef};
 /// 执行单个任务（spawn 内部调用）
 ///
 /// 流程：
-/// 1. 创建 mpsc + ProgressSender
+/// 1. 创建 mpsc + ProgressSender（绑定 task_id + parent_id）
 /// 2. spawn 后台 flush task（100ms 聚合 emit 到前端）
 /// 3. catch_unwind(action(cancel_token, sender)).await
 /// 4. 根据结果：
@@ -30,18 +30,25 @@ use super::task::{FinalErr, FinalOutcome, TaskDef};
 /// 注意：状态转换（Queued→Running→终态）、emit terminal、LogStore 写入由调用方处理
 ///
 /// `app = None` 时（测试场景）跳过 emit，仅记录日志
+///
+/// ✅ P2-1：增加 `parent_id` 参数（None = 根任务）
 pub(crate) async fn run_action(
     app: Option<AppHandle>,
     task_id: TaskId,
     def: TaskDef,
     cancel_token: CancellationToken,
+    parent_id: Option<TaskId>,
 ) -> FinalOutcome {
-    // 1. 创建 mpsc + ProgressSender
+    // 1. 创建 mpsc + ProgressSender（绑定 task_id 给子任务日志透传用）
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let sender = ProgressSender { tx };
+    let sender = ProgressSender {
+        tx,
+        task_id: task_id.clone(),
+    };
 
     // 2. spawn 后台 flush task（rx 在 sender drop 后自然关闭，flush 最后一帧并退出）
-    let _flush_handle = spawn_flush_loop(app, task_id.clone(), rx);
+    // ✅ P2-1：把 parent_id 传进 flush_loop，让 LogEvent.parent_task_id 正确
+    let _flush_handle = spawn_flush_loop(app, task_id.clone(), rx, parent_id);
 
     // 3. catch_unwind 包装 action
     let action_fut = (def.action)(cancel_token.clone(), sender);

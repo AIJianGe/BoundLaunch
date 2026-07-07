@@ -44,15 +44,19 @@
 
 import { computed, onUnmounted, ref, watch } from "vue";
 import { NButton, NSpin, NProgress, NModal, NSpace, NText } from "naive-ui";
+import { useRouter } from "vue-router";
 import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
+import { useConfigStore } from "@/stores/config";
 import { useToast } from "@/composables/useToast";
 import { useConfirm } from "@/composables/useConfirm";
 import { useEnvInstaller } from "@/composables/useEnvInstaller";
 import { useStartComfyui } from "@/composables/useStartComfyui";
 
+const router = useRouter();
 const processStore = useProcessStore();
 const envStore = useEnvStore();
+const configStore = useConfigStore();
 const toast = useToast();
 const { confirm: showConfirm } = useConfirm();
 const { installMissingSteps, installing: installingEnv } = useEnvInstaller();
@@ -152,6 +156,31 @@ const envNotReady = computed(
     !envStore.readiness.ready,
 );
 
+/**
+ * v3.10：检测 torch.cuda_available 与 launch_mode 是否匹配
+ *
+ * 解决「torch+cpu + GpuHigh 启动后 AssertionError」问题：
+ * - 当用户在设置页选了 cu128，但 venv 中 torch+cpu（config 与 venv 不一致）
+ * - 当用户选 GpuHigh 模式但 torch 不支持 CUDA
+ * → mismatch → 启动按钮显示警告，sublabel 引导去设置修复
+ *
+ * 优先级：mismatch > envNotReady（mismatch 是更具体的错误）
+ */
+const cudaMismatch = computed(() => {
+  if (!envStore.isLoaded) return false;
+  const env = envStore.envInfo;
+  if (!env || !env.torch_installed) return false;
+  // v3.10：launchMode 来自 configStore
+  const mode = configStore.launchMode;
+  const gpuMode =
+    mode === "gpu_high" || mode === "gpu_low" || mode === "gpu_no_vram";
+  // gpuMode 缺失（null）时不视为 mismatch（让后端 verify_preconditions 处理）
+  if (mode !== null && gpuMode && !env.cuda_available) {
+    return true;
+  }
+  return false;
+});
+
 /** 按钮配置 */
 const buttonConfig = computed(() => {
   switch (currentState.value) {
@@ -205,6 +234,16 @@ const buttonConfig = computed(() => {
         showSublabel: true,
       };
     default: // stopped
+      // v3.10：mismatch 时按钮变 warning + disabled，引导去设置修复
+      if (cudaMismatch.value) {
+        return {
+          type: "warning" as const,
+          loading: false,
+          disabled: true,
+          label: "⚠ PyTorch 不支持 CUDA",
+          showSublabel: true,
+        };
+      }
       return {
         type: "success" as const,
         loading: false,
@@ -228,6 +267,10 @@ const sublabel = computed(() => {
   }
   if (currentState.value === "crashed") {
     return processStore.error || "ComfyUI 进程已崩溃";
+  }
+  // v3.10：mismatch 优先级最高（mismatch 是更具体的错误）
+  if (currentState.value === "stopped" && cudaMismatch.value) {
+    return "⚠ PyTorch 不支持 CUDA：请到「设置 → 关键依赖」点击「重新安装 PyTorch」";
   }
   if (currentState.value === "stopped" && envNotReady.value) {
     return "⚠ 环境未就绪，请前往「设置 → 路径配置」点击「一键补装」";
@@ -271,6 +314,36 @@ async function onStart() {
     startComfyui.unmarkSubmitting();
     toast.info("ComfyUI 已在运行中");
     return;
+  }
+
+  // v3.10 守卫 1.5：torch cuda_available vs launch_mode mismatch
+  // - 比 readiness 守卫更具体（readiness 不知道 launch_mode × cuda_available 关系）
+  // - 弹窗让用户选择：去设置页修复 / 仍然启动（可能失败）
+  if (cudaMismatch.value) {
+    const env = envStore.envInfo;
+    const torchVer = env?.torch_version ?? "?";
+    const ok = await showConfirm({
+      title: "PyTorch 不支持 CUDA",
+      content:
+        `检测到 venv 中的 PyTorch 不支持 CUDA：\n` +
+        `• PyTorch 版本：${torchVer}\n` +
+        `• torch.cuda.is_available() = ${env?.cuda_available ?? "未知"}\n` +
+        `• 启动模式：${configStore.launchMode ?? "gpu_high"}（需要 GPU）\n\n` +
+        `这会导致 ComfyUI 启动后立即报错：\n` +
+        `  AssertionError: Torch not compiled with CUDA enabled\n\n` +
+        `建议：\n` +
+        `1. 到「设置 → 关键依赖」点击「重新安装 PyTorch」（用 --force-reinstall 强制一致）\n` +
+        `2. 或先在「基础参数」切换到「CPU 模式」`,
+      positiveText: "去设置页修复",
+      negativeText: "仍然启动",
+    });
+    if (ok) {
+      startComfyui.unmarkSubmitting();
+      // 跳到 PyTorch 设置页（用户最关心的修复入口）
+      router.push("/settings/torch");
+      return;
+    }
+    // 用户选择"仍然启动"→ 不阻断，让后端 verify_preconditions 给出具体错误
   }
 
   // v3.2.1 关键修复：先强制刷新 envInfo 和 readiness

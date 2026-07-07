@@ -4,16 +4,17 @@
  *
  * 详见 `PR/06-界面设计.md §5.3 设置页`
  *
- * 5 区编排：
- * 1. 路径配置       PathsPanel
- * 2. Python 切换    PythonVersionPanel
- * 3. torch 配置     TorchConfigPanel
- * 4. UI 配置         UiPanel
- * 5. 危险操作        DangerZonePanel
+ * 6 区编排：
+ * 1. 路径配置         PathsPanel
+ * 2. Python 切换      PythonVersionPanel
+ * 3. torch 配置       TorchConfigPanel
+ * 4. transformers 切换 TransformersConfigPanel（v3.7 新增）
+ * 5. UI 配置           UiPanel
+ * 6. 危险操作          DangerZonePanel
  *
  * 容器职责：
  * - 加载初始 Config / envInfo（如未加载）
- * - 编排 5 个子组件
+ * - 编排 6 个子组件
  *
  * 设计模式：
  * - **Facade**：本页面是「设置页」外观
@@ -28,6 +29,7 @@ import { computed } from "vue";
 import PathsPanel from "@/components/settings/PathsPanel.vue";
 import PythonVersionPanel from "@/components/settings/PythonVersionPanel.vue";
 import TorchConfigPanel from "@/components/settings/TorchConfigPanel.vue";
+import TransformersConfigPanel from "@/components/settings/TransformersConfigPanel.vue";
 import DependenciesPanel from "@/components/settings/DependenciesPanel.vue";
 import UiPanel from "@/components/settings/UiPanel.vue";
 import DangerZonePanel from "@/components/settings/DangerZonePanel.vue";
@@ -65,6 +67,7 @@ onMounted(async () => {
       <PathsPanel />
       <PythonVersionPanel />
       <TorchConfigPanel />
+      <TransformersConfigPanel />
       <DependenciesPanel />
       <UiPanel />
       <DangerZonePanel />

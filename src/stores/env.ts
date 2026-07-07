@@ -41,9 +41,14 @@ import {
   envChangeTorchVariant,
   envDiagnose,
   envRepair,
+  envCheckTorchConsistency,
+  envRepairConsistent,
   systemDetectGpus,
   systemClearGpuCache,
   systemRecommendTorch,
+  envListTransformersVersions,
+  envSwitchTransformers,
+  envRestoreTransformersDefault,
 } from "@/api/env";
 import { listen, type UnlistenFn } from "@/api";
 import type {
@@ -59,7 +64,11 @@ import type {
   DiagnoseReport,
   RepairAction,
 } from "@/api/types";
-import { parseTorchVariant, serializeTorchVariant } from "@/utils/torchVariant";
+import {
+  parseTorchVariant,
+  parseTorchVersionString,
+  serializeTorchVariant,
+} from "@/utils/torchVariant";
 import { useConfigStore } from "./config";
 
 export const useEnvStore = defineStore("env", () => {
@@ -87,6 +96,13 @@ export const useEnvStore = defineStore("env", () => {
   const repairing = ref(false);
   /** 修复动作（用于进度提示） */
   const currentRepairAction = ref<RepairAction | null>(null);
+  // v3.7：transformers 版本切换
+  /** 所有可用 transformers 版本（降序，最新在前；后端三层缓存） */
+  const transformersVersions = ref<string[]>([]);
+  /** transformers 版本切换中（true = 已提交 task_id，正在等 task_completed） */
+  const switchingTransformers = ref(false);
+  /** transformers 恢复默认中（true = 已提交 task_id，正在等 task_completed） */
+  const restoringTransformers = ref(false);
 
   const unlisteners: UnlistenFn[] = [];
 
@@ -100,14 +116,34 @@ export const useEnvStore = defineStore("env", () => {
   /** 是否就绪（readiness.ready === true），false 时按钮变 "一键安装" */
   const isReady = computed(() => readiness.value?.ready ?? false);
 
-  /** v3.0：当前选中的 torch 变体（来自 ConfigStore.torch.torch_variant） */
+  /**
+   * v3.0：当前选中的 torch 变体（带降级链）
+   *
+   * 解析顺序（v3.10 新增降级链）：
+   * 1. `currentTorch`（store 缓存，refresh 时从 Config 解析写入）
+   * 2. `Config.torch.torch_variant`（最权威，但可能为 None）
+   * 3. `envInfo.torch_version` 字符串反向推断（v3.10 新增）
+   *    - 用途：Config 没存 torch_variant（首次启动 / 自动安装）
+   *      但 venv 中已有 torch 时，让设置页面能正确默认选中
+   *    - 例：Config.torch_variant = None, envInfo.torch_version = "2.11.0+cu128"
+   *      → 返回 `{ vendor: "nvidia_cuda", version: "cu128" }`
+   *
+   * 注意：第 3 步不写回 Config（避免污染用户配置），
+   * 下次用户手动切换时再写入。
+   */
   const activeTorch = computed<TorchVariant | null>(() => {
-    // 优先用 store 自己解析的 currentTorch（refresh 时写入）
+    // 1. store 缓存
     if (currentTorch.value) return currentTorch.value;
-    // fallback: 从 config store 拿原始 JSON 字符串解析
+    // 2. Config.torch.torch_variant
     const configStore = useConfigStore();
     const raw = configStore.config?.torch.torch_variant;
-    return raw ? parseTorchVariant(raw) : null;
+    const fromConfig = raw ? parseTorchVariant(raw) : null;
+    if (fromConfig) return fromConfig;
+    // 3. v3.10 降级：从 envInfo.torch_version 字符串推断
+    if (envInfo.value?.torch_version) {
+      return parseTorchVersionString(envInfo.value.torch_version);
+    }
+    return null;
   });
 
   // ========== F32 内部工具：等待任务完成 ==========
@@ -212,10 +248,22 @@ export const useEnvStore = defineStore("env", () => {
       pythonEnvStatus.value = status;
       // v3.6: deps 可能为 null（首次启动 cache 为空），降级为空数组
       dependencies.value = deps ?? [];
-      // 同步 v3.0 torch 变体（从 Config 解析）
+      // 同步 v3.0 torch 变体（带降级链）
+      //
+      // v3.10 升级：之前只从 Config 解析，Config 为 None 时 currentTorch = null
+      // → 设置页面单选列表没默认选中
+      // 现在增加降级链：Config → envInfo.torch_version 字符串推断
       const configStore = useConfigStore();
       const raw = configStore.config?.torch.torch_variant;
-      currentTorch.value = raw ? parseTorchVariant(raw) : null;
+      const fromConfig = raw ? parseTorchVariant(raw) : null;
+      if (fromConfig) {
+        currentTorch.value = fromConfig;
+      } else if (info?.torch_version) {
+        // 降级：从 venv 实际安装的 torch 版本字符串推断
+        currentTorch.value = parseTorchVersionString(info.torch_version);
+      } else {
+        currentTorch.value = null;
+      }
       // 顺便做一次 readiness 检查（不抛错）
       checkReadiness().catch((e) =>
         console.warn("[env] readiness check failed:", e),
@@ -398,6 +446,114 @@ export const useEnvStore = defineStore("env", () => {
     }
   }
 
+  // ========== v3.10：torch 一致性诊断 + 强制一致重装 ==========
+
+  /**
+   * v3.10：检测 venv 中的 torch 状态是否与 Config 一致
+   *
+   * 用于解决「Config 写 cu128，但 venv 实际是 +cpu」这种 mismatch 问题。
+   * @returns 一致性报告
+   */
+  async function checkTorchConsistency() {
+    return await envCheckTorchConsistency();
+  }
+
+  /**
+   * v3.10：强制一致重装 torch
+   *
+   * 用 `--force-reinstall --no-deps --index-url pytorch.org` 强制覆盖重装
+   * torch/torchvision/torchaudio，**不破坏 venv 中的其他包**。
+   * @param cudaVersion "cu128" / "cu126" / "cu118" / "cpu"
+   * @returns task_id
+   */
+  async function repairConsistent(cudaVersion: string) {
+    if (repairing.value) {
+      throw new Error("已有修复任务在执行中");
+    }
+    repairing.value = true;
+    currentRepairAction.value = "reinstall_torch";
+    try {
+      const taskId = await envRepairConsistent(cudaVersion);
+      await waitForTask(taskId);
+      // 完成后让缓存失效 + 重新刷新 + 重新诊断
+      await envInvalidateCache();
+      await refresh();
+      try {
+        await diagnose();
+      } catch (e) {
+        console.warn("[env] re-diagnose after repairConsistent failed:", e);
+      }
+    } finally {
+      repairing.value = false;
+      currentRepairAction.value = null;
+    }
+  }
+
+  // ========== v3.7：transformers 版本切换 ==========
+
+  /**
+   * 加载所有可用 transformers 版本（从后端三层缓存）
+   *
+   * 后端启动时自动后台拉取 PyPI 版本列表，前端也可监听
+   * `transformers_versions_updated` 事件自动更新（见 subscribe）。
+   */
+  async function loadTransformersVersions() {
+    try {
+      transformersVersions.value = await envListTransformersVersions();
+    } catch (e) {
+      console.warn("[env] loadTransformersVersions failed:", e);
+    }
+  }
+
+  /**
+   * 切换 transformers 版本（v3.7 新增）
+   *
+   * F32 模式：invoke 拿 task_id → waitForTask 等终态 → invalidateCache + refresh
+   * 完成后 env cache 失效，`env_inspect_updated` 事件会自动更新 envInfo。
+   *
+   * @param version 目标版本号（如 "4.57.3" 或 "5.13.0"）
+   */
+  async function switchTransformers(version: string) {
+    if (switchingTransformers.value) {
+      throw new Error("已有 transformers 切换任务在执行中");
+    }
+    switchingTransformers.value = true;
+    try {
+      const taskId = await envSwitchTransformers(version);
+      await waitForTask(taskId);
+      // 完成后失效缓存 + 刷新（后端已 emit RequirementsInstalled 触发后台刷新，
+      // 但显式 refresh 让前端立即拿到最新数据）
+      await envInvalidateCache();
+      await refresh();
+    } finally {
+      switchingTransformers.value = false;
+    }
+  }
+
+  /**
+   * 恢复默认 transformers 版本（v3.7 新增）
+   *
+   * 按 ComfyUI requirements.txt 约束选最新 4.x 版本切换。
+   *
+   * @returns 选定的版本号（如 "4.57.3"）
+   */
+  async function restoreTransformersDefault(): Promise<string> {
+    if (restoringTransformers.value) {
+      throw new Error("已有 transformers 恢复任务在执行中");
+    }
+    restoringTransformers.value = true;
+    try {
+      const taskId = await envRestoreTransformersDefault();
+      // 用 waitForTaskWithPayload 提取 payload.version
+      const payload = await waitForTaskWithPayload<{ version: string }>(taskId);
+      await envInvalidateCache();
+      await refresh();
+      return payload.version;
+    } finally {
+      restoringTransformers.value = false;
+    }
+  }
+
   /** v3.0 依赖冲突检测（扫描 custom_nodes 下的所有 requirements 文件） */
   async function checkConflicts(): Promise<ConflictReport | null> {
     try {
@@ -499,6 +655,10 @@ export const useEnvStore = defineStore("env", () => {
           console.warn("[env] readiness check after env_inspect_updated failed:", err),
         );
       }),
+      // v3.7 新事件：transformers 版本列表后台刷新完成 → 更新本地缓存
+      await listen<string[]>("transformers_versions_updated", (e) => {
+        transformersVersions.value = e.payload;
+      }),
     );
   }
 
@@ -528,6 +688,10 @@ export const useEnvStore = defineStore("env", () => {
     lastDiagnose,
     repairing,
     currentRepairAction,
+    // v3.7 state
+    transformersVersions,
+    switchingTransformers,
+    restoringTransformers,
     // getters
     isLoaded,
     torchInstalled,
@@ -551,6 +715,13 @@ export const useEnvStore = defineStore("env", () => {
     // v1.8 / F36-Phase2 actions
     diagnose,
     repair,
+    // v3.10 actions
+    checkTorchConsistency,
+    repairConsistent,
+    // v3.7 actions
+    loadTransformersVersions,
+    switchTransformers,
+    restoreTransformersDefault,
     // v3.0 actions (F25)
     detectGpus,
     recommendTorch,

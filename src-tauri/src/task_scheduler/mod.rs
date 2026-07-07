@@ -136,6 +136,8 @@ impl TaskSchedulerService {
         let priority = def.priority.unwrap_or_else(|| def.kind.default_priority());
         let kind = def.kind;
         let name = def.name.clone();
+        // ✅ P2-1：从 TaskDef 读取 parent_id（submit_child 自动注入）
+        let parent_id = def.parent_id.clone();
 
         // 2. 检查排队上限
         {
@@ -147,12 +149,13 @@ impl TaskSchedulerService {
             *q += 1;
         }
 
-        // 3. 创建句柄 + token
+        // 3. 创建句柄 + token（✅ P2-1 传入 parent_id）
         let (handle, cancel_token) = TaskHandle::new(
             task_id.clone(),
             kind,
             name.clone(),
             priority,
+            parent_id.clone(),
         );
         self.inner.cancel_tokens.insert(task_id.clone(), cancel_token.clone());
 
@@ -170,7 +173,7 @@ impl TaskSchedulerService {
             &name,
             priority.as_str(),
         );
-        tracing::info!(?task_id, ?kind, ?priority, name = %name, "task submitted");
+        tracing::info!(?task_id, ?kind, ?priority, name = %name, ?parent_id, "task submitted");
 
         // 6. spawn 调度 task
         let app = self.app.clone();
@@ -178,6 +181,7 @@ impl TaskSchedulerService {
         let log_store = self.log_store.clone();
         let inner = self.inner.clone();
         let task_id_for_spawn = task_id.clone();
+        let parent_id_for_spawn = parent_id.clone();
 
         tokio::spawn(async move {
             // 6.1 acquire permit
@@ -193,7 +197,7 @@ impl TaskSchedulerService {
                         TaskStatus::Failed {
                             error: "semaphore closed".to_string(),
                         },
-                        None,
+                        Some("任务调度器信号量已关闭".to_string()),
                     ).await;
                     return;
                 }
@@ -215,7 +219,14 @@ impl TaskSchedulerService {
             }
 
             // 6.3-6.5 执行 action（catch_unwind + cancel 传播）
-            let outcome: FinalOutcome = run_action(app.clone(), task_id_for_spawn.clone(), def, cancel_token).await;
+            // ✅ P2-1：把 parent_id 传给 run_action，让子任务日志 parent_task_id 正确
+            let outcome: FinalOutcome = run_action(
+                app.clone(),
+                task_id_for_spawn.clone(),
+                def,
+                cancel_token,
+                parent_id_for_spawn,
+            ).await;
 
             // v3.5：保存 payload 到 TaskHandle.final_result（再调 mark_terminal 时 emit 给前端）
             // 只在 Ok 状态下保留 payload，Err 状态不携带 payload
@@ -227,6 +238,8 @@ impl TaskSchedulerService {
             }
 
             // 6.6 根据结果更新状态
+            // ✅ P0-1 修复：Failed / Panicked / Cancelled 都把 error 注入 summary，
+            // 否则前端 e.payload.summary 为 null，显示"未知错误"
             let (final_status, summary) = match &outcome {
                 Ok(result) => {
                     tracing::info!(?task_id_for_spawn, summary = ?result.summary, "task completed");
@@ -234,15 +247,21 @@ impl TaskSchedulerService {
                 }
                 Err(FinalErr::ActionFailed(msg)) => {
                     tracing::warn!(?task_id_for_spawn, error = %msg, "task failed");
-                    (TaskStatus::Failed { error: msg.clone() }, None)
+                    let summary = if msg.is_empty() {
+                        "操作失败（无详细信息）".to_string()
+                    } else {
+                        format!("操作失败: {}", msg)
+                    };
+                    (TaskStatus::Failed { error: msg.clone() }, Some(summary))
                 }
                 Err(FinalErr::Panicked(msg)) => {
                     tracing::error!(?task_id_for_spawn, error = %msg, "task panicked");
-                    (TaskStatus::Failed { error: msg.clone() }, None)
+                    let summary = format!("内部错误（任务 panic）: {}", msg);
+                    (TaskStatus::Failed { error: msg.clone() }, Some(summary))
                 }
                 Err(FinalErr::Cancelled) => {
                     tracing::info!(?task_id_for_spawn, "task cancelled by user");
-                    (TaskStatus::Cancelled, None)
+                    (TaskStatus::Cancelled, Some("操作已取消".to_string()))
                 }
             };
 
@@ -254,6 +273,33 @@ impl TaskSchedulerService {
         });
 
         Ok(task_id)
+    }
+
+    /// ✅ P2-1 新增：提交子任务（自动注入 parent_id）
+    ///
+    /// 业务用法：
+    /// ```ignore
+    /// let child_id = scheduler.submit_child(
+    ///     make_install_torch_task(...),
+    ///     parent_task_id,
+    /// ).await?;
+    /// ```
+    ///
+    /// 内部：在 TaskDef.parent_id 写入 parent_task_id 后调 `submit`。
+    /// 等价于 `submit` + 手动设 `def.parent_id`，但更安全（避免忘记设）。
+    pub async fn submit_child(
+        &self,
+        mut def: TaskDef,
+        parent_id: TaskId,
+    ) -> Result<TaskId, TaskError> {
+        if def.parent_id.is_some() {
+            tracing::warn!(
+                ?parent_id,
+                "submit_child 覆盖了 TaskDef 原有 parent_id（不应同时设置）"
+            );
+        }
+        def.parent_id = Some(parent_id);
+        self.submit(def).await
     }
 
     /// 取消任务：已完成/已取消的任务返回 Ok（幂等）
@@ -510,6 +556,7 @@ mod tests {
             TaskKind::Custom,
             "test".to_string(),
             TaskPriority::Normal,
+            None,
         );
         assert_eq!(handle.info.id, "t1");
         assert!(matches!(handle.info.status, TaskStatus::Queued));
@@ -534,6 +581,7 @@ mod tests {
                     TaskKind::Custom,
                     format!("task {}", i),
                     TaskPriority::Normal,
+                    None,
                 );
                 h.info.status = TaskStatus::Completed;
                 h.info.completed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(i as i64));

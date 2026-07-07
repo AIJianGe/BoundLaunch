@@ -64,6 +64,8 @@ export interface TaskCallbacks {
 /** 后端 task_log 事件 payload 格式 */
 interface TaskLogEventRaw {
   task_id: string;
+  /** ✅ P2-1 新增：父任务 ID（子任务日志有值，根任务日志为 undefined） */
+  parent_task_id?: string | null;
   source: string;
   text: string;
   ts_ms: number;
@@ -134,10 +136,19 @@ export function useTaskProgress() {
           isCompleted.value = true;
           progress.value = 100;
           callbacks.onComplete?.(e.payload.summary);
-        } else if (e.payload.status === "failed" || e.payload.status === "cancelled") {
+        } else if (e.payload.status === "failed") {
+          // ✅ P0-1 修复：后端 Failed 时 summary 现在保证非 null
+          // 但保留 ?? "操作失败" 兜底，防止老后端 / 测试 mock
           isFailed.value = true;
-          errorSummary.value = e.payload.summary;
-          callbacks.onError?.(e.payload.summary);
+          const summary = e.payload.summary ?? "操作失败（无详细信息）";
+          errorSummary.value = summary;
+          callbacks.onError?.(summary);
+        } else if (e.payload.status === "cancelled") {
+          // ✅ P0-1 修复：Cancelled 也有 summary（"操作已取消"）
+          isFailed.value = true;  // UI 复用失败态显示
+          const summary = e.payload.summary ?? "操作已取消";
+          errorSummary.value = summary;
+          callbacks.onError?.(summary);
         }
         // 终态后清理监听器（避免重复触发）
         cleanup();
@@ -147,11 +158,18 @@ export function useTaskProgress() {
     // v3.5：实时日志事件（一次 emit 一批 LogEvent）
     unlisteners.push(
       await listen<TaskLogEventRaw[]>("task_log", (e) => {
-        if (!currentTaskId.value) return;
+        const selfId = currentTaskId.value;
+        if (!selfId) return;
         // 后端 emit 整批（Vec<LogEvent>），按 task_id 过滤
         const events = Array.isArray(e.payload) ? e.payload : [];
         for (const ev of events) {
-          if (ev.task_id !== currentTaskId.value) continue;
+          // ✅ P0-3 / P2-1 修复：接受自己 + 父是自己的子任务日志
+          // - 自己的日志：ev.task_id === selfId
+          // - 子任务的日志：ev.parent_task_id === selfId（子任务的 task_id 不是 selfId）
+          // - 兼容旧后端：未传 parent_task_id 时退化为只接受自己的（行为不变）
+          const isSelf = ev.task_id === selfId;
+          const isMyChild = ev.parent_task_id === selfId;
+          if (!isSelf && !isMyChild) continue;
           const line: TaskLogLine = {
             source: ev.source,
             text: ev.text,
@@ -223,8 +241,10 @@ export function useTaskProgress() {
     }
   }
 
-  /** 重置状态（不清理监听器，用于复用 composable） */
+  /** 重置状态（清理监听器 + 状态清空） */
   function reset() {
+    // ✅ P0-4 修复：先清理监听器，避免切菜单/重置时 onComplete 误触发
+    cleanup();
     currentTaskId.value = null;
     progress.value = 0;
     message.value = null;

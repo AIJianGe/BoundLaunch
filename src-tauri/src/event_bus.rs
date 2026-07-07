@@ -89,6 +89,13 @@ pub enum SystemEvent {
     /// - 前端通过 Tauri 2 Event `env_inspect_updated` 接收（不走 EventBus.subscribe）
     EnvInspectUpdated,
 
+    /// v3.7 新增：transformers 版本索引已刷新
+    ///
+    /// 由 `TransformersVersionIndex` 后台 `spawn_refresh` 完成后广播：
+    /// - 通知后端模块联动（如 ComfyUI 版本切换后触发刷新）
+    /// - 前端通过 Tauri 2 Event `transformers_versions_updated` 接收（不走 EventBus.subscribe）
+    TransformersVersionsUpdated,
+
     /// launcher 即将退出（F24 退出流程）
     ///
     /// 由 ShutdownCoordinator 在事务开始时广播：
@@ -119,6 +126,7 @@ impl SystemEvent {
             Self::RequirementsMismatch { .. } => "RequirementsMismatch",
             Self::RequirementsInstalled => "RequirementsInstalled",
             Self::EnvInspectUpdated => "EnvInspectUpdated",
+            Self::TransformersVersionsUpdated => "TransformersVersionsUpdated",
             Self::AppExiting { .. } => "AppExiting",
             Self::AppExited => "AppExited",
         }
