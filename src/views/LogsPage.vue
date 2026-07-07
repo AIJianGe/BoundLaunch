@@ -47,11 +47,14 @@ import { useTaskStore } from "@/stores/task";
 import { logQuery, logClear } from "@/api/log";
 import { listen, type UnlistenFn } from "@/api";
 import { useToast } from "@/composables/useToast";
+import { useErrorLog } from "@/composables/useErrorLog";
 import type { LogEntry, LogLevel, TaskProgressEvent, TaskTerminalEvent } from "@/api/types";
 
 const processStore = useProcessStore();
 const taskStore = useTaskStore();
 const toast = useToast();
+// v3.10：业务错误 store（ErrorPanel + 菜单红点）
+const errorLog = useErrorLog();
 
 const logContainerRef = ref<HTMLElement | null>(null);
 const autoScroll = ref(true);
@@ -217,6 +220,19 @@ function formatElapsed(sec: number): string {
   return m > 0 ? `${m}分${s}秒` : `${s}秒`;
 }
 
+/** v3.10：格式化错误时间（ISO 8601 → "HH:MM:SS"） */
+function formatErrorTime(iso: string): string {
+  return iso.split("T")[1]?.split(".")[0] || iso;
+}
+
+/** v3.10：刷新 ErrorPanel 历史（重新拉 LogStore 一次） */
+async function onRefreshErrors() {
+  // 重新初始化：把 initialized 重置，调 loadHistory
+  errorLog.$patch({ initialized: false });
+  await errorLog.loadHistory();
+  toast.success("已刷新最近错误");
+}
+
 /** task_queued 事件 payload 的最小子集（实际有更多字段） */
 interface TaskInfoLite {
   id: string;
@@ -226,6 +242,9 @@ interface TaskInfoLite {
 onMounted(async () => {
   // 订阅 task_progress / task_completed 事件
   await setupStartTaskListeners();
+
+  // v3.10：用户进入日志页 → 清零未读（菜单红点消失）
+  errorLog.markAllRead();
 
   // 加载历史日志
   try {
@@ -337,6 +356,54 @@ function formatCrashReason(reason: string): string {
       </NSpace>
     </NCard>
 
+    <!-- v3.10：业务错误面板（顶部置顶，不会消失，永远可回溯） -->
+    <NCard v-if="errorLog.hasErrors" class="error-panel" :bordered="true" size="small">
+      <template #header>
+        <div class="error-panel-header">
+          <span class="error-panel-title">
+            ⚠ 最近错误（{{ errorLog.recentErrors.length }}）
+          </span>
+          <NTag size="small" type="error">置顶</NTag>
+        </div>
+      </template>
+      <NSpace vertical size="small">
+        <div
+          v-for="(err, idx) in errorLog.displayErrors"
+          :key="err.ts + idx"
+          class="error-item"
+        >
+          <div class="error-item-header">
+            <NTag size="small" :type="err.level === 'error' ? 'error' : 'warning'">
+              {{ err.level.toUpperCase() }}
+            </NTag>
+            <span class="error-item-time">{{ formatErrorTime(err.ts) }}</span>
+            <span class="error-item-source">[{{ err.source }}]</span>
+          </div>
+          <div class="error-item-message">{{ err.message }}</div>
+          <details v-if="err.detail" class="error-item-detail">
+            <summary>展开详情</summary>
+            <pre>{{ err.detail }}</pre>
+          </details>
+        </div>
+        <div v-if="errorLog.recentErrors.length > 10" class="error-panel-hint">
+          仅显示前 10 条，完整历史见下方日志流（已持久化到 LogStore）
+        </div>
+        <NSpace size="small">
+          <NButton size="tiny" @click="onRefreshErrors">刷新历史</NButton>
+          <NPopconfirm
+            :on-positive-click="errorLog.clearDisplayed"
+            positive-text="确认清空"
+            negative-text="取消"
+          >
+            <template #trigger>
+              <NButton size="tiny" type="warning" ghost>清空显示</NButton>
+            </template>
+            仅清空面板显示，LogStore 数据不动
+          </NPopconfirm>
+        </NSpace>
+      </NSpace>
+    </NCard>
+
     <NCard class="toolbar" :bordered="true" size="small">
       <div class="toolbar-row">
         <NSelect
@@ -440,6 +507,82 @@ function formatCrashReason(reason: string): string {
   padding: 16px;
   max-width: 1400px;
   margin: 0 auto;
+}
+
+/* v3.10：错误面板（顶部置顶） */
+.error-panel {
+  margin-bottom: 12px;
+  border-color: #d03050;
+  background: linear-gradient(135deg, #fef0f0 0%, #ffffff 100%);
+}
+
+.error-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.error-panel-title {
+  font-weight: 600;
+  color: #d03050;
+}
+
+.error-item {
+  padding: 8px 12px;
+  border-left: 3px solid #d03050;
+  background: #fafafa;
+  border-radius: 4px;
+}
+
+.error-item-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #888;
+}
+
+.error-item-time {
+  font-family: monospace;
+}
+
+.error-item-source {
+  font-family: monospace;
+  color: #555;
+}
+
+.error-item-message {
+  margin-top: 4px;
+  font-size: 14px;
+  color: #333;
+}
+
+.error-item-detail {
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+.error-item-detail summary {
+  cursor: pointer;
+  color: #888;
+  user-select: none;
+}
+
+.error-item-detail pre {
+  margin-top: 4px;
+  padding: 8px;
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+}
+
+.error-panel-hint {
+  font-size: 12px;
+  color: #888;
+  font-style: italic;
 }
 
 .start-progress {

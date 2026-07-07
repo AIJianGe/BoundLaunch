@@ -55,6 +55,7 @@ import {
 import { useCoreStore } from "@/stores/core";
 import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
+import { useConfigStore } from "@/stores/config";
 import { useToast } from "@/composables/useToast";
 import { useSwitchVersion } from "@/composables/useSwitchVersion";
 import {
@@ -74,6 +75,7 @@ import RepairWizard from "@/components/settings/RepairWizard.vue";
 const coreStore = useCoreStore();
 const processStore = useProcessStore();
 const envStore = useEnvStore();
+const configStore = useConfigStore();
 const toast = useToast();
 
 // ========== v3.5：版本切换 composable（实时进度 + 实时日志 + 取消） ==========
@@ -108,6 +110,11 @@ const stableTags = computed(() => coreStore.stableTags);
 const prereleaseTags = computed(() => coreStore.prereleaseTags);
 const hasLocalChanges = computed(() => coreStore.hasLocalChanges);
 const hasUpdates = computed(() => coreStore.hasUpdates);
+
+/** v3.10：引导安装默认版本（Config.paths.installation_default_version） */
+const defaultVersion = computed(
+  () => configStore.config?.paths?.installation_default_version ?? null,
+);
 
 const isRunning = computed(() => processStore.isAlive);
 
@@ -709,6 +716,7 @@ async function onForceClean() {
               :current-version="currentVersion"
               :loading="loading"
               :disabled="switchDisabled"
+              :default-version="defaultVersion"
               @switch="onSwitchClick"
             />
           </NTabPane>
@@ -728,6 +736,7 @@ async function onForceClean() {
               :current-version="currentVersion"
               :loading="loading"
               :disabled="switchDisabled"
+              :default-version="defaultVersion"
               @switch="onSwitchClick"
             />
           </NTabPane>

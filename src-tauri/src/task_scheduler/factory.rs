@@ -93,9 +93,16 @@ pub fn make_create_venv_task(
 /// 进度细分：
 /// - 10%：开始
 /// - 30%：下载 torch wheel
-/// - 70%：安装到 venv
+/// - 60%：torch 主包安装完成
+/// - 75%：torchvision + torchaudio 安装完成
 /// - 90%：校验 import torch
 /// - 100%：完成
+///
+/// **v3.11 增强**：实时日志转发
+/// - 创建 `LineCollector` 传给 `install_torch`，uv 子进程的 stdout/stderr
+///   每一行都通过 `ProgressSender::send_log` 推到前端
+/// - 前端 `useTaskProgress` 可看到 `uv:torch` / `uv:torch-vision` 的逐行输出
+///   （如 "Resolved X packages" / "Downloaded torch-2.4.0+cu128"）
 pub fn make_install_torch_task(
     python_env: Arc<PythonEnvService>,
     venv_path: PathBuf,
@@ -125,11 +132,45 @@ pub fn make_install_torch_task(
                     progress.send_percent(30);
                     progress.send_message("下载 torch wheel（可能需要 1-5 分钟）...");
 
+                    // v3.11：实时日志转发
+                    // - LineCollector 接收 uv 子进程逐行输出
+                    // - 后台 task 把每行通过 ProgressSender.send_log 推到前端
+                    let (collector, mut log_rx) = LineCollector::new(500);
+                    let collector_for_install = collector.clone();
+                    let progress_for_log = progress.clone();
+                    let log_forwarder = tauri::async_runtime::spawn(async move {
+                        while let Some(line) = log_rx.recv().await {
+                            progress_for_log.send_log(line.source, line.text);
+                        }
+                    });
+
                     // 主流程：install_torch（内部会 emit TorchInstalled 事件）
-                    python_env
-                        .install_torch(&venv_path, cuda_version, &cancel, None)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    // 传 line_collector，install_torch 会把 uv 输出推到 collector
+                    let result = python_env
+                        .install_torch(&venv_path, cuda_version, &cancel, Some(&collector_for_install))
+                        .await;
+
+                    // 关闭 log forwarder（drop collector 后 rx 会自然关闭）
+                    drop(collector_for_install);
+                    drop(collector);
+                    let _ = log_forwarder.await;
+
+                    if let Err(e) = result {
+                        return Err(e.to_string());
+                    }
+
+                    // v3.11：torch 主包已装，更新进度（中间进度点）
+                    progress.send_percent(60);
+                    progress.send_message("torch 主包安装完成");
+
+                    if cancel.is_cancelled() {
+                        return Err("任务已取消".to_string());
+                    }
+
+                    // 注：install_torch 内部已经完成 torchvision/torchaudio 安装 + 校验
+                    // 这里只是给前端一个更直观的进度跃迁
+                    progress.send_percent(75);
+                    progress.send_message("torchvision + torchaudio 安装完成");
 
                     progress.send_percent(90);
                     progress.send_message("校验 torch import...");
@@ -260,12 +301,19 @@ pub fn make_switch_torch_variant_task(
 ///
 /// 进度细分：
 /// - 10%：开始
-/// - 50%：uv pip install -r requirements.txt
+/// - 30%：解析依赖
+/// - 50%：下载
+/// - 80%：安装
 /// - 90%：校验
 /// - 100%：完成
 ///
 /// v3.10 新增 `pytorch_index` 参数：传 Some(url) 时 uv 解析时同时查 PyPI 和 pytorch.org，
 /// 防止 transformers 5.x 等依赖触发 torch 覆盖成 +cpu。
+///
+/// **v3.11 增强**：实时日志转发
+/// - 创建 `LineCollector` 传给 `install_requirements`，uv 子进程输出
+///   每一行通过 `ProgressSender::send_log` 推到前端
+/// - 前端可看到 `uv:requirements` 的逐行反馈
 pub fn make_install_requirements_task(
     python_env: Arc<PythonEnvService>,
     venv_path: PathBuf,
@@ -291,21 +339,46 @@ pub fn make_install_requirements_task(
                         return Err("任务已取消".to_string());
                     }
 
+                    progress.send_percent(30);
+                    progress.send_message("解析依赖列表...");
+
+                    // v3.11：实时日志转发
+                    let (collector, mut log_rx) = LineCollector::new(500);
+                    let collector_for_install = collector.clone();
+                    let progress_for_log = progress.clone();
+                    let log_forwarder = tauri::async_runtime::spawn(async move {
+                        while let Some(line) = log_rx.recv().await {
+                            progress_for_log.send_log(line.source, line.text);
+                        }
+                    });
+
                     progress.send_percent(50);
                     progress.send_message("uv pip install -r requirements.txt...");
 
                     // 主流程：install_requirements（内部会 emit RequirementsInstalled 事件）
                     // v3.10：传 pytorch_index，防止 transformers 5.x 等依赖触发 torch 覆盖
-                    python_env
+                    // v3.11：传 line_collector，实时推送 uv 输出
+                    let result = python_env
                         .install_requirements(
                             &venv_path,
                             &req_file,
                             pytorch_index.as_deref(),
                             &cancel,
-                            None,
+                            Some(&collector_for_install),
                         )
-                        .await
-                        .map_err(|e| e.to_string())?;
+                        .await;
+
+                    // 关闭 log forwarder
+                    drop(collector_for_install);
+                    drop(collector);
+                    let _ = log_forwarder.await;
+
+                    if let Err(e) = result {
+                        return Err(e.to_string());
+                    }
+
+                    progress.send_percent(80);
+                    progress.send_message("依赖安装完成");
 
                     progress.send_percent(90);
                     progress.send_message("校验依赖安装...");

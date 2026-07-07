@@ -46,6 +46,18 @@ export interface PathsConfig {
    * 后端通过 `core_ensure_models_link` 命令建立 / 维护链接。
    */
   models_path?: string | null;
+  /**
+   * v3.10 新增：引导安装默认版本
+   *
+   * - `null` / `undefined`：使用自动规则（patch=0/1 + 跳过首次大版本 + SemVer 最大）
+   * - 字符串：用户显式指定（如 "v0.3.10"），跳过自动规则直接 checkout
+   *
+   * 三态语义（与 comfyui_repo_url 一致）：
+   * - 字段未传：跳过（不修改）
+   * - `""`：清空（恢复走自动规则）
+   * - 非空：设置
+   */
+  installation_default_version?: string | null;
 }
 
 export interface LaunchConfig {
@@ -661,6 +673,33 @@ export interface TaskHistoryRecord {
   completed_at: string | null;
   exit_code: number | null;
   error: string | null;
+}
+
+// ============================================================================
+// v3.10：业务错误通道（对应 src-tauri/src/commands/log_store.rs::log_append）
+// ============================================================================
+
+/** `log_append` 命令入参（前端 useToast 自动 invoke） */
+export interface LogAppendPayload {
+  /** 日志级别：warn / error / info（其他降级为 info） */
+  level: LogLevel;
+  /** 来源标识（前端传入，如 "useEnvInstaller" / "PathsPanel"） */
+  source: string;
+  /** 主消息（toast 的 content） */
+  message: string;
+  /** 详情（错误对象 message / stack 等，可选） */
+  detail: string | null;
+}
+
+/** `business_log` 事件 payload（后端 log_append emit 出来） */
+export interface BusinessLogEvent {
+  level: LogLevel;
+  /** 已加 `ui:` 前缀的来源 */
+  source: string;
+  message: string;
+  detail: string | null;
+  /** ISO 8601 时间戳 */
+  ts: string;
 }
 
 // ============================================================================

@@ -106,6 +106,63 @@ impl LogStoreService {
         TaskRepository { pool: &self.pool }
     }
 
+    /// v3.10 业务错误快捷写入（覆盖 toast.error / toast.warn 路径）
+    ///
+    /// **目的**：让前端 `useToast` 自动调用的 20+ 个 toast.error / toast.warn
+    /// 能 0 业务代码改动地入 LogStore，避免"弹窗消失=日志丢失"。
+    ///
+    /// **写策略**：
+    /// - 异步 spawn 写（不阻塞调用方）
+    /// - 写失败仅 warn（不污染主流程）
+    /// - 自动加 `ui:` 前缀，与 ComfyUI / 任务来源区分
+    ///
+    /// **入参约束**：
+    /// - `level` 必须是 warn / error（其他级别会降级为 info）
+    /// - `source` 长度 ≤ 64（过长会被截断）
+    /// - `message` 长度 ≤ 4096（过长会被截断 + `…` 省略号）
+    pub fn log_business_error(
+        &self,
+        level: crate::log_store::repository::LogLevel,
+        source: &str,
+        message: &str,
+    ) {
+        use crate::log_store::repository::LogEntry;
+
+        // 长度保护：避免前端错误地把整个 Exception 链塞进来
+        let source = if source.len() > 64 {
+            format!("{}…", &source[..63])
+        } else {
+            source.to_string()
+        };
+        let message = if message.len() > 4096 {
+            format!("{}…", &message[..4095])
+        } else {
+            message.to_string()
+        };
+
+        // 降级：非 warn/error 一律记为 info
+        let level = match level {
+            crate::log_store::repository::LogLevel::Warn
+            | crate::log_store::repository::LogLevel::Error => level,
+            _ => crate::log_store::repository::LogLevel::Info,
+        };
+
+        let entry = LogEntry {
+            timestamp: chrono::Utc::now(),
+            level,
+            source: format!("ui:{}", source),
+            message,
+        };
+
+        // 异步写：spawn 出来不阻塞调用方
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = (LogRepository { pool: &pool }).append(entry).await {
+                tracing::warn!(error = %e, "log_business_error persist failed");
+            }
+        });
+    }
+
     /// 优雅停止（取消后台清理）
     pub fn shutdown(&self) {
         self.retention_cancel.cancel();

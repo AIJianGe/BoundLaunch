@@ -11,7 +11,14 @@
  */
 
 import { invoke } from "./index";
-import type { LogEntry, LogQueryOptions, TaskHistoryRecord, LogLevel } from "./types";
+import type {
+  LogEntry,
+  LogQueryOptions,
+  TaskHistoryRecord,
+  LogLevel,
+  LogAppendPayload,
+  BusinessLogEvent,
+} from "./types";
 
 /**
  * 查询日志（支持多维过滤）
@@ -49,4 +56,42 @@ export function taskHistoryList(limit = 50): Promise<TaskHistoryRecord[]> {
   return invoke<TaskHistoryRecord[]>("task_history_list", { limit });
 }
 
-export type { LogEntry, LogQueryOptions, TaskHistoryRecord, LogLevel };
+// ============================================================================
+// v3.10：业务错误快捷通道
+// ============================================================================
+
+/**
+ * 写入一条业务日志（v3.10 新增）
+ *
+ * **核心价值**：让 toast.error / toast.warn 弹窗**自动**有日志备份。
+ * `useToast` 内部自动调用，业务代码 0 改动即可覆盖 20+ 个错误源。
+ *
+ * **不阻塞**：后端 `log_append` 命令内部 spawn 写库 + emit 事件，
+ * 调用立即返回，失败也不抛错（toast 显示不受影响）。
+ *
+ * **副作用**：
+ * - 写 LogStore（`logs` 表）
+ * - emit `business_log` 事件给前端（ErrorPanel 实时刷新 + 菜单红点 +1）
+ *
+ * @param payload 日志入参
+ *
+ * @example
+ * ```ts
+ * // 在 useToast.error / warn 内部自动调用，业务代码无需关心
+ * logAppend({
+ *   level: "error",
+ *   source: "useEnvInstaller",
+ *   message: "环境补装失败",
+ *   detail: "torch 安装超时，请检查网络",
+ * });
+ * ```
+ */
+export function logAppend(payload: LogAppendPayload): Promise<void> {
+  // log_append 失败不抛错（catch 后仅 warn），避免污染调用方
+  return invoke<void>("log_append", { payload }).catch((e) => {
+    // eslint-disable-next-line no-console
+    console.warn("[logAppend] failed:", e);
+  });
+}
+
+export type { LogEntry, LogQueryOptions, TaskHistoryRecord, LogLevel, BusinessLogEvent };

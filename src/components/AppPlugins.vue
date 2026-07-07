@@ -33,12 +33,16 @@ import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
 import { useTaskStore } from "@/stores/task";
 import { useCoreStore } from "@/stores/core";
+import { useErrorLog } from "@/composables/useErrorLog";
 
 const configStore = useConfigStore();
 const processStore = useProcessStore();
 const envStore = useEnvStore();
 const taskStore = useTaskStore();
 const coreStore = useCoreStore();
+
+// v3.10：全局错误日志 store（ErrorPanel + 菜单红点）
+const errorLog = useErrorLog();
 
 onMounted(async () => {
   // 并行订阅所有事件 + 加载初始数据
@@ -48,6 +52,9 @@ onMounted(async () => {
     envStore.subscribe(),
     taskStore.subscribe(),
     coreStore.subscribe(),
+    // v3.10：订阅后端 business_log 事件 + 拉取历史错误
+    errorLog.subscribe(),
+    errorLog.loadHistory(),
   ]);
 
   // 加载初始 Config（其他 store 由事件驱动或页面手动加载）
@@ -64,6 +71,8 @@ onUnmounted(() => {
   envStore.unsubscribe();
   taskStore.unsubscribe();
   coreStore.unsubscribe();
+  // v3.10：取消 business_log 订阅
+  errorLog.unsubscribe();
   crashRecovery.cleanup();
   shortcuts.cleanup();
   tray.cleanup();

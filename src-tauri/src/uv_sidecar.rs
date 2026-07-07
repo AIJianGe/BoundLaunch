@@ -11,7 +11,8 @@
 //! 2. **启动时**：
 //!    - 通过 `app.path().resource_dir()` 拿 Tauri 资源目录
 //!    - 在资源目录找 `uv-<host-triple>[.exe]`
-//!    - 复制到 `%APPDATA%/boundlaunch/uv/uv.exe`（首次或源文件变化时）
+//!    - 复制到 `<app_data_dir>/uv/uv.exe`（首次或源文件变化时）
+//!      - v1.8 / F38：跟随 portable 模式（dev → 项目根 data/，prod → exe 旁 data/）
 //!    - Unix 上 `chmod +x`
 //!
 //! 3. **运行时**：`PythonEnvService` 用绝对路径调用 uv
@@ -55,8 +56,10 @@ fn bundled_binary_name() -> &'static str {
 
 /// launcher 用户数据目录中 sidecar 的存放位置
 ///
-/// Windows: %APPDATA%/boundlaunch/uv/uv.exe
-/// Unix:    ~/.local/share/boundlaunch/uv/uv
+/// v1.8 / F38：跟随 portable 模式
+/// - dev 模式：`<project_root>/data/uv/uv.exe`
+/// - prod 模式：`<exe_dir>/data/uv/uv.exe`
+/// - legacy fallback：`<%APPDATA%>/boundlaunch/uv/uv.exe`（1.0 前老用户）
 pub fn deployed_uv_path() -> PathBuf {
     paths::app_data_dir()
         .join("uv")

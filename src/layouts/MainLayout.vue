@@ -39,12 +39,14 @@ import {
   NLayoutContent,
   NMenu,
   NScrollbar,
+  NBadge,
   type MenuOption,
 } from "naive-ui";
 import { computed, h, type Component } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import AppHeader from "@/components/AppHeader.vue";
 import SafeIcon from "@/components/SafeIcon.vue";
+import { useErrorLog } from "@/composables/useErrorLog";
 import {
   Rocket,
   RefreshCw,
@@ -57,6 +59,9 @@ import {
 
 const route = useRoute();
 const router = useRouter();
+
+// v3.10：业务错误 store（菜单"日志"红点）
+const errorLog = useErrorLog();
 
 interface NavItem {
   key: string;
@@ -80,12 +85,36 @@ const menus: readonly NavItem[] = [
  *
  * - icon: render 函数 → NMenu 在 collapsed 时只显示 icon（自动隐藏 label）
  * - label: 普通字符串 → NMenu 内部处理显隐
+ *
+ * v3.10：**日志菜单**图标加红点（未读错误 > 0 时显示），
+ * 红点数据来自 `useErrorLog().unreadCount`。
  */
 const menuOptions = computed<MenuOption[]>(() =>
   menus.map((m) => ({
     key: m.key,
     label: m.label,
-    icon: () => h(SafeIcon, { component: m.icon, size: 20, class: "nav-icon" }),
+    icon: () => {
+      // v3.10：日志菜单套 NBadge 显示红点
+      if (m.key === "logs") {
+        return h(
+          "div",
+          { class: "nav-icon-wrapper", style: "position: relative; display: inline-flex;" },
+          [
+            h(SafeIcon, { component: m.icon, size: 20, class: "nav-icon" }),
+            errorLog.unreadCount > 0
+              ? h(NBadge, {
+                  value: errorLog.unreadCount,
+                  max: 99,
+                  color: "#d03050",
+                  class: "nav-error-badge",
+                })
+              : null,
+          ],
+        );
+      }
+      // 其他菜单：原样
+      return h(SafeIcon, { component: m.icon, size: 20, class: "nav-icon" });
+    },
   })),
 );
 
@@ -146,5 +175,13 @@ function onMenuSelect(key: string) {
   color: inherit;
   /* 兜底：万一 currentColor 在 WebView2 解析失败，至少有字面值 */
   stroke: #333;
+}
+
+/* v3.10：日志菜单红点定位（绝对定位在图标右上角） */
+.app-sider :deep(.nav-icon-wrapper .nav-error-badge) {
+  position: absolute;
+  top: -4px;
+  right: -8px;
+  pointer-events: none;
 }
 </style>

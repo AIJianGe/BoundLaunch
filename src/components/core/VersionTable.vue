@@ -38,11 +38,18 @@ const props = withDefaults(
     loading?: boolean;
     /** 禁用切换按钮（如 ComfyUI 运行中 / 切换中） */
     disabled?: boolean;
+    /**
+     * v3.10：引导安装默认版本（用于 NBadge 标识"自动装到的版本"）
+     * - `null`：未设置（走自动规则，标识由父组件决定是否展示）
+     * - 非空字符串：用户锁定，显示"默认安装"徽标
+     */
+    defaultVersion?: string | null;
   }>(),
   {
     currentVersion: null,
     loading: false,
     disabled: false,
+    defaultVersion: null,
   },
 );
 
@@ -72,10 +79,9 @@ function shortCommit(sha: string): string {
 
 /** 表格列定义（✅ P0-4 修复：computed 显式依赖 props.currentVersion） */
 const columns = computed<DataTableColumns<TagInfo>>(() => {
-  // 读取 props.currentVersion 到局部变量，让 Vue 追踪这个依赖
-  // 之前在 render 函数里直接读 props.currentVersion，computed 不一定能追踪到
-  // （Vue 3 多数情况能追踪到，但显式读一次最稳）
+  // 读取 props.currentVersion / props.defaultVersion 到局部变量，让 Vue 追踪依赖
   const cur = props.currentVersion;
+  const def = props.defaultVersion;
   return [
     {
       title: "版本号",
@@ -83,6 +89,8 @@ const columns = computed<DataTableColumns<TagInfo>>(() => {
       width: 200,
       render: (row) => {
         const isCurrent = row.name === cur;
+        // v3.10：是否为"默认安装"版本
+        const isDefault = !!def && row.name === def;
         return h(
           "div",
           { class: "version-cell" },
@@ -93,6 +101,13 @@ const columns = computed<DataTableColumns<TagInfo>>(() => {
                   NTag,
                   { size: "small", type: "success", class: "current-badge" },
                   () => "当前",
+                )
+              : null,
+            isDefault
+              ? h(
+                  NTag,
+                  { size: "small", type: "info", class: "default-badge" },
+                  () => "默认安装",
                 )
               : null,
           ],

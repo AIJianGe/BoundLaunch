@@ -55,6 +55,29 @@ pub fn run() {
 
     tracing::info!("BoundLaunch launcher starting up...");
 
+    // v3.10：启动期 VC++ Runtime 检测（解决"prod 打包后用户机器少 VCRUNTIME140.dll，弹英文错误后消失"问题）
+    //
+    // **背景**：之前 prod 模式启动时，如果用户机器没有安装 VC++ 2015-2022 Redistributable，
+    // Windows Loader 会直接弹 "由于找不到 VCRUNTIME140.dll，无法继续执行代码" 英文 MessageBox，
+    // 然后 launcher 进程直接退出。**用户什么都看不到、没 launcher 日志**。
+    //
+    // **v3.10 修复**：在 launcher 自己启动时，**主动** LoadLibraryW 检测关键 DLL。
+    // 检测到缺失时，**用我们自己的 MessageBoxW**（不是系统弹英文），给出：
+    // 1. 中文错误说明
+    // 2. VC++ Redistributable 下载链接
+    //
+    // **为什么不直接 spawn 一个 .NET 程序检测**：
+    // 任何 .NET 程序同样依赖 VCRuntime → 套娃。
+    // 唯一可靠的兜底是 launcher 自己主动检测。
+    #[cfg(windows)]
+    {
+        if let Err(missing) = check_critical_dlls() {
+            show_dll_missing_dialog(&missing);
+            // 直接退出，不进入 Tauri（launcher 自身就起不来）
+            std::process::exit(1);
+        }
+    }
+
     tauri::Builder::default()
     .plugin(tauri_plugin_shell::init())
     .plugin(tauri_plugin_dialog::init())
@@ -67,6 +90,28 @@ pub fn run() {
             let rt = tokio::runtime::Runtime::new()?;
             let app_state = rt.block_on(async {
                 let event_bus = std::sync::Arc::new(event_bus::EventBus::new());
+
+                // **v1.8 / F38**：Portable 数据迁移
+                // 1.0 前老用户的 config / venv / sqlite 还在 <%APPDATA%>/boundlaunch/，
+                // 启动时探测并复制到新的 portable 位置（dev → <project_root>/data/，
+                // prod → <exe_dir>/data/）。详见 paths::maybe_migrate_to_portable。
+                // 注意：必须在 Config 初始化之前，否则 Config 会读到老位置而不是新位置
+                match paths::maybe_migrate_to_portable().await {
+                    Ok(paths::MigrationOutcome::Migrated { from, to }) => {
+                        tracing::info!(
+                            from = %from.display(),
+                            to = %to.display(),
+                            "F38: legacy data migrated to portable location"
+                        );
+                    }
+                    Ok(paths::MigrationOutcome::Noop) => {
+                        tracing::debug!("F38: no portable migration needed");
+                    }
+                    Err(e) => {
+                        // 迁移失败不阻塞启动，只记录警告（用户可能手动处理）
+                        tracing::warn!(error = %e, "F38: portable migration failed");
+                    }
+                }
 
                 // Config 初始化
                 let config_path = paths::config_path();
@@ -205,9 +250,10 @@ pub fn run() {
                 ));
 
                 // v3.7：transformers 版本索引（PyPI 拉取 + 三层缓存）
-                // 缓存文件位于 app_data_dir/transformers_versions.json
+                // 缓存文件位于 <app_data_dir>/transformers_versions.json
+                // v1.8 / F38：跟随 portable 模式
                 // 注：此处仅构造，spawn_refresh 在 manage 之后调用（避免 manage 前 spawn 访问 State 失败）
-                let transformers_cache_file = paths::app_data_dir().join("transformers_versions.json");
+                let transformers_cache_file = paths::transformers_cache_path();
                 let transformers_index = std::sync::Arc::new(TransformersVersionIndex::new(
                     transformers_cache_file,
                     (*event_bus).clone(),
@@ -295,6 +341,7 @@ pub fn run() {
             // Config
             commands::config::config_get,
             commands::config::config_launcher_working_dir,
+            commands::config::config_data_location,
             commands::config::config_update,
             commands::config::config_reset,
             // LogStore
@@ -302,6 +349,8 @@ pub fn run() {
             commands::log_store::log_tail,
             commands::log_store::log_clear,
             commands::log_store::task_history_list,
+            // v3.10：业务错误快捷通道（覆盖 toast.error / toast.warn 路径）
+            commands::log_store::log_append,
             // EnvironmentInspector
             commands::env_inspector::env_inspect,
             // F32: env_probe_torch 已删除（死代码，前端无调用）
@@ -394,3 +443,89 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+// ============================================================================
+// v3.10 启动期 DLL 缺失检测（Windows only）
+// ============================================================================
+
+#[cfg(windows)]
+fn check_critical_dlls() -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::FreeLibrary;
+    use windows::Win32::System::LibraryLoader::LoadLibraryW;
+
+    /// 关键 DLL 清单（lib_imports.txt 的核心项）
+    ///
+    /// 顺序：必装（用户机器没装就 100% 跑不起来）→ 可选（部分缺失可降级）
+    const REQUIRED: &[&str] = &[
+        "VCRUNTIME140.dll",   // MSVC 2015-2022 运行时（核心！）
+        "VCRUNTIME140_1.dll", // MSVC 2019+ 追加
+        "ucrtbase.dll",       // Universal CRT
+    ];
+
+    let mut missing: Vec<&str> = Vec::new();
+
+    for name in REQUIRED {
+        // PCWSTR 需要以 \0 结尾的 UTF-16 字符串
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+
+        unsafe {
+            match LoadLibraryW(PCWSTR(wide.as_ptr())) {
+                Ok(handle) => {
+                    if !handle.is_invalid() {
+                        let _ = FreeLibrary(handle);
+                    } else {
+                        missing.push(name);
+                    }
+                }
+                Err(_) => missing.push(name),
+            }
+        }
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing.join(", "))
+    }
+}
+
+#[cfg(windows)]
+fn show_dll_missing_dialog(missing: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let text = format!(
+        "启动器缺少以下系统组件，无法运行：\n\n  {}\n\n\
+         这是 Microsoft Visual C++ 2015-2022 Redistributable 组件，\n\
+         Windows 默认不安装，需要手动下载安装。\n\n\
+         下载地址（任选其一）：\n\
+         • 官方下载：https://aka.ms/vs/17/release/vc_redist.x64.exe\n\
+         • 国内镜像：https://mirrors.tuna.tsinghua.edu.cn/microsoft/VC++2015-2022/vc_redist.x64.exe\n\n\
+         安装完成后请重新启动 BoundLaunch。",
+        missing
+    );
+
+    let wide_text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_caption: Vec<u16> = "BoundLaunch 启动失败"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(wide_text.as_ptr()),
+            PCWSTR(wide_caption.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+// 非 Windows 平台：直接返回 Ok（macOS / Linux 走系统自带的 libc）
+#[cfg(not(windows))]
+fn check_critical_dlls() -> Result<(), String> {
+    Ok(())
+}
+#[cfg(not(windows))]
+fn show_dll_missing_dialog(_missing: &str) {}

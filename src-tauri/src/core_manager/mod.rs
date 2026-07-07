@@ -445,25 +445,64 @@ impl CoreManagerService {
     ///
     /// 区别于 `update_latest_stable`：
     /// - `update_latest_stable`：选 SemVer 最大的稳定版（v0.27.5 也会被选）
-    /// - **本函数**：选"发布日期最后 + patch = 0 或 1"的稳定版
-    ///   （如 v0.29.0、v0.28.1），更适合 onboarding 首次安装。
+    /// - **本函数**：选"发布日期最后 + patch = 0 或 1 + 跳过首次大版本"的稳定版
+    ///   （如 v0.28.1、v0.29.0），更适合 onboarding 首次安装。
+    ///
+    /// **v3.10 增强**：用户可在 Config.paths.installation_default_version 显式
+    /// 指定版本（如 v0.3.10），优先级高于自动规则。指定的 tag 不存在时
+    /// 降级到自动规则 + warn 日志（不阻塞 onboarding）。
     ///
     /// 兜底：若过滤后无符合规则的 tag，回退到 `update_latest_stable` 行为。
     ///
-    /// 用例：`ensure_cloned`（首次启动）调用本函数，避免默认装到 v0.27.5。
+    /// 用例：`ensure_cloned`（首次启动）调用本函数，避免默认装到 v1.0.0 等
+    /// "首次大版本"。
     pub async fn update_latest_stable_for_installation(&self) -> Result<String, CoreError> {
         let tags = self.list_tags(true).await?;
+
+        // 1) 优先使用用户显式配置
+        let user_override = self
+            .config
+            .get()
+            .paths
+            .installation_default_version
+            .clone();
+        if let Some(target) = user_override {
+            if !target.is_empty() && tags.iter().any(|t| t.name == target) {
+                tracing::info!(
+                    tag = %target,
+                    "onboarding: using user-configured installation_default_version"
+                );
+                return self.checkout_to(&target).await;
+            } else {
+                tracing::warn!(
+                    tag = %target,
+                    "onboarding: user-configured installation_default_version not found in tags, \
+                     falling back to auto rule"
+                );
+            }
+        }
+
+        // 2) 自动规则
         let target = tags::latest_stable_for_installation(&tags).ok_or_else(|| {
             CoreError::GitError("no stable tag found for installation".to_string())
         })?;
 
-        let status = self.current_version().await?;
-        if status.current_version.as_deref() == Some(&target) {
-            return Ok(target);
-        }
+        self.checkout_to(&target).await
+    }
 
-        self.checkout(&target).await?;
-        Ok(target)
+    /// 把仓库 checkout 到指定 tag（v3.10 抽出，供 update_latest_stable 与
+    /// update_latest_stable_for_installation 复用）。
+    ///
+    /// 行为：
+    /// - 当前已是目标 tag → 直接返回（不触发事件总线）
+    /// - 否则 checkout → emit `CoreVersionSwitched`
+    async fn checkout_to(&self, target: &str) -> Result<String, CoreError> {
+        let status = self.current_version().await?;
+        if status.current_version.as_deref() == Some(target) {
+            return Ok(target.to_string());
+        }
+        self.checkout(target).await?;
+        Ok(target.to_string())
     }
 
     /// 检查工作区是否有未提交改动

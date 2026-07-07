@@ -53,6 +53,19 @@ pub struct PathsConfig {
     /// 切换仓库地址时由 `core_set_repo_url` 命令写入。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comfyui_repo_url: Option<String>,
+    /// 引导安装默认版本（v3.10 新增）
+    ///
+    /// - `None`：使用自动规则（`tags::latest_stable_for_installation`，
+    ///   即「patch = 0/1 + 跳过首次大版本 + SemVer 倒序最大」）
+    /// - `Some(tag)`：用户显式指定（如 "v0.3.10"），跳过自动规则直接 checkout
+    ///
+    /// 用途：用户希望默认装到特定版本（如某次 ComfyUI 大版本升级时
+    /// 想继续停留在 v0.x 线，主动锁定 v0.3.10）
+    ///
+    /// 校验：`update_latest_stable_for_installation` 中若 tag 不存在，
+    /// 降级到自动规则 + warn 日志（不阻塞 onboarding）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_default_version: Option<String>,
 }
 
 /// 启动配置
@@ -331,6 +344,7 @@ impl Default for Config {
                 python_version: "3.11".to_string(),
                 models_path: None,
                 comfyui_repo_url: None,
+                installation_default_version: None,
             },
             launch: LaunchConfig {
                 mode: LaunchMode::GpuHigh,
@@ -392,6 +406,11 @@ pub struct PathsConfigPatch {
     pub models_path: Option<PathBuf>,
     /// F31：ComfyUI 仓库 URL
     pub comfyui_repo_url: Option<String>,
+    /// v3.10：引导安装默认版本
+    /// - `None`：走自动规则
+    /// - `Some("")`：清空（恢复走自动规则）
+    /// - `Some(非空)`：用户显式指定
+    pub installation_default_version: Option<String>,
 }
 
 /// Launch section 的 patch
@@ -469,6 +488,14 @@ pub fn apply_paths_patch(cfg: &mut PathsConfig, patch: PathsConfigPatch) {
             cfg.comfyui_repo_url = None;
         } else {
             cfg.comfyui_repo_url = Some(v);
+        }
+    }
+    // v3.10：installation_default_version（与 comfyui_repo_url 同款三态语义）
+    if let Some(v) = patch.installation_default_version {
+        if v.is_empty() {
+            cfg.installation_default_version = None;
+        } else {
+            cfg.installation_default_version = Some(v);
         }
     }
 }

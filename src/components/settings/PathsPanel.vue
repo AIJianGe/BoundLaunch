@@ -31,6 +31,8 @@ import {
   NTooltip,
   NButton,
   NSpin,
+  NInput,
+  NTag,
 } from "naive-ui";
 import { useConfigStore } from "@/stores/config";
 import { useEnvStore } from "@/stores/env";
@@ -38,6 +40,8 @@ import { useCoreStore } from "@/stores/core";
 import { useToast } from "@/composables/useToast";
 import { useEnvInstaller } from "@/composables/useEnvInstaller";
 import { useConfirm } from "@/composables/useConfirm";
+import { coreListTagsClassified } from "@/api/core";
+import { latestStableForInstallation } from "@/composables/useTagRules";
 import FolderPicker from "@/components/FolderPicker.vue";
 import RepoUrlDialog from "@/components/settings/RepoUrlDialog.vue";
 import RepairWizard from "@/components/settings/RepairWizard.vue";
@@ -67,6 +71,16 @@ const localVenv = ref("");
 const localPython = ref("3.11");
 /** 自定义 models 路径（v3.1 / F26 决策 12，空字符串 = 用默认） */
 const localModelsPath = ref("");
+/** v3.10：引导安装默认版本（空字符串 = 走自动规则） */
+const localDefaultVersion = ref("");
+
+/**
+ * v3.10：自动计算的默认版本（用于"自动模式"展示）
+ *
+ * 来源：coreListTagsClassified → latestStableForInstallation
+ */
+const autoDefaultVersion = ref<string | null>(null);
+const autoDefaultLoading = ref(false);
 /**
  * v3.2：venv 路径是否刚切换（用于 NAlert 按钮文案上下文感知）
  *
@@ -85,6 +99,7 @@ watch(
       localVenv.value = cfg.paths.venv_path;
       localPython.value = cfg.paths.python_version;
       localModelsPath.value = cfg.paths.models_path ?? "";
+      localDefaultVersion.value = cfg.paths.installation_default_version ?? "";
       // 首次加载时初始化 lastSavedVenv
       if (!lastSavedVenv) {
         lastSavedVenv = cfg.paths.venv_path;
@@ -104,7 +119,10 @@ const venvEmpty = computed(() => !localVenv.value.trim());
 
 const hasError = computed(() => pathConflict.value || rootEmpty.value || venvEmpty.value);
 
-function debouncedUpdate(field: "root" | "venv" | "python" | "models", value: string) {
+function debouncedUpdate(
+  field: "root" | "venv" | "python" | "models" | "defaultVersion",
+  value: string,
+) {
   if (debounceTimers[field]) clearTimeout(debounceTimers[field]);
   debounceTimers[field] = setTimeout(async () => {
     try {
@@ -193,6 +211,40 @@ function debouncedUpdate(field: "root" | "venv" | "python" | "models", value: st
         } catch (e) {
           toast.error("建立 models 软链接失败", e);
         }
+      } else if (field === "defaultVersion") {
+        // v3.10：保存 installation_default_version
+        // 空字符串 = 清空（走自动规则）
+        const trimmed = value.trim();
+        if (trimmed) {
+          // 校验 tag 存在（避免用户打错）
+          try {
+            const classified = await coreListTagsClassified(false);
+            const all = [...classified.stable, ...classified.prerelease];
+            const exists = all.some((t) => t.name === trimmed);
+            if (!exists) {
+              toast.error(
+                `版本 ${trimmed} 不存在`,
+                "请检查拼写或留空使用自动规则",
+              );
+              // 回退到当前值
+              localDefaultVersion.value =
+                configStore.config?.paths.installation_default_version ?? "";
+              return;
+            }
+          } catch (e) {
+            console.warn("[PathsPanel] tag validation failed:", e);
+            // 校验失败不阻塞保存（后端会兜底）
+          }
+          await configStore.update({
+            paths: { installation_default_version: trimmed },
+          });
+          toast.success(`默认安装版本已锁定为 ${trimmed}`);
+        } else {
+          await configStore.update({
+            paths: { installation_default_version: "" },
+          });
+          toast.info("已切换为自动规则");
+        }
       }
     } catch (e) {
       toast.error("保存失败", e);
@@ -209,7 +261,28 @@ onMounted(async () => {
   } catch (e) {
     console.warn("[PathsPanel] initial env check failed:", e);
   }
+  // v3.10：加载自动计算的默认版本（用于 NTag 展示）
+  await loadAutoDefaultVersion();
 });
+
+/**
+ * v3.10：拉 tags 计算"自动模式"下的默认版本
+ *
+ * 用于 NTag 展示，让用户知道"留空时会装到哪个版本"。
+ * 失败不阻塞：留 null，UI 隐藏自动提示。
+ */
+async function loadAutoDefaultVersion() {
+  autoDefaultLoading.value = true;
+  try {
+    const classified = await coreListTagsClassified(false);
+    const all = [...classified.stable, ...classified.prerelease];
+    autoDefaultVersion.value = latestStableForInstallation(all);
+  } catch (e) {
+    console.warn("[PathsPanel] loadAutoDefaultVersion failed:", e);
+  } finally {
+    autoDefaultLoading.value = false;
+  }
+}
 
 /** 环境是否完全就绪（readiness.ready === true） */
 const envReady = computed(() => envStore.readiness?.ready ?? false);
@@ -467,6 +540,45 @@ const torchBroken = computed(
           clearable
           @update:model-value="(v) => debouncedUpdate('models', v)"
         />
+      </NFormItem>
+
+      <!-- v3.10：引导安装默认版本 -->
+      <NFormItem>
+        <template #label>
+          <span class="label-with-help">
+            引导安装默认版本
+            <NTooltip placement="top" trigger="hover">
+              <template #trigger>
+                <span class="help-icon" aria-label="引导安装默认版本说明">?</span>
+              </template>
+              <div class="help-content">
+                首次启动克隆 ComfyUI 后，自动 checkout 到的版本。<br /><br />
+                <strong>留空</strong>：走自动规则（patch=0/1 + 跳过首次大版本 + SemVer 最大）<br />
+                <strong>指定版本</strong>（如 v0.3.10）：跳过自动规则直接装到该版本<br /><br />
+                自动规则会自动跳过 v1.0.0 / v2.0.0 等首次大版本发布（可能引入破坏性变更）。<br />
+                当 ComfyUI 主版本升级时，可以先留空，等 v1.x 稳定后再锁定具体版本。
+              </div>
+            </NTooltip>
+          </span>
+        </template>
+        <NSpace size="small" align="center" style="width: 100%">
+          <NInput
+            v-model:value="localDefaultVersion"
+            placeholder="留空走自动规则"
+            clearable
+            style="max-width: 240px"
+            @update:value="(v) => debouncedUpdate('defaultVersion', v)"
+          />
+          <NTag v-if="!localDefaultVersion && autoDefaultVersion" type="info" size="small">
+            自动将安装: {{ autoDefaultVersion }}
+          </NTag>
+          <NTag v-else-if="!localDefaultVersion && autoDefaultLoading" size="small">
+            检测中...
+          </NTag>
+          <NTag v-else-if="localDefaultVersion" type="warning" size="small">
+            已锁定: {{ localDefaultVersion }}
+          </NTag>
+        </NSpace>
       </NFormItem>
     </NForm>
 

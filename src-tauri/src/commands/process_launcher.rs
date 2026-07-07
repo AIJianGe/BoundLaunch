@@ -248,6 +248,7 @@ mod tests {
                 python_version: "3.11".into(),
                 models_path: None,
                 comfyui_repo_url: None,
+                installation_default_version: None,
             },
             launch: LaunchConfig {
                 mode,

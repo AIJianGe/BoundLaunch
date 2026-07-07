@@ -210,10 +210,17 @@ impl ProcessLauncherService {
         let current = self.inner.state.read().clone();
         if current.is_alive() {
             tracing::warn!(?current, "start rejected, process already alive");
-            return match current {
-                ProcessStatus::Running { pid, .. } => Err(ProcessError::AlreadyRunning { pid }),
-                _ => Err(ProcessError::AlreadyRunning { pid: 0 }),
+            let err = match current {
+                ProcessStatus::Running { pid, .. } => ProcessError::AlreadyRunning { pid },
+                _ => ProcessError::AlreadyRunning { pid: 0 },
             };
+            // v3.10：启动失败入 ERROR 日志（让 ErrorPanel 实时看到）
+            self.inner.log_store.log_business_error(
+                crate::log_store::repository::LogLevel::Error,
+                "ProcessLauncher:start",
+                &format!("启动被拒：{}\n\n请先停止当前 ComfyUI 进程", err),
+            );
+            return Err(err);
         }
 
         // 4. transition_to_starting
@@ -245,6 +252,12 @@ impl ProcessLauncherService {
                     None,
                     format!("preconditions failed: {}", e),
                 );
+                // v3.10：环境校验失败入 ERROR 日志
+                self.inner.log_store.log_business_error(
+                    crate::log_store::repository::LogLevel::Error,
+                    "ProcessLauncher:preconditions",
+                    &format!("环境校验失败：{}\n\n请检查：\n• venv 是否完整（python 二进制 / torch）\n• ComfyUI main.py 是否存在\n• dirty 标记是否需要清理\n• PyTorch CUDA 是否与启动模式匹配", e),
+                );
                 return Err(e);
             }
         };
@@ -255,6 +268,12 @@ impl ProcessLauncherService {
         report(20, &format!("检查端口 {} 是否空闲...", port));
         if let Err(e) = check_port_available(&args.listen_host, port).await {
             *self.inner.state.write() = ProcessStatus::Stopped;
+            // v3.10：端口被占入 ERROR 日志
+            self.inner.log_store.log_business_error(
+                crate::log_store::repository::LogLevel::Error,
+                "ProcessLauncher:port",
+                &format!("端口 {} 被占用，请关闭占用进程后再试（{}）", port, e),
+            );
             return Err(e);
         }
         report(25, &format!("端口 {} 空闲", port));
@@ -271,7 +290,14 @@ impl ProcessLauncherService {
             .await
         {
             *self.inner.state.write() = ProcessStatus::Stopped;
-            return Err(ProcessError::Io(format!("ensure yaml failed: {}", e)));
+            let io_err = ProcessError::Io(format!("ensure yaml failed: {}", e));
+            // v3.10：yaml 生成失败入 ERROR 日志
+            self.inner.log_store.log_business_error(
+                crate::log_store::repository::LogLevel::Error,
+                "ProcessLauncher:yaml",
+                &format!("extra_model_paths.yaml 生成失败：{}\n\n请检查「模型路径」配置是否合法", e),
+            );
+            return Err(io_err);
         }
         report(40, "extra_model_paths.yaml 已生成");
 
@@ -290,6 +316,12 @@ impl ProcessLauncherService {
             Ok(c) => c,
             Err(e) => {
                 *self.inner.state.write() = ProcessStatus::Stopped;
+                // v3.10：spawn 失败入 ERROR 日志
+                self.inner.log_store.log_business_error(
+                    crate::log_store::repository::LogLevel::Error,
+                    "ProcessLauncher:spawn",
+                    &format!("ComfyUI 进程 spawn 失败：{}\n\n可能原因：\n• venv python 二进制损坏\n• 权限不足\n• 系统资源不足", e),
+                );
                 return Err(e);
             }
         };

@@ -25,6 +25,9 @@ use super::models::{TaskInfo, TaskKind, TaskStatus};
 /// 写入任务历史记录
 ///
 /// 失败时仅返回 Err，调用方决定是否 warn（设计上不阻塞终态返回）。
+///
+/// **v3.10 增强**：当任务是 Failed 状态时，**同时**写一条 ERROR 级日志到 LogStore，
+/// 这样 ErrorPanel 顶部 + LogStore 查询都能看到（不依赖 task_history 审计表的 stderr 字段）。
 pub(crate) async fn record(
     log_store: &LogStoreService,
     info: &TaskInfo,
@@ -37,7 +40,19 @@ pub(crate) async fn record(
         completed_at: info.completed_at,
         error: extract_error(&info.status),
     };
-    log_store.tasks().append(record).await
+    log_store.tasks().append(record).await?;
+
+    // v3.10：Failed 任务额外写一条 ERROR 日志（让 ErrorPanel 实时刷新）
+    if let TaskStatus::Failed { error } = &info.status {
+        let message = format!("任务失败: {} ({})", info.name, info.kind.as_str());
+        log_store.log_business_error(
+            crate::log_store::repository::LogLevel::Error,
+            &format!("task:{}", info.kind.as_str()),
+            &format!("{}\n\n{}", message, error),
+        );
+    }
+
+    Ok(())
 }
 
 /// 从状态中提取错误信息（仅 Failed 填充，其余为 None）

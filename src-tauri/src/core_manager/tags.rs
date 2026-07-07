@@ -103,20 +103,68 @@ pub fn latest_stable(tags: &[TagInfo]) -> Option<String> {
 /// 规则：
 /// 1. 必须是稳定版（`is_stable_tag` 通过）
 /// 2. 版本号的第三段（patch）必须是 `0` 或 `1`
-/// 3. 在满足条件中按 SemVer 倒序取最大
+/// 3. **v3.10 新增**：跳过"首次大版本发布"（如 v1.0.0、v2.0.0）
+///    - 原因：首次大版本可能引入破坏性变更，用户未确认前不应自动装上
+///    - 详见 `is_first_major_release`
+/// 4. 在满足条件中按 SemVer 倒序取最大
 ///
-/// 示例（假设 tags: v0.27.0 / v0.27.1 / v0.27.2 / v0.28.0 / v0.28.1 / v0.29.0）：
-/// - 过滤后剩: v0.27.0 / v0.27.1 / v0.28.0 / v0.28.1 / v0.29.0
-/// - SemVer 倒序最大: **v0.29.0**（最后一个 0 号主版本）
+/// 示例（假设 tags: v0.27.0 / v0.27.1 / v0.27.5 / v1.0.0）：
+/// - 第一轮过滤（稳定 + patch=0/1）剩：v0.27.0 / v0.27.1 / v1.0.0
+/// - 第二轮过滤（跳过首次大版本 v1.0.0）剩：v0.27.0 / v0.27.1
+/// - SemVer 倒序最大：**v0.27.1**
 ///
 /// 兜底：若过滤后无任何 tag，回退到 `latest_stable`（行为等同之前）
 pub fn latest_stable_for_installation(tags: &[TagInfo]) -> Option<String> {
     tags.iter()
         .filter(|t| t.is_stable)
         .filter(|t| is_patch_zero_or_one(&t.name))
+        .filter(|t| !is_first_major_release(&t.name, tags))
         .max_by(|a, b| crate::core_manager::semver::cmp_tag_desc(&a.name, &b.name))
         .map(|t| t.name.clone())
         .or_else(|| latest_stable(tags))
+}
+
+/// 判断 tag 是否为"首次大版本发布"（v3.10 新增）
+///
+/// 规则：
+/// - 必须是稳定版格式 vX.Y.Z
+/// - Y == 0 && Z == 0（即 X.0.0）
+/// - X 是 tag 列表中最大的主版本号
+///
+/// 命中示例：
+/// - tags = [v0.27.0, v0.27.1, v1.0.0] → v1.0.0 是首次大版本（max_major=1）
+/// - tags = [v0.27.0, v1.0.0, v1.0.1] → v1.0.0 仍是首次大版本
+///   （v1.x 已发布但首次仍跳过，避免把刚升级的 v1.0.0 当默认）
+/// - tags = [v0.27.0, v0.27.1] → 无首次大版本（max_major=0）
+pub fn is_first_major_release(name: &str, tags: &[TagInfo]) -> bool {
+    let parts: Vec<&str> = name.trim_start_matches('v').split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let major: u32 = match parts[0].parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    // 必须是 X.0.0
+    if parts[1] != "0" || parts[2] != "0" {
+        return false;
+    }
+    // 必须 major == max_major
+    let max_major = tags
+        .iter()
+        .filter(|t| t.is_stable)
+        .filter_map(|t| {
+            let ps: Vec<&str> = t.name.trim_start_matches('v').split('.').collect();
+            if ps.len() != 3 {
+                return None;
+            }
+            ps[0].parse::<u32>().ok()
+        })
+        .max();
+    match max_major {
+        Some(m) if m == major => true,
+        _ => false,
+    }
 }
 
 /// 判断 tag 的 patch 段是否 = 0 或 1
@@ -301,6 +349,79 @@ mod tests {
         assert_eq!(
             latest_stable_for_installation(&tags),
             Some("v0.27.1".to_string())
+        );
+    }
+
+    // ============================================================================
+    // v3.10 新增：「首次大版本跳过」规则相关测试
+    // ============================================================================
+
+    #[test]
+    fn test_is_first_major_release_basic() {
+        // v1.0.0 是 max_major=1 的首次大版本
+        let tags = vec![make_tag("v0.27.0", true), make_tag("v1.0.0", true)];
+        assert!(is_first_major_release("v1.0.0", &tags));
+        // v0.27.0 不是首次大版本（max_major=1，major=0 不等）
+        assert!(!is_first_major_release("v0.27.0", &tags));
+        // v0.28.0 不是首次大版本（min != 0）
+        assert!(!is_first_major_release("v0.28.0", &tags));
+    }
+
+    #[test]
+    fn test_latest_stable_for_installation_skips_v1_first_release() {
+        // 核心场景：v0.3.10 + v1.0.0 → 选 v0.3.10
+        let tags = vec![
+            make_tag("v0.3.9", true),
+            make_tag("v0.3.10", true),
+            make_tag("v1.0.0", true),
+        ];
+        assert_eq!(
+            latest_stable_for_installation(&tags),
+            Some("v0.3.10".to_string())
+        );
+    }
+
+    #[test]
+    fn test_latest_stable_for_installation_still_skips_v1_0_0_even_with_v1_0_1() {
+        // tags = [v0.27.1, v1.0.0, v1.0.1]
+        // v1.0.0 仍是首次大版本 → 跳过
+        // v1.0.1 patch=1 但 max_major=1 → 也是首次大版本的后续 → 不在"patch=0/1 + 非首次"中
+        // 应选 v0.27.1
+        let tags = vec![
+            make_tag("v0.27.1", true),
+            make_tag("v1.0.0", true),
+            make_tag("v1.0.1", true),
+        ];
+        assert_eq!(
+            latest_stable_for_installation(&tags),
+            Some("v0.27.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_latest_stable_for_installation_fallback_to_latest_stable_when_only_v1() {
+        // 极端兜底：tags 里只有 v1.0.0，没有 v0.x
+        // 主规则（patch=0/1 + 非首次大版本）过滤后空 → or_else 回退到 latest_stable
+        let tags = vec![make_tag("v1.0.0", true)];
+        assert_eq!(
+            latest_stable_for_installation(&tags),
+            Some("v1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_latest_stable_for_installation_does_not_apply_to_v0() {
+        // tags = [v0.27.0, v0.28.0, v0.28.1]
+        // max_major=0 → 没有"首次大版本"概念
+        // 按原规则选最大的 patch=0/1
+        let tags = vec![
+            make_tag("v0.27.0", true),
+            make_tag("v0.28.0", true),
+            make_tag("v0.28.1", true),
+        ];
+        assert_eq!(
+            latest_stable_for_installation(&tags),
+            Some("v0.28.1".to_string())
         );
     }
 }

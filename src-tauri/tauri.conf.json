@@ -37,7 +37,15 @@
       "icons/icon.ico"
     ],
     "resources": ["resources/uv/*"],
-    "externalBin": []
+    "externalBin": [],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false,
+        "installerHooks": "nsis/installer_hooks.nsh"
+      }
+    }
   },
   "plugins": {}
 }

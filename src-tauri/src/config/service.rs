@@ -270,29 +270,33 @@ fn build_default_config() -> Config {
 
 /// 将空路径字段填充为 launcher 工作目录
 ///
-/// 规则：
-/// - `comfyui_root` 为空 → 设置为 launcher 工作目录的 `ComfyUI` 子目录
-/// - `venv_path` 为空 → 设置为 `<app_data_dir>/data/venv`（v3.1 / F26 决策 1：venv 独立于 ComfyUI 仓库）
+/// 规则（v1.8 / F38 Portable 模式重写）：
+/// - `comfyui_root` 为空 → 设置为 `<portable_base_dir>/ComfyUI`（dev 时是项目根，prod 时是 exe 旁）
+/// - `venv_path` 为空 → 设置为 `<app_data_dir>/venv`（v3.1 / F26 决策 1：venv 独立于 ComfyUI 仓库）
 /// - `models_path` 不在此处设置（保持 `None`，由用户在设置页显式配置）
 ///
 /// 已配置的路径不会被覆盖（保证老用户的 config.toml 不会被打乱）。
 fn apply_default_paths(cfg: &mut Config) {
-    let launcher_dir = paths::launcher_working_dir();
-    // 关键：comfyui_root 必须是 launcher 工作目录的**子目录**（如 "ComfyUI"），
-    // 不能直接等于 launcher_dir 本身。原因：
-    //   - launcher_dir 通常已包含 launcher 自己的 .git、node_modules、src/ 等
-    //   - 若直接用 launcher_dir，CoreManager::is_cloned() 会返回 false（没有 ComfyUI 标记）
+    // 关键：comfyui_root 必须是 portable_base_dir 的**子目录**（如 "ComfyUI"），
+    // 不能直接等于 portable_base_dir 本身。原因：
+    //   - portable_base_dir 通常已包含 launcher 自己的 .git、node_modules、src/ 等
+    //   - 若直接用 portable_base_dir，CoreManager::is_cloned() 会返回 false（没有 ComfyUI 标记）
     //   - clone_repo 会检测到目录非空但无 .git → 抛 NotEmptyDir
     // 设为子目录后：目录不存在 → clone_repo 走"目录不存在"分支，正常 clone
+    //
+    // v1.8 / F38：使用 portable_base_dir 替代 launcher_working_dir
+    //   - dev 模式：项目根（避免数据跑到 target/debug/）
+    //   - prod 模式：exe 所在目录
     if cfg.paths.comfyui_root.as_os_str().is_empty() {
-        cfg.paths.comfyui_root = launcher_dir.join("ComfyUI");
+        cfg.paths.comfyui_root = paths::default_comfyui_root();
     }
     // v3.1 / F26 决策 1：venv 独立于 ComfyUI 仓库
     //   - 旧版默认 `<comfyui_root>/venv` 切版本时会被 git 操作影响
-    //   - 新版默认 `<app_data_dir>/data/venv`，跨版本切换 ComfyUI 不影响 venv
+    //   - v1.8 起默认 `<app_data_dir>/venv`（即 `<portable_base>/data/venv`），
+    //     跨版本切换 ComfyUI 不影响 venv，且和 launcher 一起走 portable 模式
     //   - 用户已配置的路径保留不动（向后兼容）
     if cfg.paths.venv_path.as_os_str().is_empty() {
-        cfg.paths.venv_path = paths::app_data_dir().join("data").join("venv");
+        cfg.paths.venv_path = paths::app_data_dir().join("venv");
     }
 }
 

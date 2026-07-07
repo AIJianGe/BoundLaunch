@@ -147,6 +147,16 @@ function copyError(text: string) {
   );
 }
 
+/** v3.10：截断错误信息用于折叠预览（前 N 字符 + "..."） */
+function truncateError(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  // 截取到最近的换行符（避免截半个单词/半个 traceback 行）
+  const truncated = text.slice(0, maxLen);
+  const lastNewline = truncated.lastIndexOf("\n");
+  const cut = lastNewline > maxLen / 2 ? truncated.slice(0, lastNewline) : truncated;
+  return `${cut}\n…（共 ${text.length} 字符，点击展开）`;
+}
+
 // ========== Actions ==========
 
 async function onRefresh() {
@@ -407,7 +417,15 @@ onUnmounted(() => {
               {{ getDuration(task.started_at, task.completed_at) }}
             </NDescriptionsItem>
             <NDescriptionsItem v-if="task.error" label="错误信息" :span="2">
-              <pre class="error-pre">{{ task.error }}</pre>
+              <!-- v3.10：错误信息过长时默认折叠 + 截断显示 -->
+              <details v-if="task.error.length > 200" class="error-detail-collapsible">
+                <summary class="error-summary">
+                  <span class="error-preview">{{ truncateError(task.error, 200) }}</span>
+                  <NButton text size="tiny">展开</NButton>
+                </summary>
+                <pre class="error-pre">{{ task.error }}</pre>
+              </details>
+              <pre v-else class="error-pre">{{ task.error }}</pre>
             </NDescriptionsItem>
           </NDescriptions>
 
@@ -569,6 +587,50 @@ onUnmounted(() => {
   margin-top: 8px;
   display: flex;
   justify-content: flex-end;
+}
+
+/* v3.10：错误信息折叠样式 */
+.error-detail-collapsible {
+  margin-top: 4px;
+}
+
+.error-detail-collapsible summary {
+  cursor: pointer;
+  padding: 8px;
+  background: #fafafa;
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+  user-select: none;
+  list-style: none;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.error-detail-collapsible summary::-webkit-details-marker {
+  display: none;
+}
+
+.error-preview {
+  flex: 1;
+  font-family: monospace;
+  font-size: 12px;
+  color: #666;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.error-detail-collapsible[open] summary {
+  margin-bottom: 8px;
+}
+
+.error-detail-collapsible[open] .error-preview {
+  max-height: none;
+  overflow: visible;
 }
 
 .footer-tip {

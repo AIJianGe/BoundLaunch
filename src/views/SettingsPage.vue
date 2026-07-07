@@ -33,6 +33,7 @@ import TransformersConfigPanel from "@/components/settings/TransformersConfigPan
 import DependenciesPanel from "@/components/settings/DependenciesPanel.vue";
 import UiPanel from "@/components/settings/UiPanel.vue";
 import DangerZonePanel from "@/components/settings/DangerZonePanel.vue";
+import DataLocationPanel from "@/components/settings/DataLocationPanel.vue"; // v1.8 / F38
 
 const configStore = useConfigStore();
 const envStore = useEnvStore();
@@ -64,6 +65,8 @@ onMounted(async () => {
     </div>
 
     <template v-else>
+      <!-- v1.8 / F38：数据位置信息（顶部优先显示） -->
+      <DataLocationPanel />
       <PathsPanel />
       <PythonVersionPanel />
       <TorchConfigPanel />
