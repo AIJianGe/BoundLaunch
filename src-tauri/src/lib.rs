@@ -24,7 +24,6 @@ mod env_inspector;
 mod error;
 mod event_bus;
 mod log_store;
-mod model_path;
 mod plugin_manager;
 mod process_launcher;
 mod pseudo_terminal;
@@ -39,7 +38,6 @@ use crate::config::ConfigService;
 use crate::core_manager::CoreManagerService;
 use crate::env_inspector::EnvironmentInspectorService;
 use crate::log_store::LogStoreService;
-use crate::model_path::ModelPathService;
 use crate::plugin_manager::PluginManagerService;
 use crate::process_launcher::ProcessLauncherService;
 use crate::process_launcher::ShutdownCoordinator;
@@ -195,9 +193,6 @@ pub fn run() {
                     log_store.clone(),
                 );
 
-                // ModelPathService 初始化（yaml 路径 = <comfyui_root>/extra_model_paths.yaml，路径热加载）
-                let model_path = ModelPathService::new(config.clone());
-
                 // PluginManager 初始化（custom_nodes + venv，路径热加载）
                 let plugin_manager = PluginManagerService::new(
                     config.clone(),
@@ -222,10 +217,8 @@ pub fn run() {
                     tracing::warn!(?data_dir, error = %e, "failed to ensure data_dir");
                 }
                 let python_env_arc = std::sync::Arc::new(python_env);
-                let model_path_arc = std::sync::Arc::new(model_path);
                 let process_launcher = ProcessLauncherService::new(
                     python_env_arc.clone(),
-                    model_path_arc.clone(),
                     log_store.clone(),
                     config.clone(),
                     data_dir,
@@ -269,7 +262,6 @@ pub fn run() {
                     env_inspector: std::sync::Arc::new(env_inspector),
                     python_env: python_env_arc,
                     core_manager: std::sync::Arc::new(core_manager),
-                    model_path: model_path_arc,
                     plugin_manager: std::sync::Arc::new(plugin_manager),
                     task_scheduler: task_scheduler_arc,
                     process_launcher: std::sync::Arc::new(process_launcher),
@@ -411,11 +403,6 @@ pub fn run() {
             commands::core_manager::core_force_clean_workspace,
             // F36：版本兼容性预检（切版本前弹对话框用）
             commands::core_manager::core_check_version_compatibility,
-            // ModelPathManager
-            commands::model_path::modelpath_generate,
-            commands::model_path::modelpath_remove,
-            commands::model_path::modelpath_scan,
-            commands::model_path::modelpath_validate,
             // PluginManager
             commands::plugin_manager::plugin_list,
             commands::plugin_manager::plugin_install,

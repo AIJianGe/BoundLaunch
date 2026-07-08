@@ -93,7 +93,7 @@ const changelog: ChangeEntry[] = [
       "ComfyUI 启动器核心功能（启动/停止/状态机）",
       "环境管理（Python 切换 / venv 重建 / torch CUDA 配置）",
       "插件管理（Git 仓库安装 / 启用 / 更新 / 卸载）",
-      "模型路径管理（扫描 / extra_model_paths.yaml 生成）",
+      "模型路径管理（v3.x 合并到设置 → 路径配置 → models 软链接）",
       "任务调度器 + 日志持久化",
     ],
   },

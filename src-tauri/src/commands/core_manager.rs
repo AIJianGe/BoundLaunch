@@ -172,6 +172,7 @@ pub async fn core_switch_version(
         python_env: state.python_env.clone(),
         process_launcher: state.process_launcher.clone(),
         task_scheduler: state.task_scheduler.clone(),
+        env_inspector: state.env_inspector.clone(),
     };
     let params = SwitchVersionParams { target_tag, mode };
     let def = crate::task_scheduler::factory::make_switch_version_task(params, ctx, app);

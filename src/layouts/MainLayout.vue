@@ -51,7 +51,6 @@ import {
   Rocket,
   RefreshCw,
   Puzzle,
-  Package,
   BarChart3,
   Info,
   Terminal as TerminalIcon,
@@ -75,7 +74,7 @@ const menus: readonly NavItem[] = [
   { key: "logs", label: "终端", icon: TerminalIcon, path: "/logs" },
   { key: "core", label: "核心版本", icon: RefreshCw, path: "/core" },
   { key: "plugins", label: "插件管理", icon: Puzzle, path: "/plugins" },
-  { key: "models", label: "模型路径", icon: Package, path: "/models" },
+  // v3.x：删除"模型路径"菜单项（功能合并到设置 → 路径配置 → models 路径）
   { key: "tasks", label: "任务进度", icon: BarChart3, path: "/tasks" },
   { key: "about", label: "关于", icon: Info, path: "/about" },
 ] as const;

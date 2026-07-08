@@ -13,7 +13,7 @@
 //! - **实时日志推送**：子进程 stdout/stderr 通过 `LineCollector` 推送到前端
 //! - **细粒度进度**：15 段进度（参考 §11.13 启动异步化）
 //!
-//! ## 流程（11 步）
+//! ## 流程（12 步）
 //! 1. 前置检查（5 步：ComfyUI 已停止 + 工作区干净 + 当前 tag + 模式决策）
 //! 2. 解除 models 软链接
 //! 3. fetch 远程 tag（决策 10：本地优先）
@@ -24,7 +24,8 @@
 //! 8. 安装 torch（submit 子任务）
 //! 9. 安装 requirements（submit 子任务）
 //! 10. 验证 venv 完整性
-//! 11. 发出 CoreVersionSwitched 事件
+//! 11. 同步预热 env snapshot_cache（v3.x 新增：解决"切完版本首页仍显示未就绪"问题）
+//! 12. 发出 CoreVersionSwitched 事件
 //!
 //! ## 回滚策略
 //! 步骤 4 之后任一失败 → force_checkout 回原 tag
@@ -45,6 +46,7 @@ use crate::core_manager::git_ops;
 use crate::core_manager::git_ops_async;
 use crate::core_manager::models::SwitchVersionResult;
 use crate::core_manager::paths as link_paths;
+use crate::env_inspector::EnvironmentInspectorService;
 use crate::error::CoreError;
 use crate::event_bus::EventBus;
 use crate::log_store::LogStoreService;
@@ -70,6 +72,13 @@ pub struct SwitchContext {
     pub process_launcher: Arc<ProcessLauncherService>,
     /// v3.5 新增：用于 submit 子任务
     pub task_scheduler: Arc<TaskSchedulerService>,
+    /// v3.x 新增：用于在切换末尾同步预热 env snapshot_cache
+    ///
+    /// 切换完成（git checkout + venv 重建 + torch + requirements 都装好）后，
+    /// 调 `force_snapshot_update` 同步跑一次完整探查，把结果写回 snapshot_cache
+    /// 并 emit `env_inspect_updated` 事件，避免用户切到首页时还看到 5-30s 前的旧快照。
+    /// 详见 `env_inspector::EnvironmentInspectorService::force_snapshot_update`。
+    pub env_inspector: Arc<EnvironmentInspectorService>,
 }
 
 /// 构造切换版本任务（提交给 TaskScheduler）
@@ -591,6 +600,36 @@ async fn run_switch_version_impl(
     if let Err(e) = verify_result {
         tracing::warn!(error = %e, "verify_venv failed, but git already switched");
         progress.send_message(format!("警告: venv 验证失败: {}（版本切换已完成）", e));
+    }
+    progress.send_percent(95);
+
+    // ========== 步骤 12：同步预热 env snapshot_cache ==========
+    //
+    // 目的：用户切完版本回到首页时，立即看到"就绪"和"已安装"，
+    // 而不是看到 5-30s 前的旧 snapshot_cache（`spawn_refresh` 异步刷新延迟）。
+    //
+    // 行为：
+    // 1. 同步跑一次完整 inspect_snapshot（probe_torch + inspect_dependencies + detect_gpu）
+    // 2. 把结果写回 snapshot_cache
+    // 3. emit env_inspect_updated 事件给前端
+    //
+    // 失败容忍：探查失败不阻塞切换完成，tracing::warn 记录。
+    // 此时 `CoreVersionSwitched` 事件仍会 emit，前端会通过后续的
+    // `spawn_refresh` 异步刷新来拿到正确状态（与旧行为一致）。
+    progress.send_message("同步刷新环境信息（让首页立即看到就绪）".to_string());
+    if let Err(e) = ctx
+        .env_inspector
+        .force_snapshot_update(&venv_path, &comfyui_root, &cancel_token)
+        .await
+    {
+        tracing::warn!(
+            error = %e,
+            "force_snapshot_update failed after switch, will rely on async spawn_refresh"
+        );
+        progress.send_message(format!(
+            "警告: 同步刷新环境失败（{}），切回首页时可能短暂看到旧状态",
+            e
+        ));
     }
     progress.send_percent(100);
 

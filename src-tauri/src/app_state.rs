@@ -8,7 +8,6 @@ use crate::core_manager::CoreManagerService;
 use crate::env_inspector::EnvironmentInspectorService;
 use crate::event_bus::EventBus;
 use crate::log_store::LogStoreService;
-use crate::model_path::ModelPathService;
 use crate::plugin_manager::PluginManagerService;
 use crate::process_launcher::ProcessLauncherService;
 use crate::process_launcher::ShutdownCoordinator;
@@ -30,7 +29,6 @@ pub struct AppState {
     pub env_inspector: Arc<EnvironmentInspectorService>,
     pub python_env: Arc<PythonEnvService>,
     pub core_manager: Arc<CoreManagerService>,
-    pub model_path: Arc<ModelPathService>,
     pub plugin_manager: Arc<PluginManagerService>,
     pub task_scheduler: Arc<TaskSchedulerService>,
     pub process_launcher: Arc<ProcessLauncherService>,
@@ -72,8 +70,6 @@ impl AppState {
             (*event_bus).clone(),
             log_store.clone(),
         ));
-        // ModelPathService（路径热加载：复用 config）
-        let model_path = Arc::new(ModelPathService::new(config.clone()));
         // PluginManager（路径热加载：复用 config）
         let plugin_manager = Arc::new(PluginManagerService::new(
             config.clone(),
@@ -92,7 +88,6 @@ impl AppState {
         ));
         let process_launcher = Arc::new(ProcessLauncherService::new(
             python_env.clone(),
-            model_path.clone(),
             log_store.clone(),
             config.clone(),
             data_dir,
@@ -121,7 +116,6 @@ impl AppState {
             env_inspector,
             python_env,
             core_manager,
-            model_path,
             plugin_manager,
             task_scheduler,
             process_launcher,

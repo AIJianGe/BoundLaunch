@@ -543,6 +543,64 @@ impl EnvironmentInspectorService {
     pub fn invalidate_cache(&self) {
         self.cache.invalidate();
     }
+
+    /// 同步强制刷新 env snapshot 并写回 `snapshot_cache`
+    ///
+    /// **v3.x 新增**：解决"切换版本后首次启动看到未就绪"的问题。
+    ///
+    /// 用例：版本切换、venv 重建、requirements 装完等"大动作"完成后，
+    /// **同步**跑一次完整探查并立即把结果写回 `snapshot_cache` + emit 前端事件，
+    /// 避免用户切到首页时还看到 5-30s 前的旧 `snapshot_cache`。
+    ///
+    /// 与 `spawn_refresh` 的区别：
+    /// - `spawn_refresh` 是**异步**的（`tokio::spawn`），不阻塞调用方，5-30s 后才更新
+    /// - `force_snapshot_update` 是**同步**的（`await`），阻塞调用方 5-30s，但调用方
+    ///   返回时 `snapshot_cache` 已经是新的
+    ///
+    /// 行为：
+    /// 1. await `inspect_snapshot`（内部走 `inspect_all`，会更新 30s TTL `cache`）
+    /// 2. 把结果写入 `snapshot_cache`（同步路径，不依赖 `spawn_refresh`）
+    /// 3. emit Tauri 2 Event `env_inspect_updated` 给前端
+    /// 4. emit `EnvInspectUpdated` SystemEvent 给后端其他 Service
+    ///
+    /// 错误处理：
+    /// - `inspect_snapshot` 失败 → `snapshot_cache` 保持旧值，返回 `Err`
+    /// - emit 失败 → 记录 warn，不影响返回值
+    ///
+    /// 注意：本方法接受 `CancellationToken` 用于透传给子探针，
+    /// 切版本时建议传 `switcher` 的 cancel_token，便于级联取消。
+    pub async fn force_snapshot_update(
+        &self,
+        venv_path: &Path,
+        comfyui_root: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<EnvSnapshot, EnvError> {
+        tracing::info!("force snapshot update started");
+        let snapshot = self.inspect_snapshot(venv_path, comfyui_root, cancel).await?;
+
+        // 1. 写回 snapshot_cache
+        *self.snapshot_cache.write() = Some(snapshot.clone());
+
+        // 2. emit Tauri 2 Event 给前端
+        if let Some(app) = &self.app_handle {
+            if let Err(e) = app.emit("env_inspect_updated", &snapshot) {
+                tracing::warn!(error = %e, "emit env_inspect_updated failed");
+            } else {
+                tracing::debug!("emitted env_inspect_updated event to frontend (force)");
+            }
+        } else {
+            tracing::debug!("app_handle None (test mode), skip emit env_inspect_updated");
+        }
+
+        // 3. emit 后端 SystemEvent（其他 Service 联动）
+        self.event_bus.emit(SystemEvent::EnvInspectUpdated);
+
+        tracing::info!(
+            torch_installed = snapshot.torch_installed,
+            "force snapshot update complete"
+        );
+        Ok(snapshot)
+    }
 }
 
 /// 检查 venv 目录是否存在

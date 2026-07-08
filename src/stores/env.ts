@@ -650,6 +650,9 @@ export const useEnvStore = defineStore("env", () => {
       await listen<EnvInfo>("env_inspect_updated", (e) => {
         envInfo.value = e.payload;
         lastUpdated.value = e.payload.last_updated;
+        // v3.x 修复：同步更新 dependencies，避免右侧"关键依赖"卡 10s
+        // 之前只更新 envInfo，导致依赖面板需要用户切换菜单触发 refresh() 才更新
+        dependencies.value = e.payload.dependencies;
         // 顺便重新检查 readiness（基于新 snapshot）
         checkReadiness().catch((err) =>
           console.warn("[env] readiness check after env_inspect_updated failed:", err),

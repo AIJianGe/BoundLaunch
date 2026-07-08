@@ -43,12 +43,11 @@ import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
 import { useShutdown } from "@/composables/useShutdown";
 
-/** 8 个主导航路径，对应 Ctrl+1 ~ Ctrl+8 */
+/** 主导航路径，对应 Ctrl+1 ~ Ctrl+7（v3.x：删除"模型路径"页后减少到 7 个） */
 const NAV_PATHS = [
   "/launch",
   "/core",
   "/plugins",
-  "/models",
   "/settings",
   "/logs",
   "/tasks",
@@ -187,8 +186,8 @@ export function useShortcuts() {
       return;
     }
 
-    // Ctrl+1 ~ Ctrl+8
-    if (ctrl && /^[1-8]$/.test(event.key)) {
+    // Ctrl+1 ~ Ctrl+7
+    if (ctrl && /^[1-7]$/.test(event.key)) {
       onCtrlDigit(parseInt(event.key), event);
       return;
     }

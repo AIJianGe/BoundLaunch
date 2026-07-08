@@ -13,11 +13,14 @@ pub mod models;
 pub mod service;
 
 pub use models::{
-    apply_launch_patch, apply_models_patch, apply_paths_patch, apply_torch_patch,
-    apply_ui_patch, Config, ConfigPatch, LaunchConfigPatch, ModelsConfigPatch,
+    apply_launch_patch, apply_paths_patch, apply_torch_patch,
+    apply_ui_patch, Config, ConfigPatch, LaunchConfigPatch,
     PathsConfigPatch, TorchConfigPatch, UiConfigPatch, LaunchMode, CudaVersion,
-    ModelsMode, ModelsConfig, AdvancedArgs, PreviewMethod, LaunchConfig, PathsConfig,
+    AdvancedArgs, PreviewMethod, LaunchConfig, PathsConfig,
     TorchConfig, UiConfig, Theme,
+    // v3.x：models 段已废弃，类型仅保留向后兼容
+    AdvancedModels, ModelsConfig, ModelsConfigPatch, ModelsMode,
+    apply_models_patch,
 };
 pub use service::ConfigService;
 

@@ -37,7 +37,6 @@ use tokio_util::sync::CancellationToken;
 use crate::config::ConfigService;
 use crate::error::ProcessError;
 use crate::log_store::LogStoreService;
-use crate::model_path::ModelPathService;
 use crate::python_env::PythonEnvService;
 use crate::task_scheduler::progress::ProgressSender;
 
@@ -106,7 +105,6 @@ pub struct Inner {
 
     // 依赖服务
     python_env: Arc<PythonEnvService>,
-    model_path: Arc<ModelPathService>,
     log_store: Arc<LogStoreService>,
     config: Arc<ConfigService>,
 
@@ -131,7 +129,6 @@ impl ProcessLauncherService {
     /// `pid_file_path` 属于 app data 目录状态，构造时固定一次。
     pub fn new(
         python_env: Arc<PythonEnvService>,
-        model_path: Arc<ModelPathService>,
         log_store: Arc<LogStoreService>,
         config: Arc<ConfigService>,
         data_dir: PathBuf,
@@ -149,7 +146,6 @@ impl ProcessLauncherService {
                 health_check_handle: TokioMutex::new(None::<JoinHandle<()>>),
                 cancel_token: PlRwLock::new(None),
                 python_env,
-                model_path,
                 log_store,
                 config,
                 pid_file_path,
@@ -165,6 +161,32 @@ impl ProcessLauncherService {
     /// 读取当前 venv_path（每次调用读最新 config）
     fn current_venv_path(&self) -> PathBuf {
         self.inner.config.get().paths.venv_path.clone()
+    }
+
+    /// 启动前确保 models 软链接就绪（v3.x：取代 v3.4 的 yaml 方案）
+    ///
+    /// - `paths.models_path` 为空 → 跳过（使用默认 `<comfyui_root>/models`）
+    /// - `paths.models_path` 非空 → 调用 `core_manager::paths::ensure_models_link`
+    ///   建立 `<comfyui_root>/models` 软链接到该路径
+    ///
+    /// 失败返回错误：与切版本流程共享 `core_manager::paths::ensure_models_link`，
+    /// 行为完全一致（target 不一致先 remove / 真实目录拒绝 / 创建链接）。
+    async fn ensure_models_link_for_launch(&self) -> Result<(), ProcessError> {
+        let cfg = self.inner.config.get();
+        let comfyui_root = cfg.paths.comfyui_root.clone();
+        let models_path = cfg.paths.models_path.clone();
+        drop(cfg);
+
+        match crate::core_manager::paths::ensure_models_link(
+            &comfyui_root,
+            models_path.as_deref(),
+        ) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(ProcessError::Io(format!(
+                "ensure models link failed: {}",
+                e
+            ))),
+        }
     }
 
     /// 启动 ComfyUI 进程
@@ -302,28 +324,22 @@ impl ProcessLauncherService {
         }
         report(25, &format!("端口 {} 空闲", port));
 
-        // 7. ensure yaml
+        // 7. ensure models 软链接（v3.x：settings.models_path 软链接到自定义目录）
         //
-        // v3.4 增强：阶段 3 - 生成 extra_model_paths.yaml（30%）
-        report(30, "生成 extra_model_paths.yaml...");
-        let models_config = self.inner.config.get().models.clone();
-        if let Err(e) = self
-            .inner
-            .model_path
-            .ensure_yaml_for_launch(&models_config)
-            .await
-        {
+        // v3.x 替代了 v3.4 的 yaml 方案：直接确保 `<comfyui_root>/models` 软链接到
+        // `paths.models_path`（如设置），与切版本流程共享同一套机制（switcher.rs:351）
+        report(30, "确保 models 软链接...");
+        if let Err(e) = self.ensure_models_link_for_launch().await {
             *self.inner.state.write() = ProcessStatus::Stopped;
-            let io_err = ProcessError::Io(format!("ensure yaml failed: {}", e));
-            // v3.10：yaml 生成失败入 ERROR 日志
+            let io_err = ProcessError::Io(format!("ensure models link failed: {}", e));
             self.inner.log_store.log_business_error(
                 crate::log_store::repository::LogLevel::Error,
-                "ProcessLauncher:yaml",
-                &format!("extra_model_paths.yaml 生成失败：{}\n\n请检查「模型路径」配置是否合法", e),
+                "ProcessLauncher:models_link",
+                &format!("models 软链接建立失败：{}\n\n请检查「设置 → 路径配置 → models 路径」是否合法", e),
             );
             return Err(io_err);
         }
-        report(40, "extra_model_paths.yaml 已生成");
+        report(40, "models 软链接就绪");
 
         // 8. build_command + spawn
         //

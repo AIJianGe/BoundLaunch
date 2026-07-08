@@ -264,11 +264,8 @@ mod tests {
                 cuda_version: crate::config::CudaVersion::Cu128,
                 torch_variant: None,
             },
-            models: crate::config::ModelsConfig {
-                mode: crate::config::ModelsMode::Default,
-                custom_root: PathBuf::new(),
-                advanced: Default::default(),
-            },
+            // v3.x：models 段已废弃
+            models: None,
             ui: UiConfig {
                 theme: crate::config::Theme::Auto,
                 language: "zh-CN".into(),

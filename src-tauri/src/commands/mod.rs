@@ -9,7 +9,6 @@ pub mod log_store;
 pub mod env_inspector;
 pub mod python_env;
 pub mod core_manager;
-pub mod model_path;
 pub mod plugin_manager;
 pub mod port_diagnostics;
 pub mod task_scheduler;

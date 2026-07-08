@@ -86,9 +86,10 @@ export interface TorchConfig {
 }
 
 export interface ModelsConfig {
-  mode: ModelsMode;
-  custom_root: string;
-  advanced: Record<string, never>; // 高级配置预留
+  // v3.x：models 段已废弃，保留仅为向后兼容
+  mode?: ModelsMode;
+  custom_root?: string;
+  advanced?: Record<string, never>;
 }
 
 export interface UiConfig {
@@ -461,34 +462,9 @@ export type SwitchRepoResult =
     };
 
 // ============================================================================
-// ModelPathManager 模块（对应 src-tauri/src/model_path/models.rs）
+// v3.x：ModelPathManager 模块已删除（被 paths.models_path 软链接方案取代）
+// 原 ModelFile / SubdirInfo / ScanResult / GenerateYamlResult 类型不再使用
 // ============================================================================
-
-export interface GenerateYamlResult {
-  yaml_path: string;
-  backed_up: string | null;
-  generated_at: string;
-}
-
-export interface ModelFile {
-  name: string;
-  size: number;
-  modified: string;
-}
-
-export interface SubdirInfo {
-  name: string;
-  path: string;
-  file_count: number;
-  total_size: number;
-  models: ModelFile[];
-}
-
-export interface ScanResult {
-  root: string;
-  subdirs: SubdirInfo[];
-  scanned_at: string;
-}
 
 // ============================================================================
 // PluginManager 模块（对应 src-tauri/src/plugin_manager/models.rs）

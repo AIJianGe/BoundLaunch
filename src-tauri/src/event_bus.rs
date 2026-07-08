@@ -198,10 +198,10 @@ mod tests {
         let mut rx1 = bus.subscribe();
         let mut rx2 = bus.subscribe();
 
-        bus.emit(SystemEvent::YamlRegenerated);
+        bus.emit(SystemEvent::PluginListChanged);
 
-        assert!(matches!(rx1.recv().await.unwrap(), SystemEvent::YamlRegenerated));
-        assert!(matches!(rx2.recv().await.unwrap(), SystemEvent::YamlRegenerated));
+        assert!(matches!(rx1.recv().await.unwrap(), SystemEvent::PluginListChanged));
+        assert!(matches!(rx2.recv().await.unwrap(), SystemEvent::PluginListChanged));
     }
 
     #[tokio::test]

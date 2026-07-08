@@ -163,9 +163,8 @@ pub async fn config_update(
             if let Some(p) = patch.torch {
                 apply_torch_patch(&mut cfg.torch, p);
             }
-            if let Some(p) = patch.models {
-                apply_models_patch(&mut cfg.models, p);
-            }
+            // v3.x：models 段已废弃，patch.models 静默忽略
+            let _ = patch.models;
             if let Some(p) = patch.ui {
                 apply_ui_patch(&mut cfg.ui, p);
             }

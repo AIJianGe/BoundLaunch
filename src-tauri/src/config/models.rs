@@ -11,7 +11,13 @@ pub struct Config {
     pub paths: PathsConfig,
     pub launch: LaunchConfig,
     pub torch: TorchConfig,
-    pub models: ModelsConfig,
+    /// v3.x：models section 已废弃（被 paths.models_path 软链接方案取代）
+    ///
+    /// - 保留字段：**仅用于向后兼容旧 config.toml**（老用户可能有 `[models]` 段）
+    /// - 不再写入：UI 已删除"模型路径"菜单项，没有修改入口
+    /// - 解析时静默忽略内容（不读、不校验、不参与业务逻辑）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<serde_json::Value>,
     pub ui: UiConfig,
     /// 配置 schema 版本，用于迁移
     pub schema_version: u32,
@@ -362,11 +368,8 @@ impl Default for Config {
                 cuda_version: CudaVersion::Cu128,
                 torch_variant: None,
             },
-            models: ModelsConfig {
-                mode: ModelsMode::Default,
-                custom_root: PathBuf::new(),
-                advanced: AdvancedModels::default(),
-            },
+            // v3.x：models 段已废弃，留 None
+            models: None,
             ui: UiConfig {
                 theme: Theme::Auto,
                 language: "zh-CN".to_string(),
@@ -556,17 +559,12 @@ pub fn apply_torch_patch(cfg: &mut TorchConfig, patch: TorchConfigPatch) {
     }
 }
 
-/// 把 ModelsConfigPatch 合并到 ModelsConfig
-pub fn apply_models_patch(cfg: &mut ModelsConfig, patch: ModelsConfigPatch) {
-    if let Some(v) = patch.mode {
-        cfg.mode = v;
-    }
-    if let Some(v) = patch.custom_root {
-        cfg.custom_root = v;
-    }
-    if let Some(v) = patch.advanced {
-        cfg.advanced = v;
-    }
+/// 把 ModelsConfigPatch 合并到 ModelsConfig（v3.x：已废弃，no-op）
+///
+/// 保留函数仅用于反序列化兼容，调用时直接忽略 patch。
+/// 业务代码不应再调用本函数。
+pub fn apply_models_patch(_cfg: &mut ModelsConfig, _patch: ModelsConfigPatch) {
+    // v3.x：models 段已废弃，不再应用 patch
 }
 
 /// 把 UiConfigPatch 合并到 UiConfig
