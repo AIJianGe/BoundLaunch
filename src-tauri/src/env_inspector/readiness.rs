@@ -51,6 +51,7 @@ pub struct ReadinessChecks {
     pub venv_exists: bool,
     pub uv_available: bool,
     pub torch_installed: bool,
+    pub torchvision_ok: bool,
     pub requirements_ok: bool,
 }
 
@@ -117,6 +118,7 @@ pub async fn check_readiness(
                     venv_exists: false,
                     uv_available,
                     torch_installed: false,
+                    torchvision_ok: false,
                     requirements_ok: false,
                 },
                 launch_mode: config.launch.mode,
@@ -128,6 +130,9 @@ pub async fn check_readiness(
 
     let torch_installed = env_info.torch.installed;
     let cuda_available = env_info.torch.cuda_available;
+    let torchvision_ok = env_info.torch.torchvision.installed
+        && env_info.torch.torchvision.ops_available
+        && env_info.torch.torchvision.io_available;
 
     // 5. requirements 是否全部满足
     let (requirements_ok, missing_required) =
@@ -144,7 +149,7 @@ pub async fn check_readiness(
             python_version: config.paths.python_version.clone(),
         });
     }
-    if !torch_installed {
+    if !torch_installed || !torchvision_ok {
         missing_steps.push(ReadinessStep::InstallTorch {
             cuda_version: cuda_version_to_string(&config.torch.cuda_version),
         });
@@ -165,6 +170,7 @@ pub async fn check_readiness(
             venv_exists,
             uv_available,
             torch_installed,
+            torchvision_ok,
             requirements_ok,
         },
         launch_mode: config.launch.mode,

@@ -13,4 +13,5 @@ pub mod model_path;
 pub mod plugin_manager;
 pub mod task_scheduler;
 pub mod process_launcher;
+pub mod pseudo_terminal;
 pub mod system;

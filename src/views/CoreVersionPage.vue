@@ -469,9 +469,7 @@ async function onForceClean() {
             🔄 检查更新
           </NButton>
         </div>
-        <div v-if="hasUpdates" class="update-hint">
-          🆕 检测到新版本: {{ coreStore.status?.latest_stable }}
-        </div>
+
       </NCard>
 
       <!-- 运行中提示 -->

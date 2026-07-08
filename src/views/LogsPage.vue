@@ -41,13 +41,20 @@ import {
   NProgress,
   NModal,
   NText,
+  NSpin,
 } from "naive-ui";
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import "@xterm/xterm/css/xterm.css";
+import { invoke } from "@tauri-apps/api/core";
+import { listen as listenTauri } from "@tauri-apps/api/event";
 import { useProcessStore } from "@/stores/process";
 import { useTaskStore } from "@/stores/task";
 import { logQuery, logClear } from "@/api/log";
 import { listen, type UnlistenFn } from "@/api";
 import { useToast } from "@/composables/useToast";
 import { useErrorLog } from "@/composables/useErrorLog";
+import { Plus, X, Terminal as TerminalIcon, ChevronDown, ChevronUp } from "lucide-vue-next";
 import type { LogEntry, LogLevel, TaskProgressEvent, TaskTerminalEvent } from "@/api/types";
 
 const processStore = useProcessStore();
@@ -270,20 +277,216 @@ onMounted(async () => {
       if (t && t.status.phase === "running") {
         // v3.4.2：task status 没有 message 字段，从 startTaskMessage 默认值即可
         startTaskMessage.value = "进行中...";
+        startElapsedTimer();
       }
-      // v3.4.2：恢复耗时计时器（从 task 创建时间算起）
-      startElapsedTimer();
     }
   } catch (e) {
     console.warn("task load:", e);
   }
+
+  // 初始化伪终端
+  initPtyTerminal();
+  await setupPtyListeners();
+  await loadPtySessions();
+  if (ptySessions.value.length === 0) {
+    await nextTick();
+    await createPtySession();
+  }
 });
+
+// ====== 伪终端（底部可折叠面板） ======
+interface PtySize {
+  rows: number;
+  cols: number;
+}
+
+interface TerminalSessionInfo {
+  session_id: string;
+  shell: string;
+  cwd: string;
+  size: PtySize;
+  is_alive: boolean;
+  exit_code: number | null;
+  created_at: string;
+}
+
+const terminalCollapsed = ref(false);
+const terminalContainer = ref<HTMLElement | null>(null);
+const activeSessionId = ref<string | null>(null);
+const ptySessions = ref<TerminalSessionInfo[]>([]);
+
+let term: Terminal | null = null;
+let fitAddon: FitAddon | null = null;
+let unlistenPtyOutput: (() => void) | null = null;
+let unlistenPtyExit: (() => void) | null = null;
+
+function toggleTerminal() {
+  terminalCollapsed.value = !terminalCollapsed.value;
+  if (!terminalCollapsed.value) {
+    nextTick(() => {
+      if (fitAddon) {
+        fitAddon.fit();
+      }
+    });
+  }
+}
+
+function initPtyTerminal() {
+  if (!terminalContainer.value) return;
+
+  term = new Terminal({
+    cursorBlink: true,
+    fontSize: 12,
+    fontFamily: 'Consolas, "Courier New", monospace',
+    theme: {
+      background: "#1e1e1e",
+      foreground: "#d4d4d4",
+      cursor: "#d4d4d4",
+      black: "#000000",
+      red: "#cd3131",
+      green: "#0dbc79",
+      yellow: "#e5e510",
+      blue: "#2472c8",
+      magenta: "#bc3fbc",
+      cyan: "#11a8cd",
+      white: "#e5e5e5",
+      brightBlack: "#666666",
+      brightRed: "#f14c4c",
+      brightGreen: "#23d18b",
+      brightYellow: "#f5f543",
+      brightBlue: "#3b8eea",
+      brightMagenta: "#d670d6",
+      brightCyan: "#29b8db",
+      brightWhite: "#ffffff",
+    },
+    allowProposedApi: true,
+  });
+
+  fitAddon = new FitAddon();
+  term.loadAddon(fitAddon);
+
+  term.open(terminalContainer.value);
+  fitAddon.fit();
+
+  term.onData((data) => {
+    if (activeSessionId.value) {
+      const encoded = btoa(unescape(encodeURIComponent(data)));
+      void invoke("pty_write", {
+        sessionId: activeSessionId.value,
+        data: encoded,
+      });
+    }
+  });
+
+  term.onResize((size) => {
+    if (activeSessionId.value) {
+      void invoke("pty_resize", {
+        sessionId: activeSessionId.value,
+        size: { rows: size.rows, cols: size.cols },
+      });
+    }
+  });
+
+  window.addEventListener("resize", handleTerminalResize);
+}
+
+function handleTerminalResize() {
+  if (fitAddon && !terminalCollapsed.value) {
+    fitAddon.fit();
+  }
+}
+
+function base64Decode(b64: string): string {
+  try {
+    const binaryString = atob(b64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return "";
+  }
+}
+
+async function createPtySession() {
+  try {
+    const info = await invoke<TerminalSessionInfo>("pty_create_session", {
+      shell: null,
+      cwd: null,
+      size: term
+        ? { rows: term.rows, cols: term.cols }
+        : { rows: 20, cols: 80 },
+    });
+    ptySessions.value.push(info);
+    activeSessionId.value = info.session_id;
+    if (term) {
+      term.clear();
+    }
+  } catch (e) {
+    console.error("Failed to create pty session:", e);
+  }
+}
+
+async function closePtySession(sessionId: string) {
+  try {
+    await invoke("pty_close", { sessionId });
+    const idx = ptySessions.value.findIndex((s) => s.session_id === sessionId);
+    if (idx >= 0) {
+      ptySessions.value.splice(idx, 1);
+    }
+    if (activeSessionId.value === sessionId) {
+      activeSessionId.value = ptySessions.value[0]?.session_id ?? null;
+    }
+  } catch (e) {
+    console.error("Failed to close pty session:", e);
+  }
+}
+
+async function loadPtySessions() {
+  try {
+    const list = await invoke<TerminalSessionInfo[]>("pty_list_sessions");
+    ptySessions.value = list;
+    if (!activeSessionId.value && list.length > 0) {
+      activeSessionId.value = list[0].session_id;
+    }
+  } catch (e) {
+    console.error("Failed to list pty sessions:", e);
+  }
+}
+
+async function setupPtyListeners() {
+  unlistenPtyOutput = await listenTauri("pty_output", (event: any) => {
+    const payload = event.payload as { session_id: string; data: string };
+    if (payload.session_id === activeSessionId.value && term) {
+      const text = base64Decode(payload.data);
+      term.write(text);
+    }
+  });
+
+  unlistenPtyExit = await listenTauri("pty_exit", (event: any) => {
+    const payload = event.payload as { session_id: string; exit_code: number | null };
+    const session = ptySessions.value.find((s) => s.session_id === payload.session_id);
+    if (session) {
+      session.is_alive = false;
+      session.exit_code = payload.exit_code;
+    }
+  });
+}
 
 onUnmounted(() => {
   taskUnlisteners.forEach((un) => un());
   taskUnlisteners.length = 0;
   // v3.4.2：清理计时器
   stopElapsedTimer();
+
+  window.removeEventListener("resize", handleTerminalResize);
+  unlistenPtyOutput?.();
+  unlistenPtyExit?.();
+  if (term) {
+    term.dispose();
+    term = null;
+  }
 });
 
 async function onClearLogs() {
@@ -471,6 +674,42 @@ function formatCrashReason(reason: string): string {
         >
           {{ line }}
         </div>
+      </div>
+    </NCard>
+
+    <!-- 伪终端（底部可折叠面板） -->
+    <NCard :bordered="true" size="small" class="terminal-card">
+      <div class="terminal-header" @click="toggleTerminal">
+        <div class="terminal-header-left">
+          <TerminalIcon :size="16" class="terminal-icon" />
+          <span class="terminal-title">终端</span>
+          <div class="session-tabs">
+            <div
+              v-for="s in ptySessions"
+              :key="s.session_id"
+              class="session-tab"
+              :class="{ active: s.session_id === activeSessionId, dead: !s.is_alive }"
+              @click.stop="activeSessionId = s.session_id"
+            >
+              <span class="tab-label">{{ s.shell.split('/').pop()?.split('\\').pop() }}</span>
+              <button class="tab-close" @click.stop="closePtySession(s.session_id)">
+                <X :size="12" />
+              </button>
+            </div>
+            <button class="tab-add" @click.stop="createPtySession" title="新建终端">
+              <Plus :size="14" />
+            </button>
+          </div>
+        </div>
+        <div class="terminal-header-right">
+          <span v-if="activeSessionId" class="session-status">
+            {{ ptySessions.find(s => s.session_id === activeSessionId)?.is_alive ? '运行中' : '已结束' }}
+          </span>
+          <component :is="terminalCollapsed ? ChevronDown : ChevronUp" :size="16" class="collapse-icon" />
+        </div>
+      </div>
+      <div v-show="!terminalCollapsed" class="terminal-container-wrapper">
+        <div ref="terminalContainer" class="terminal-container"></div>
       </div>
     </NCard>
 
@@ -733,5 +972,141 @@ function formatCrashReason(reason: string): string {
   white-space: pre-wrap;
   word-break: break-all;
   user-select: text;
+}
+
+/* 伪终端面板 */
+.terminal-card {
+  margin-top: 12px;
+}
+
+.terminal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+  padding: 4px 0;
+}
+
+.terminal-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.terminal-icon {
+  color: var(--text-color-2);
+}
+
+.terminal-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-color-1);
+}
+
+.session-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+}
+
+.session-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  background: var(--border-color);
+  color: var(--text-color-2);
+  transition: all 0.15s;
+}
+
+.session-tab:hover {
+  background: var(--border-color-strong);
+}
+
+.session-tab.active {
+  background: var(--primary-color);
+  color: white;
+}
+
+.session-tab.dead:not(.active) {
+  opacity: 0.6;
+}
+
+.tab-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  padding: 1px;
+  border-radius: 2px;
+  color: inherit;
+  opacity: 0.7;
+}
+
+.tab-close:hover {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.1);
+}
+
+.tab-add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 4px;
+  background: var(--border-color);
+  color: var(--text-color-2);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.tab-add:hover {
+  background: var(--border-color-strong);
+  color: var(--text-color-1);
+}
+
+.terminal-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.session-status {
+  font-size: 12px;
+  color: var(--text-color-2);
+}
+
+.collapse-icon {
+  color: var(--text-color-2);
+  transition: transform 0.2s;
+}
+
+.terminal-container-wrapper {
+  margin-top: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.terminal-container {
+  height: 300px;
+  background: #1e1e1e;
+  padding: 6px;
+}
+
+:deep(.xterm) {
+  height: 100%;
+}
+
+:deep(.xterm-viewport) {
+  overflow-y: auto;
 }
 </style>

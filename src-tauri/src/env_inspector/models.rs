@@ -41,6 +41,9 @@ pub struct EnvSnapshot {
     pub python_version: String,
     pub torch_installed: bool,
     pub torch_version: Option<String>,
+    pub torchvision_installed: bool,
+    pub torchvision_ops_available: bool,
+    pub torchvision_io_available: bool,
     pub cuda_available: bool,
     pub cuda_version: Option<String>,
     pub gpu_name: Option<String>,
@@ -65,6 +68,27 @@ pub struct TorchInfo {
     pub device_name: Option<String>,
     pub device_count: u32,
     pub total_memory_mb: Option<u64>,
+    pub torchvision: TorchvisionInfo,
+}
+
+/// torchvision 完整性信息
+#[derive(Debug, Clone, Serialize)]
+pub struct TorchvisionInfo {
+    pub installed: bool,
+    pub version: Option<String>,
+    pub ops_available: bool,
+    pub io_available: bool,
+}
+
+impl Default for TorchvisionInfo {
+    fn default() -> Self {
+        Self {
+            installed: false,
+            version: None,
+            ops_available: false,
+            io_available: false,
+        }
+    }
 }
 
 impl TorchInfo {
@@ -78,6 +102,7 @@ impl TorchInfo {
             device_name: None,
             device_count: 0,
             total_memory_mb: None,
+            torchvision: TorchvisionInfo::default(),
         }
     }
 }

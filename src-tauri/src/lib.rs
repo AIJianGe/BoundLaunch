@@ -27,6 +27,7 @@ mod log_store;
 mod model_path;
 mod plugin_manager;
 mod process_launcher;
+mod pseudo_terminal;
 mod python_env;
 mod system;
 mod task_scheduler;
@@ -42,6 +43,7 @@ use crate::model_path::ModelPathService;
 use crate::plugin_manager::PluginManagerService;
 use crate::process_launcher::ProcessLauncherService;
 use crate::process_launcher::ShutdownCoordinator;
+use crate::pseudo_terminal::PseudoTerminalService;
 use crate::python_env::PythonEnvService;
 use crate::python_env::TransformersVersionIndex;
 use crate::task_scheduler::TaskSchedulerService;
@@ -273,6 +275,7 @@ pub fn run() {
                     process_launcher: std::sync::Arc::new(process_launcher),
                     shutdown_coordinator,
                     transformers_index,
+                    pseudo_terminal: std::sync::Arc::new(PseudoTerminalService::new()),
                 }
             });
 
@@ -440,6 +443,13 @@ pub fn run() {
             commands::system::system_check_driver_compat,
             // Dev 诊断
             commands::dev_log::dev_log,
+            // 伪终端
+            commands::pseudo_terminal::pty_create_session,
+            commands::pseudo_terminal::pty_write,
+            commands::pseudo_terminal::pty_resize,
+            commands::pseudo_terminal::pty_close,
+            commands::pseudo_terminal::pty_list_sessions,
+            commands::pseudo_terminal::pty_get_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

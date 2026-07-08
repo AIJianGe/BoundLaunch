@@ -72,6 +72,9 @@ indexmap = { version = "2.4", features = ["serde"] }
 regex = "1.10"
 # v3.4.2：Windows GBK → UTF-8 编码转换（taskkill / wmic 输出解码）
 encoding_rs = "0.8"
+# 伪终端（portable-pty 跨平台：Windows ConPTY / Unix pty）
+portable-pty = "0.4"
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 # v3.10：LoadLibraryW + MessageBoxW 用于启动期 DLL 缺失检测

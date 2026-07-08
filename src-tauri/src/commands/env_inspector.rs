@@ -145,6 +145,9 @@ pub async fn env_readiness_check(
     let uv_available = true;
     let torch_installed = snapshot.torch_installed;
     let cuda_available = snapshot.cuda_available;
+    let torchvision_ok = snapshot.torchvision_installed
+        && snapshot.torchvision_ops_available
+        && snapshot.torchvision_io_available;
 
     // requirements_ok：检查 dependencies 中是否有 Missing / NeedsUpgrade
     let requirements_ok = snapshot
@@ -162,7 +165,7 @@ pub async fn env_readiness_check(
             python_version: cfg.paths.python_version.clone(),
         });
     }
-    if !torch_installed {
+    if !torch_installed || !torchvision_ok {
         missing_steps.push(ReadinessStep::InstallTorch {
             cuda_version: cuda_version_to_string(&cfg.torch.cuda_version),
         });
@@ -181,6 +184,7 @@ pub async fn env_readiness_check(
             venv_exists,
             uv_available,
             torch_installed,
+            torchvision_ok,
             requirements_ok,
         },
         // v3.10 新增：把启动模式 + 实际 CUDA 可用性一并返回，

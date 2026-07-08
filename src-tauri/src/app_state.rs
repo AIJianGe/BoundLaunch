@@ -12,6 +12,7 @@ use crate::model_path::ModelPathService;
 use crate::plugin_manager::PluginManagerService;
 use crate::process_launcher::ProcessLauncherService;
 use crate::process_launcher::ShutdownCoordinator;
+use crate::pseudo_terminal::PseudoTerminalService;
 use crate::python_env::PythonEnvService;
 use crate::python_env::TransformersVersionIndex;
 use crate::task_scheduler::TaskSchedulerService;
@@ -37,6 +38,8 @@ pub struct AppState {
     pub shutdown_coordinator: Arc<ShutdownCoordinator>,
     /// v3.7 新增：transformers 版本索引（PyPI 拉取 + 三层缓存）
     pub transformers_index: Arc<TransformersVersionIndex>,
+    /// 伪终端服务（交互式终端会话）
+    pub pseudo_terminal: Arc<PseudoTerminalService>,
 }
 
 impl AppState {
@@ -110,6 +113,7 @@ impl AppState {
             transformers_cache_file,
             (*event_bus).clone(),
         ));
+        let pseudo_terminal = Arc::new(PseudoTerminalService::new());
         Self {
             event_bus,
             config,
@@ -123,6 +127,7 @@ impl AppState {
             process_launcher,
             shutdown_coordinator,
             transformers_index,
+            pseudo_terminal,
         }
     }
 }

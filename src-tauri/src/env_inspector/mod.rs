@@ -38,7 +38,7 @@ use crate::event_bus::{EventBus, SystemEvent};
 use cache::EnvCache;
 use deps::build_dependency_list;
 use gpu::detect_gpu;
-use models::{DependencyInfo, EnvInfo, EnvSnapshot, GpuInfo, TorchInfo};
+use models::{DependencyInfo, EnvInfo, EnvSnapshot, GpuInfo, TorchInfo, TorchvisionInfo};
 use scripts::{probe_torch_script, run_pip_list, venv_python_path};
 
 /// EnvironmentInspector 服务
@@ -275,6 +275,9 @@ impl EnvironmentInspectorService {
             python_version,
             torch_installed: inner.torch.installed,
             torch_version: inner.torch.version,
+            torchvision_installed: inner.torch.torchvision.installed,
+            torchvision_ops_available: inner.torch.torchvision.ops_available,
+            torchvision_io_available: inner.torch.torchvision.io_available,
             cuda_available: inner.torch.cuda_available,
             cuda_version: inner.torch.cuda_version,
             gpu_name: gpu_display_name(&inner.gpu),
@@ -439,6 +442,13 @@ impl EnvironmentInspectorService {
             return Ok(TorchInfo::not_installed());
         }
 
+        let torchvision = parsed.get("torchvision").map(|tv| TorchvisionInfo {
+            installed: tv.get("installed").and_then(|v| v.as_bool()).unwrap_or(false),
+            version: tv.get("version").and_then(|v| v.as_str()).map(String::from),
+            ops_available: tv.get("ops_available").and_then(|v| v.as_bool()).unwrap_or(false),
+            io_available: tv.get("io_available").and_then(|v| v.as_bool()).unwrap_or(false),
+        }).unwrap_or_default();
+
         Ok(TorchInfo {
             installed: true,
             version: torch_obj
@@ -464,6 +474,7 @@ impl EnvironmentInspectorService {
             total_memory_mb: torch_obj
                 .get("total_memory_mb")
                 .and_then(|v| v.as_u64()),
+            torchvision,
         })
     }
 

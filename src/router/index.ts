@@ -18,7 +18,7 @@ const routes: RouteRecordRaw[] = [
       { path: "plugins", name: "plugins", component: () => import("@/views/PluginPage.vue"), meta: { title: "插件管理" } },
       { path: "models", name: "models", component: () => import("@/views/ModelPathPage.vue"), meta: { title: "模型路径" } },
       { path: "settings", name: "settings", component: () => import("@/views/SettingsPage.vue"), meta: { title: "设置" } },
-      { path: "logs", name: "logs", component: () => import("@/views/LogsPage.vue"), meta: { title: "日志" } },
+      { path: "logs", name: "logs", component: () => import("@/views/LogsPage.vue"), meta: { title: "终端" } },
       { path: "tasks", name: "tasks", component: () => import("@/views/TaskCenterPage.vue"), meta: { title: "任务进度" } },
       { path: "about", name: "about", component: () => import("@/views/AboutPage.vue"), meta: { title: "关于" } },
     ],

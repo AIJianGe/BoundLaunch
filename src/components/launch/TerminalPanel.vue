@@ -25,12 +25,15 @@
  */
 
 import { ref, computed, watch, onMounted, nextTick } from "vue";
+import { useRouter } from "vue-router";
 import { NCard, NScrollbar, NButton, NSwitch, NTag, NSpace, NTooltip } from "naive-ui";
 import { useProcessStore } from "@/stores/process";
 import { useToast } from "@/composables/useToast";
+import { ExternalLink } from "@/components/icons";
 
 const processStore = useProcessStore();
 const toast = useToast();
+const router = useRouter();
 
 /** 最大渲染行数（性能保护：超过此值用 NScrollbar 自动虚拟化） */
 const MAX_RENDER_LINES = 1000;
@@ -114,6 +117,10 @@ function onClear() {
   toast.info("已清空终端");
 }
 
+function goToTerminalPage() {
+  void router.push("/logs");
+}
+
 /** 复制全部日志到剪贴板 */
 async function onCopyAll() {
   const text = processStore.logEntries.map((e) => e.line).join("\n");
@@ -153,6 +160,18 @@ function onScrollToBottom() {
 
     <template #header-extra>
       <NSpace :size="6" align="center">
+        <NTooltip placement="top">
+          <template #trigger>
+            <NButton size="tiny" type="primary" ghost @click="goToTerminalPage">
+              <span style="display: inline-flex; align-items: center; gap: 4px;">
+                <ExternalLink :size="12" />
+                终端
+              </span>
+            </NButton>
+          </template>
+          打开完整终端页面（含伪终端）
+        </NTooltip>
+
         <NTooltip placement="top">
           <template #trigger>
             <NSwitch

@@ -268,7 +268,14 @@ export const useProcessStore = defineStore("process", () => {
       // 载荷含 exit_code + stderr_tail，前端 LogsPage / StartStopButtons 弹窗用
       await listen<ProcessCrashedEvent>("process_crashed", (e) => {
         crashedReason.value = e.payload;
-        error.value = `ComfyUI 已崩溃（exit code: ${e.payload.exit_code ?? "未知"}）`;
+        const errMsg = `ComfyUI 已崩溃（exit code: ${e.payload.exit_code ?? "未知"}）`;
+        error.value = errMsg;
+        status.value = {
+          kind: "crashed",
+          exit_code: e.payload.exit_code,
+          error: errMsg,
+          at: new Date().toISOString(),
+        };
         console.error("[processStore] process_crashed", e.payload);
       }),
       // v3.2.2 修复：事件名 `log` → `comfyui_log`（后端 log_pipeline.rs:185）

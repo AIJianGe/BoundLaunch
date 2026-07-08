@@ -52,9 +52,9 @@ import {
   RefreshCw,
   Puzzle,
   Package,
-  ScrollText,
   BarChart3,
   Info,
+  Terminal as TerminalIcon,
 } from "@/components/icons";
 
 const route = useRoute();
@@ -72,7 +72,7 @@ interface NavItem {
 
 const menus: readonly NavItem[] = [
   { key: "launch", label: "启动", icon: Rocket, path: "/launch" },
-  { key: "logs", label: "日志", icon: ScrollText, path: "/logs" },        // v3.4：上移到第 2 位
+  { key: "logs", label: "终端", icon: TerminalIcon, path: "/logs" },
   { key: "core", label: "核心版本", icon: RefreshCw, path: "/core" },
   { key: "plugins", label: "插件管理", icon: Puzzle, path: "/plugins" },
   { key: "models", label: "模型路径", icon: Package, path: "/models" },
