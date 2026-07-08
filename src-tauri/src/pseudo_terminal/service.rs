@@ -311,9 +311,25 @@ fn default_shell() -> String {
 }
 
 fn default_cwd() -> String {
-    std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| ".".into())
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd_str = cwd.to_string_lossy().to_string();
+
+    // v3.13 增强：如果当前目录是 Tauri 源代码目录（src-tauri），自动回退到项目根。
+    //
+    // 背景：Tauri 进程启动时 cwd 通常是 src-tauri 目录（因为 cargo run 在 manifest 目录执行），
+    // 但用户在终端里期望的 cwd 是项目根（D:\AIWork\myComfyui），而不是 src-tauri。
+    // 检测方法：当前目录同时存在 Cargo.toml 和 tauri.conf.json，就认为是 src-tauri。
+    if cwd.join("Cargo.toml").exists() && cwd.join("tauri.conf.json").exists() {
+        if let Some(parent) = cwd.parent() {
+            tracing::info!(
+                "default_cwd: detected src-tauri directory, falling back to parent: {}",
+                parent.to_string_lossy()
+            );
+            return parent.to_string_lossy().to_string();
+        }
+    }
+
+    cwd_str
 }
 
 fn wait_child_exit(child: &mut (dyn Child + Send + Sync)) -> Option<i32> {
