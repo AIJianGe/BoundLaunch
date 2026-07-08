@@ -50,6 +50,19 @@ export function coreEnsureCloned(): Promise<void> {
 }
 
 /**
+ * v3.11.5：引导安装专用 ensure_cloned
+ *
+ * 与 `coreEnsureCloned` 区别：
+ * - `coreEnsureCloned`：仓库已存在 → 跳过（尊重用户当前版本）
+ * - `coreEnsureClonedForOnboarding`：仓库已存在 → **仍切到安装默认版本**
+ *
+ * 仅 OnboardingPage.finishWithInit 调用。
+ */
+export function coreEnsureClonedForOnboarding(): Promise<void> {
+  return invoke<void>("core_ensure_cloned_for_onboarding");
+}
+
+/**
  * 列出所有 tag（v3.1 / F26 返回 TagInfo[]，包含 commit / date / is_stable）
  *
  * @param force 是否强制刷新（跳过内存缓存）；默认 false（用缓存）

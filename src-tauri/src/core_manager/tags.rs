@@ -103,23 +103,49 @@ pub fn latest_stable(tags: &[TagInfo]) -> Option<String> {
 /// 规则：
 /// 1. 必须是稳定版（`is_stable_tag` 通过）
 /// 2. 版本号的第三段（patch）必须是 `0` 或 `1`
-/// 3. **v3.10 新增**：跳过"首次大版本发布"（如 v1.0.0、v2.0.0）
-///    - 原因：首次大版本可能引入破坏性变更，用户未确认前不应自动装上
-///    - 详见 `is_first_major_release`
-/// 4. 在满足条件中按 SemVer 倒序取最大
+/// 3. **v3.11.8 方案 B 兜底**：若 tags 中存在 `v0.27.0`，直接返回它
+///    - 用户明确要求"引导安装固定死安装 v0.27.0"
+///    - 这是绝对兜底，确保即使 date 排序/缓存有问题也一定选 v0.27.0
+/// 4. **v3.11.8 方案 A**：过滤掉 `major==0 && minor==0` 的远古占位 tag（v0.0.x）
+///    - 原因：`is_patch_zero_or_one("v0.0.1")` 返回 true（patch=1），
+///      v0.0.1 会通过过滤；如果其 date 解析异常（如 LogStore 持久化缓存残留
+///      v3.11.7 修复前的 Utc::now() fallback 值），会错误地赢过 v0.27.0
+///    - v0.0.x 是 ComfyUI 早期占位 tag，不应作为安装默认版
+/// 5. **v3.11.6 关键修复**：按 **tag date** 倒序选择（不再用 SemVer 比较）
+///    - 原因：ComfyUI 的 tag 历史是非单调的（v1.0.0/v1.0.1 是 2017 年的老 tag，
+///      v0.27.0 是 2025 年的新版），SemVer 比较会错误地选 v1.0.1
+///    - 需求文档本来就写的是"发布日期最后"，现在实现终于与文档一致
+/// 6. ~~v3.10 `is_first_major_release` 过滤~~（v3.11.6 移除：改用 date 排序后不再需要）
 ///
-/// 示例（假设 tags: v0.27.0 / v0.27.1 / v0.27.5 / v1.0.0）：
-/// - 第一轮过滤（稳定 + patch=0/1）剩：v0.27.0 / v0.27.1 / v1.0.0
-/// - 第二轮过滤（跳过首次大版本 v1.0.0）剩：v0.27.0 / v0.27.1
-/// - SemVer 倒序最大：**v0.27.1**
+/// 示例（假设 tags: v0.0.1(2017) / v0.27.0(2025) / v0.27.1(2025) / v0.27.5(2025) / v1.0.1(2017)）：
+/// - 方案 B 命中：直接返回 **v0.27.0** ✓
+/// - 若无 v0.27.0：第一轮过滤（稳定 + patch=0/1 + 非远古）剩 v0.27.0 / v0.27.1
+/// - 按 date 倒序取最新：**v0.27.1**（2025 年）✓
 ///
 /// 兜底：若过滤后无任何 tag，回退到 `latest_stable`（行为等同之前）
 pub fn latest_stable_for_installation(tags: &[TagInfo]) -> Option<String> {
+    // 方案 B：v0.27.0 绝对优先（用户明确要求固定安装 v0.27.0）
+    if let Some(v) = tags.iter().find(|t| t.name == "v0.27.0") {
+        tracing::info!(
+            date = ?v.date,
+            "installation-default: hardcoded v0.27.0 found, returning it directly"
+        );
+        return Some(v.name.clone());
+    }
+
     tags.iter()
         .filter(|t| t.is_stable)
         .filter(|t| is_patch_zero_or_one(&t.name))
-        .filter(|t| !is_first_major_release(&t.name, tags))
-        .max_by(|a, b| crate::core_manager::semver::cmp_tag_desc(&a.name, &b.name))
+        // 方案 A：过滤远古占位 tag（major==0 && minor==0，即 v0.0.x）
+        // 防止 v0.0.1 等 patch=1 的远古 tag 在 date 异常时被误选
+        .filter(|t| !is_legacy_placeholder_tag(&t.name))
+        // v3.11.7：date 为主排序键，SemVer 为 tiebreaker
+        // - date 确保老 tag（v1.0.0/v1.0.1 从 2017-2023）不会赢过新 tag（v0.28.0 从 2025）
+        // - SemVer tiebreaker 防止相同 date 的 tag 随机选中
+        .max_by(|a, b| {
+            a.date.cmp(&b.date)
+                .then_with(|| crate::core_manager::semver::cmp_tag_desc(&a.name, &b.name))
+        })
         .map(|t| t.name.clone())
         .or_else(|| latest_stable(tags))
 }
@@ -185,6 +211,36 @@ fn is_patch_zero_or_one(name: &str) -> bool {
         Ok(p) => p == 0 || p == 1,
         Err(_) => false,
     }
+}
+
+/// v3.11.8 方案 A：判断 tag 是否为"远古占位 tag"（major==0 && minor==0，即 v0.0.x）
+///
+/// 用途：在 `latest_stable_for_installation` 中过滤掉这类 tag。
+///
+/// 背景：
+/// - `is_patch_zero_or_one("v0.0.1")` 返回 true（patch=1），v0.0.1 会通过过滤
+/// - ComfyUI 仓库历史中 v0.0.x 是早期占位 tag，不应作为安装默认版
+/// - 若其 date 解析异常（如缓存残留旧 fallback 值），会错误地赢过 v0.27.0
+///
+/// 例：
+/// - `v0.0.1` → true（major=0, minor=0）
+/// - `v0.0.0` → true
+/// - `v0.27.0` → false（minor=27 ≠ 0）
+/// - `v1.0.0` → false（major=1 ≠ 0）
+fn is_legacy_placeholder_tag(name: &str) -> bool {
+    let parts: Vec<&str> = name.trim_start_matches('v').split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let major: u32 = match parts[0].parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let minor: u32 = match parts[1].parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    major == 0 && minor == 0
 }
 
 #[cfg(test)]

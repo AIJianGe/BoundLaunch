@@ -62,6 +62,7 @@ import { useTaskProgress } from "@/composables/useTaskProgress";
 import { configLauncherWorkingDir, configDataLocation, type DataLocationInfo } from "@/api/config";
 import { coreListTagsClassified } from "@/api/core";
 import { envCreateVenv, envInstallTorch, envInstallRequirements } from "@/api/env";
+import { logAppend } from "@/api/log";
 import { latestStableForInstallation } from "@/composables/useTagRules";
 import FolderPicker from "@/components/FolderPicker.vue";
 import type { LaunchMode, CudaVersion } from "@/api/types";
@@ -100,8 +101,13 @@ const initStartMs = ref<number>(0);
  * 计算时机：onMounted（与 config 加载并行）
  * - 优先用 Config.paths.installation_default_version（用户显式配置）
  * - 否则用前端版本的 latest_stable_for_installation（与后端 tags:: 同款规则）
+ *
+ * v3.11.8：初始值直接设为 "v0.27.0"（硬编码兜底）
+ * - 用户要求"引导安装固定死安装 v0.27.0"
+ * - 第 1 步打开就能立即看到版本，无需等异步加载
+ * - 异步加载成功后会被覆盖（若拉到 tags 且 v0.27.0 存在，结果仍是 v0.27.0）
  */
-const expectedDefaultVersion = ref<string | null>(null);
+const expectedDefaultVersion = ref<string | null>("v0.27.0");
 const versionHintLoading = ref(false);
 
 // 表单数据（与 Config 字段对应）
@@ -115,6 +121,38 @@ const form = reactive({
 
 /** v1.8 / F38：数据位置信息（portable 模式下默认路径跟随） */
 const dataLocation = ref<DataLocationInfo | null>(null);
+
+/**
+ * v3.11.4：规范化路径分隔符
+ *
+ * Windows 上 `\` 和 `/` 都能被文件系统接受，但混合使用（如 `D:\AIWork\myComfyui/ComfyUI`）
+ * 在错误日志、路径比对、git 操作等场景中会造成困惑。
+ *
+ * 规则：
+ * - Windows：统一用 `\`
+ * - Unix：统一用 `/`
+ */
+function normalizePath(p: string): string {
+  // 检测 Windows：Tauri 前端用 navigator.platform
+  const isWindows = navigator.platform.toLowerCase().includes("win");
+  if (isWindows) {
+    return p.replace(/\//g, "\\");
+  }
+  return p.replace(/\\/g, "/");
+}
+
+/**
+ * v3.11.4：跨平台路径拼接
+ *
+ * 用法：joinPath("D:\\AIWork", "ComfyUI") → "D:\\AIWork\\ComfyUI"（Windows）
+ *      joinPath("/home/user", "ComfyUI") → "/home/user/ComfyUI"（Unix）
+ */
+function joinPath(base: string, ...segments: string[]): string {
+  const isWindows = navigator.platform.toLowerCase().includes("win");
+  const sep = isWindows ? "\\" : "/";
+  const parts = [base.replace(/[\\/]+$/, ""), ...segments.map(s => s.replace(/^[\\/]+/, ""))];
+  return normalizePath(parts.join(sep));
+}
 
 // ========== 初始化：自动填充 launcher 工作目录作为默认根目录 ==========
 onMounted(async () => {
@@ -130,11 +168,12 @@ onMounted(async () => {
     if (!form.comfyui_root && portableBase) {
       // portable 模式：ComfyUI 根目录 = <portable_base>/ComfyUI
       // 与后端 paths::default_comfyui_root 行为一致
-      form.comfyui_root = `${portableBase}/ComfyUI`.replace(/[\\/]+$/, "");
+      // v3.11.4：用 joinPath 规范化路径分隔符（避免 D:\AIWork\myComfyui/ComfyUI 混合分隔符）
+      form.comfyui_root = joinPath(portableBase, "ComfyUI");
     } else if (!form.comfyui_root) {
       // legacy 模式：fallback 到 launcher_working_dir
       const workDir = await configLauncherWorkingDir();
-      form.comfyui_root = `${workDir}/ComfyUI`;
+      form.comfyui_root = joinPath(workDir, "ComfyUI");
     }
     // v3.2.1：venv 默认路径改到 ComfyUI 外
     // - 之前默认 `<comfyui_root>/venv`，venv 嵌套在 ComfyUI 内
@@ -143,7 +182,7 @@ onMounted(async () => {
     // - v1.8 / F38：改为跟随 app_data_dir（dev → <project_root>/data/venv，prod → <exe_dir>/data/venv）
     //   与 launcher 一起走 portable 模式
     if (!form.venv_path) {
-      form.venv_path = `${loc.venv_path_default}`;
+      form.venv_path = normalizePath(loc.venv_path_default);
     }
   } catch (e) {
     console.warn("[onboarding] failed to get data location:", e);
@@ -151,10 +190,10 @@ onMounted(async () => {
     try {
       const workDir = await configLauncherWorkingDir();
       if (!form.comfyui_root) {
-        form.comfyui_root = `${workDir}/ComfyUI`;
+        form.comfyui_root = joinPath(workDir, "ComfyUI");
       }
       if (!form.venv_path) {
-        form.venv_path = `${workDir}/venv`;
+        form.venv_path = joinPath(workDir, "venv");
       }
     } catch (e2) {
       console.warn("[onboarding] fallback to launcher working dir failed:", e2);
@@ -289,6 +328,64 @@ async function skipOnboarding() {
 }
 
 /**
+ * v3.11.2 新增：退出引导页（不保存配置，不触发任何任务）
+ *
+ * 用途：用户在向导任意位置（除了正在初始化的）点「退出引导」按钮时调用。
+ * 与 `skipOnboarding` 的区别：
+ * - skipOnboarding：先保存当前 form → 跳 /launch
+ * - exitOnboarding：什么都不做 → 跳 /launch（保留 config 文件原状）
+ *
+ * 适用场景：
+ * - 失败后用户不想再试，先去查日志 / 设置页改东西再回来
+ * - 中途反悔，又想保留当前 config
+ *
+ * 注意：如果当前 form 还没保存（用户调过某些字段但没点过 next），
+ * 退出后这些修改会丢失。这是预期行为（用户主动放弃）。
+ */
+/**
+ * 退出引导：保存当前 form → 跳 /launch
+ *
+ * v3.11.7 修复：之前不保存直接跳，但路由守卫检查 comfyuiRoot 为空
+ * 会把用户弹回 /onboarding，看起来像"按钮没反应"。
+ * 现在先 saveConfig 让 comfyuiRoot 非空，守卫放行。
+ */
+async function exitOnboarding() {
+  try {
+    await saveConfig();
+  } catch (e) {
+    // 保存失败也跳转，让用户到主界面排查
+    console.warn("[onboarding] exitOnboarding: saveConfig failed, jumping anyway:", e);
+  }
+  router.push("/launch");
+}
+
+/**
+ * v3.11.2 新增：跳转到日志页（错误页面的快捷入口）
+ *
+ * 行为：
+ * - 不改 initError / initializing 状态
+ * - 用户在 LogsPage 看完日志后，可以手动回到 OnboardingPage
+ *   重试（用「重试」按钮）或 退出（用「退出引导」按钮）
+ */
+function gotoLogsPage() {
+  router.push("/logs");
+}
+
+/**
+ * v3.11.2 新增：重试初始化（错误页面「重试」按钮）
+ *
+ * 行为：
+ * - 清空 initError / initRecentLogs / initProgress
+ * - 重置 ETA 起始时间
+ * - 调 finishWithInit 重新走完整流程
+ *
+ * 注意：finishWithInit 内部已经会清空这些状态，这里只作为"语义清晰"的入口。
+ */
+async function retryInit() {
+  await finishWithInit();
+}
+
+/**
  * 后台异步确保 ComfyUI 仓库已克隆（用于跳过/完成场景）
  *
  * 注意：clone 失败不影响用户主流程（用户已经在主界面了）。
@@ -378,36 +475,65 @@ async function finishWithInit() {
       throw new InitStageError("创建虚拟环境失败", e);
     }
 
-    // ========== 阶段 3: 安装 torch（15% → 60%，CPU 模式跳过）==========
+    // ========== 阶段 3: 安装 torch（15% → 50%，CPU 模式跳过）==========
     if (form.mode !== "cpu") {
       initStage.value = `安装 PyTorch（${form.cuda_version}）...`;
       try {
         const torchTaskId = await envInstallTorch(form.cuda_version);
-        await runTrackedTask(torchTaskId, 15, 60, `安装 PyTorch (${form.cuda_version})`);
+        await runTrackedTask(torchTaskId, 15, 50, `安装 PyTorch (${form.cuda_version})`);
       } catch (e) {
         throw new InitStageError("安装 PyTorch 失败", e);
       }
     } else {
-      // CPU 模式：把 torch 区间让给 requirements
+      // CPU 模式：把 torch 区间让给 clone + requirements
       initProgress.value = 15;
       recomputeEta();
     }
 
-    // ========== 阶段 4: 安装 ComfyUI 依赖（v3.11：阻塞）==========
+    // ========== 阶段 3.5: 克隆 ComfyUI 仓库（50% → 60%）==========
+    // v3.11.3 修复：必须在 install_requirements 之前完成！
+    // requirements.txt 在 ComfyUI 仓库里，不先 clone 就找不到。
+    // v3.11.5 修复：用 ensureClonedForOnboarding（非 ensureCloned），
+    //   确保即使仓库已存在也切到安装默认版本（如 v0.27.0），不停留在 v1.0.0。
+    //   不影响 LaunchPage 的 ensureCloned（尊重用户手选版本）。
+    initStage.value = "克隆 ComfyUI 仓库...";
+    initProgress.value = 50;
+    recomputeEta();
+    try {
+      await coreStore.ensureClonedForOnboarding();
+      const installedTag = coreStore.status?.current_version;
+      if (installedTag) {
+        toast.success(`ComfyUI 仓库已就绪（${installedTag}）`);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // NotEmptyDir 是预期内的（用户用了非空目录），不阻塞后续步骤
+      if (msg.includes("NotEmptyDir")) {
+        console.info("[onboarding] ComfyUI 根目录已存在但非仓库，跳过 clone");
+        toast.info("ComfyUI 根目录已存在，跳过克隆");
+      } else {
+        throw new InitStageError("克隆 ComfyUI 仓库失败", e);
+      }
+    }
+    initProgress.value = 60;
+    recomputeEta();
+
+    // ========== 阶段 4: 安装 ComfyUI 依赖（60% → 95%）==========
     // ComfyUI 启动需要 requirements.txt 里的 8+ 个依赖
     // (torchsde / safetensors / transformers / tokenizers / kornia /
     //  spandrel / aiohttp / pydantic 等)
     // 幂等：uv pip install -r 自动跳过已满足的包
     // v3.11 改造：失败即终止（之前只是 warn）
+    // v3.11.2 修复：catch 块把真实 e 透传给 InitStageError.cause
+    // v3.11.3 修复：先 clone 仓库再装依赖（之前 clone 在最后导致 requirements.txt 不存在）
     initStage.value = "安装 ComfyUI 依赖（requirements.txt）...";
     try {
       const reqTaskId = await envInstallRequirements();
       await runTrackedTask(reqTaskId, 60, 95, "安装 ComfyUI 依赖");
     } catch (e) {
-      throw new InitStageError(
-        "安装 ComfyUI 依赖失败",
-        "可稍后到「设置 → 路径配置」补装，或点击「重试」重新安装",
-      );
+      // ★★★ 关键修复：把真实错误 e 透传出去，不要再写死"操作建议" ★★★
+      // runTrackedTask 抛出 new Error(summary)，summary 含完整 uv stderr
+      throw new InitStageError("安装 ComfyUI 依赖失败", e);
     }
 
     // ========== 阶段 5: 刷新环境信息（95% → 100%，非致命）==========
@@ -428,8 +554,7 @@ async function finishWithInit() {
     setTimeout(() => {
       router.push("/launch");
     }, 500);
-    // 后台异步触发 clone（不阻塞跳转）
-    void ensureClonedInBackground();
+    // v3.11.3：clone 已在阶段 3.5 完成，不再需要后台 clone
   } catch (e) {
     // InitStageError 自带中文 prefix；其他错误统一归为「初始化失败」
     const msg = e instanceof InitStageError
@@ -493,7 +618,18 @@ async function runTrackedTask(
         resolve();
       },
       onError: (summary) => {
-        reject(new Error(summary ?? `${stageLabel} 失败`));
+        // v3.11.2 修复：主动把真实错误写进 LogStore
+        // - summary 含完整 uv stderr（来自后端 task_completed.summary）
+        // - 切到「日志」菜单能直接看到完整原因（不依赖 toast）
+        // - 错误页 +1 菜单红点（business_log 事件 → useErrorLog）
+        const detail = summary ?? `${stageLabel} 失败（无详细信息）`;
+        void logAppend({
+          level: "error",
+          source: `OnboardingPage:${stageLabel}`,
+          message: `${stageLabel} 失败`,
+          detail,
+        });
+        reject(new Error(detail));
       },
     });
   });
@@ -575,15 +711,47 @@ class InitStageError extends Error {
 
 <template>
   <div class="onboarding-page">
-    <NCard class="onboarding-card" :bordered="false">
+    <NCard
+      class="onboarding-card"
+      :bordered="false"
+      :content-style="{
+        flex: '1',
+        display: 'flex',
+        flexDirection: 'column',
+        overflow: 'hidden',
+        minHeight: '0',
+        padding: '0 24px',
+      }"
+      :header-style="{
+        padding: '16px 24px',
+        flexShrink: '0',
+      }"
+    >
       <template #header>
         <div class="card-header">
-          <span class="header-icon">🚀</span>
-          <span class="header-title">欢迎使用 无界启动器</span>
+          <div class="card-header-left">
+            <span class="header-icon">🚀</span>
+            <span class="header-title">欢迎使用 无界启动器</span>
+          </div>
+          <!-- v3.11.2 新增：右上角"退出引导"按钮
+               - 任何状态都可用（initializing 时除外，避免半路取消）
+               - 失败时也可点：用户先去看日志 / 改设置，再决定是否回来重试
+               - 与 footer 区的"跳过向导"区别：不保存当前 form -->
+          <NButton
+            class="card-header-exit"
+            size="small"
+            quaternary
+            :disabled="initializing"
+            @click="exitOnboarding"
+          >
+            退出引导
+          </NButton>
         </div>
       </template>
 
       <!-- v2.15 改版：5 步分两组显示，中间用分组分隔符 -->
+      <!-- v3.11.7 布局改造：card-body 包裹可滚动内容，footer 固定底部 -->
+      <div class="card-body">
       <div class="steps-group">
         <div class="steps-group-header">
           <span class="group-icon">📋</span>
@@ -628,6 +796,35 @@ class InitStageError extends Error {
 
       <!-- 步骤 1: ComfyUI 根目录 -->
       <div v-if="currentStep === 0" class="step-content">
+        <!-- v3.11.8：将安装版本独立醒目展示（用户要求第 1 步就看到版本） -->
+        <div class="version-banner">
+          <div class="version-banner-row">
+            <span class="version-banner-label">将安装的 ComfyUI 版本：</span>
+            <NTag
+              v-if="expectedDefaultVersion"
+              type="success"
+              size="medium"
+              round
+              class="version-banner-tag"
+            >
+              {{ expectedDefaultVersion }}
+            </NTag>
+            <NTag v-else-if="versionHintLoading" size="medium" round>
+              检测中...
+            </NTag>
+            <NTag v-else size="medium" round>将自动选择最新稳定版</NTag>
+            <NButton
+              v-if="versionHintLoading"
+              size="tiny"
+              quaternary
+              :loading="true"
+            />
+          </div>
+          <div class="version-banner-hint">
+            安装完成后可在「核心版本」页面切换其他版本
+          </div>
+        </div>
+
         <NForm label-placement="top">
           <NFormItem label="ComfyUI 根目录">
             <FolderPicker
@@ -648,19 +845,6 @@ class InitStageError extends Error {
         </NForm>
         <NAlert type="info" :bordered="false">
           此目录将用于克隆 ComfyUI 仓库，建议预留 5GB 磁盘空间。
-          <NSpace size="small" align="center" style="margin-top: 8px">
-            <span>将安装版本：</span>
-            <NTag v-if="expectedDefaultVersion" type="success" size="small">
-              {{ expectedDefaultVersion }}
-            </NTag>
-            <NTag v-else-if="versionHintLoading" size="small">
-              检测中...
-            </NTag>
-            <NTag v-else size="small">将自动选择最新稳定版</NTag>
-            <span style="font-size: 12px; opacity: 0.7">
-              （可在「设置 → 核心版本」修改默认规则）
-            </span>
-          </NSpace>
         </NAlert>
       </div>
 
@@ -742,15 +926,15 @@ class InitStageError extends Error {
             <li>保存配置到 config.toml</li>
             <li>创建 Python 虚拟环境（venv）</li>
             <li v-if="form.mode !== 'cpu'">安装 PyTorch（{{ form.cuda_version }}）</li>
-            <li>
-              安装 ComfyUI 依赖（<code>requirements.txt</code>）— v3.11 新增，必装项
-            </li>
+            <li>克隆 ComfyUI 仓库（含 requirements.txt）</li>
+            <li>安装 ComfyUI 依赖（<code>requirements.txt</code>）</li>
             <li>校验环境（refresh envInfo）</li>
           </ol>
-          <p>预计耗时 8-20 分钟，取决于网络速度。</p>
+          <p>预计耗时 10-30 分钟，取决于网络速度。</p>
           <p class="hint">
-            <strong>v3.11 升级：</strong>
-            安装依赖是「阻塞步骤」（失败即终止），确保引导完成后
+            <strong>v3.11.3 升级：</strong>
+            克隆步骤已前置到安装依赖之前，确保 <code>requirements.txt</code> 就绪。
+            安装依赖是「阻塞步骤」（失败即终止），引导完成后
             <code>isReady</code> 直接为 true，无需再到「设置页」补装。
           </p>
         </NAlert>
@@ -776,10 +960,16 @@ class InitStageError extends Error {
       <!-- 之前进度条在 currentStep=3 容器内，用户在 currentStep=4 点"开始初始化"时
            进度条所在的 div 被 v-if 隐藏，导致用户看不到进度。
            改为提到外面，仅受 initializing / initError 控制显示。 -->
+      <!--
+        v3.11.2 修复：日志面板从 initializing 块里提出来
+        - 错误时（initializing=false, initError=true）也能看到日志
+        - uv 失败的 stderr 关键诊断信息不会因为失败就被隐藏
+      -->
       <div
         v-if="initializing || initError"
         class="init-progress-global"
       >
+        <!-- 进度条块：仅 initializing 时显示 -->
         <div v-if="initializing" class="init-progress">
           <div class="init-stage-row">
             <NSpin size="small" />
@@ -808,39 +998,57 @@ class InitStageError extends Error {
               ✓ 完成
             </span>
           </div>
-          <!-- v3.11 实时日志面板：最近 5 行 uv 子进程输出 -->
-          <NScrollbar
-            v-if="initRecentLogs.length > 0"
-            class="init-logs"
-            :max-height="120"
-            style="margin-top: 8px"
-          >
-            <div
-              v-for="(log, idx) in initRecentLogs"
-              :key="idx"
-              class="init-log-line"
-            >
-              <span v-if="log.source" class="log-source">[{{ log.source }}]</span>
-              <span class="log-text">{{ log.text }}</span>
-            </div>
-          </NScrollbar>
         </div>
 
+        <!-- 日志面板：initializing 或 initError 时都显示 -->
+        <NScrollbar
+          v-if="initRecentLogs.length > 0"
+          class="init-logs"
+          :max-height="180"
+          style="margin-top: 8px"
+        >
+          <div
+            v-for="(log, idx) in initRecentLogs"
+            :key="idx"
+            class="init-log-line"
+          >
+            <span v-if="log.source" class="log-source">[{{ log.source }}]</span>
+            <span class="log-text">{{ log.text }}</span>
+          </div>
+        </NScrollbar>
+
+        <!-- 错误区：仅 initError 时显示 -->
         <div v-if="initError" class="init-error">
           <NAlert type="error" :bordered="false">
-            <strong>初始化失败：</strong>{{ initError }}
+            <template #header>
+              <strong>初始化失败</strong>
+            </template>
+            <div class="init-error-message">{{ initError }}</div>
           </NAlert>
+          <NSpace style="margin-top: 12px">
+            <NButton @click="gotoLogsPage" type="primary" ghost>
+              查看完整日志
+            </NButton>
+            <NButton @click="retryInit" :disabled="initializing">
+              重试
+            </NButton>
+            <NButton @click="exitOnboarding" quaternary>
+              退出引导
+            </NButton>
+          </NSpace>
         </div>
       </div>
 
-      <!-- 底部按钮区 -->
+      </div>
+
+      <!-- 底部按钮区（固定在卡片底部，不滚动） -->
       <div class="footer-actions">
         <NButton @click="skipOnboarding" :disabled="initializing" quaternary>
           跳过向导
         </NButton>
         <NSpace>
           <NButton
-            v-if="currentStep > 0 && currentStep < 4"
+            v-if="currentStep > 0"
             @click="prev"
             :disabled="initializing"
           >
@@ -853,14 +1061,6 @@ class InitStageError extends Error {
             @click="next"
           >
             {{ currentStep < 3 ? "下一步" : "下一步（浏览）" }}
-          </NButton>
-          <NButton
-            v-if="currentStep === 4"
-            type="default"
-            :disabled="initializing"
-            @click="finishWithoutInit"
-          >
-            跳过初始化
           </NButton>
           <NButton
             v-if="currentStep === 4"
@@ -879,23 +1079,49 @@ class InitStageError extends Error {
 
 <style scoped>
 .onboarding-page {
-  min-height: 100vh;
+  height: 100vh;
   display: flex;
-  align-items: center;
+  align-items: stretch;
   justify-content: center;
   background: var(--app-bg-muted, #f5f5f5);
   padding: 24px;
+  overflow: hidden;
 }
 
 .onboarding-card {
   width: 640px;
   max-width: 100%;
+  max-height: 100%;
+  display: flex !important;
+  flex-direction: column !important;
+  overflow: hidden;
+}
+
+/* v3.11.7：card-body 包裹可滚动内容，footer 固定底部 */
+/* flex 链通过 NCard 的 content-style / header-style prop 注入 */
+.card-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0; /* flex 子元素必须设 min-height:0 才能正确滚动 */
 }
 
 .card-header {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
+}
+
+.card-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.card-header-exit {
+  flex-shrink: 0;
 }
 
 .header-icon {
@@ -958,8 +1184,42 @@ class InitStageError extends Error {
 }
 
 .step-content {
-  min-height: 180px;
+  min-height: 120px;
   padding: 16px 0;
+}
+
+/* v3.11.8：第 1 步版本展示横幅（醒目、置顶） */
+.version-banner {
+  margin-bottom: 16px;
+  padding: 12px 16px;
+  background: linear-gradient(135deg, rgba(32, 128, 240, 0.08), rgba(24, 160, 88, 0.08));
+  border: 1px solid rgba(24, 160, 88, 0.3);
+  border-radius: 8px;
+}
+
+.version-banner-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.version-banner-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--app-fg, #333);
+}
+
+.version-banner-tag {
+  font-size: 14px;
+  font-weight: 700;
+  padding: 0 12px;
+}
+
+.version-banner-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--app-fg-muted, #888);
 }
 
 .mode-group {
@@ -1081,8 +1341,23 @@ class InitStageError extends Error {
   margin-top: 12px;
 }
 
+.init-error-message {
+  font-family: ui-monospace, "Cascadia Code", "Source Code Pro", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 240px;
+  overflow-y: auto;
+  margin-top: 4px;
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.04);
+  border-radius: 4px;
+}
+
 .footer-actions {
-  margin-top: 24px;
+  flex-shrink: 0;
+  margin-top: 16px;
   display: flex;
   justify-content: space-between;
   align-items: center;

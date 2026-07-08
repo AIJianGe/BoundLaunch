@@ -163,38 +163,134 @@ impl CoreManagerService {
             return Ok(());
         }
 
-        // 委托给 clone_repo，自动检测目录状态
+        // 未克隆 → clone + 切到安装默认版本
         let url = self.current_repo_url();
         self.clone_repo(&url).await?;
+        self.switch_to_installation_default().await;
 
-        // clone 完成后，自动切到「引导安装默认版本」
-        // 失败不阻塞（用户可能想用 master / 网络问题拉不到 tags）
+        Ok(())
+    }
+
+    /// 引导安装专用：确保仓库已克隆 + **强制**切到安装默认版本
+    ///
+    /// 与 `ensure_cloned` 的区别：
+    /// - `ensure_cloned`：仓库已存在 → 直接返回（尊重用户当前版本）
+    /// - `ensure_cloned_for_onboarding`：仓库已存在 → **仍然切到安装默认版本**
+    ///
+    /// 用途：仅 OnboardingPage.finishWithInit 调用。
+    /// 修复：之前仓库已存在时跳过 checkout，导致重新引导仍停留在 v1.0.0。
+    ///
+    /// **v3.11.8 终极修复**：直接硬编码 checkout 到 `v0.27.0`，绕过整个
+    /// `latest_stable_for_installation` → date 排序 → 缓存链路。
+    /// - 用户明确要求"固定死安装 v0.27.0"
+    /// - 之前的链路（tags 缓存 / date 解析 / LogStore 持久化）任何一环出问题都会选错版本
+    /// - 直接 checkout 固定版本是最可靠的方案
+    /// - v0.27.0 不存在时（fetch 失败）才回退到自动规则
+    pub async fn ensure_cloned_for_onboarding(&self) -> Result<(), CoreError> {
+        let was_cloned_before = self.is_cloned().await;
+        tracing::info!(was_cloned_before, "onboarding: ensure_cloned start");
+
+        if !was_cloned_before {
+            let url = self.current_repo_url();
+            tracing::info!(url = %self.get_repo_url_masked(), "onboarding: cloning repo");
+            self.clone_repo(&url).await?;
+            tracing::info!("onboarding: clone finished");
+        }
+
+        // v3.11.8：硬编码 checkout v0.27.0
+        const ONBOARDING_TARGET_VERSION: &str = "v0.27.0";
+
+        // checkout 前先看一下当前状态
+        {
+            let status = self.current_version().await;
+            tracing::info!(
+                status = ?status.as_ref().map(|s| (&s.current_version, &s.current_commit, s.has_local_changes)),
+                "onboarding: status before checkout"
+            );
+        }
+
+        // 先 fetch tags 确保 v0.27.0 在本地（仓库已存在但可能没拉最新 tags）
+        let url = self.current_repo_url();
+        {
+            let _guard = self.repo_lock.lock().await;
+            let repo_path = self.current_repo_path();
+            let url_for_fetch = url.clone();
+            let fetch_result = tokio::task::spawn_blocking(move || -> Result<(), CoreError> {
+                let repo = git_ops::open_repo(&repo_path)?;
+                git_ops::fetch_tags(&repo, &url_for_fetch)?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| CoreError::GitError(e.to_string()))?;
+            if let Err(e) = fetch_result {
+                tracing::warn!(
+                    error = %e,
+                    "onboarding: fetch tags failed before hardcoded checkout, \
+                     will try checkout anyway with local tags"
+                );
+            } else {
+                tracing::info!("onboarding: fetch tags succeeded");
+            }
+        }
+
+        // 直接 checkout 到固定版本
+        match self.checkout(ONBOARDING_TARGET_VERSION).await {
+            Ok(result) => {
+                // checkout 后再确认一下当前状态
+                if let Ok(s) = self.current_version().await {
+                    tracing::info!(
+                        target = ONBOARDING_TARGET_VERSION,
+                        result = ?result,
+                        after_current = ?s.current_version,
+                        after_commit = %s.current_commit,
+                        after_has_changes = s.has_local_changes,
+                        "onboarding: hardcoded checkout to v0.27.0 SUCCESS"
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    target = ONBOARDING_TARGET_VERSION,
+                    "onboarding: hardcoded checkout to v0.27.0 FAILED, \
+                     falling back to switch_to_installation_default"
+                );
+                // 兜底：原来的自动规则（仅当 v0.27.0 确实不存在时才会走到这里）
+                self.switch_to_installation_default().await;
+                Ok(())
+            }
+        }
+    }
+
+    /// 切到安装默认版本（三级 fallback）
+    ///
+    /// 1. latest_stable_for_installation（跳过首次大版本，如 v1.0.0）
+    /// 2. latest_stable（SemVer 最大稳定版）
+    /// 3. 停留当前版本
+    async fn switch_to_installation_default(&self) {
         match self.update_latest_stable_for_installation().await {
             Ok(tag) => {
-                tracing::info!(tag = %tag, "onboarding auto-switched to installation-default stable");
+                tracing::info!(tag = %tag, "switched to installation-default stable");
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "onboarding auto-switch to installation-default failed, falling back to latest_stable"
+                    "installation-default switch failed, falling back to latest_stable"
                 );
-                // 兜底 1：再试一次「SemVer 最大稳定版」
                 match self.update_latest_stable().await {
                     Ok(tag) => {
-                        tracing::info!(tag = %tag, "onboarding fell back to latest_stable");
+                        tracing::info!(tag = %tag, "fell back to latest_stable");
                     }
                     Err(e2) => {
-                        // 兜底 2：停留在 master
                         tracing::warn!(
                             error = %e2,
-                            "onboarding auto-switch to latest_stable failed, staying on master"
+                            "latest_stable also failed, staying on current version"
                         );
                     }
                 }
             }
         }
-
-        Ok(())
     }
 
     /// 列出所有 tag（缓存命中 < 5ms，未命中 1-10s）
@@ -203,6 +299,11 @@ impl CoreManagerService {
         if !force_refresh {
             let cache = self.tags_cache.read();
             if cache.is_fresh() {
+                tracing::debug!(
+                    count = cache.tags.len(),
+                    first = ?cache.tags.first().map(|t| &t.name),
+                    "list_tags: hit memory cache"
+                );
                 return Ok(cache.tags.clone());
             }
         }
@@ -212,9 +313,15 @@ impl CoreManagerService {
             if let Ok(Some((json, _))) = self.log_store.logs().load_cached_tags().await {
                 if let Ok(tags) = serde_json::from_str::<Vec<TagInfo>>(&json) {
                     let mut cache = self.tags_cache.write();
+                    let count = tags.len();
+                    let first = tags.first().map(|t| t.name.clone());
                     cache.tags = tags.clone();
                     cache.cached_at = Some(Instant::now());
-                    tracing::debug!(count = tags.len(), "loaded tags from persistent cache");
+                    tracing::debug!(
+                        count,
+                        first = ?first,
+                        "list_tags: loaded from persistent cache (LogStore)"
+                    );
                     return Ok(tags);
                 }
             }
@@ -255,12 +362,23 @@ impl CoreManagerService {
             .await
             .map_err(|e| CoreError::GitError(e.to_string()))??;
 
+        let tag_count = tags.len();
+        let first_tag = tags.first().map(|t| t.name.clone());
+        let last_tag = tags.last().map(|t| t.name.clone());
+
         // 更新内存缓存
         {
             let mut cache = self.tags_cache.write();
             cache.tags = tags.clone();
             cache.cached_at = Some(Instant::now());
         }
+
+        tracing::info!(
+            count = tag_count,
+            first = ?first_tag,
+            last = ?last_tag,
+            "list_tags: fetched from remote and cached"
+        );
 
         // 持久化到 LogStore
         if let Ok(json) = serde_json::to_string(&tags) {
@@ -369,14 +487,34 @@ impl CoreManagerService {
             .map_err(|e| CoreError::GitError(e.to_string()))??;
 
         // latest_stable 从缓存读
+        let cache_is_fresh;
+        let cache_tag_count;
+        let cache_first_tag;
+        let cache_last_tag;
         let latest_stable = {
             let cache = self.tags_cache.read();
+            cache_is_fresh = cache.is_fresh();
+            cache_tag_count = cache.tags.len();
+            cache_first_tag = cache.tags.first().map(|t| t.name.clone());
+            cache_last_tag = cache.tags.last().map(|t| t.name.clone());
             if cache.is_fresh() {
                 tags::latest_stable(&cache.tags)
             } else {
                 None
             }
         };
+
+        tracing::info!(
+            current_version = ?current_version,
+            current_commit = %current_commit,
+            has_local_changes,
+            cache_is_fresh,
+            cache_tag_count,
+            cache_first_tag = ?cache_first_tag,
+            cache_last_tag = ?cache_last_tag,
+            latest_stable = ?latest_stable,
+            "core_status: current_version result"
+        );
 
         Ok(CoreStatus {
             current_version,

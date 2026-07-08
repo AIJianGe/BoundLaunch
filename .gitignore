@@ -71,3 +71,11 @@ src-tauri/ComfyUI
 !src-tauri/resources/uv/.gitkeep
 !src-tauri/resources/uv/README.md
 src-tauri/venv
+# --- ComfyUI 核心仓库（运行时 clone，不进版本库）---
+ComfyUI/
+
+# --- 数据目录（models / outputs / temp 等运行时数据，不进版本库）---
+data/
+
+# --- 运行时缓存（transformers 版本信息等）---
+cache/

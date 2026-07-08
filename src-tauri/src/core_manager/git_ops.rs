@@ -49,6 +49,9 @@ pub fn list_tags(repo: &Repository) -> Result<Vec<TagInfo>, CoreError> {
             .unwrap_or_default();
 
         // 解析提交时间
+        // v3.11.7 修复：日期解析失败时用 epoch（1970）而非 Utc::now()
+        // 原因：Utc::now 会让解析失败的 tag 变成"最新"，导致 latest_stable_for_installation
+        // 误选 v0.0.1 等老 tag（它们的 date 被 fallback 成当前时间）
         let date = repo
             .revparse_single(&ref_name)
             .and_then(|obj| obj.peel_to_commit())
@@ -57,7 +60,9 @@ pub fn list_tags(repo: &Repository) -> Result<Vec<TagInfo>, CoreError> {
                 let ts = c.time();
                 chrono::DateTime::from_timestamp(ts.seconds(), 0)
             })
-            .unwrap_or_else(Utc::now);
+            .unwrap_or_else(|| {
+                chrono::DateTime::from_timestamp(0, 0).unwrap_or_else(Utc::now)
+            });
 
         let is_stable = super::tags::is_stable_tag(&name);
 
@@ -136,6 +141,9 @@ pub fn current_tag(repo: &Repository) -> Result<Option<String>, CoreError> {
         .head()
         .map_err(|e| CoreError::GitError(e.to_string()))?;
 
+    let head_name = head.name().map(|s| s.to_string());
+    let head_kind = head.kind();
+
     let target_commit = head
         .peel_to_commit()
         .map_err(|e| CoreError::GitError(e.to_string()))?;
@@ -147,18 +155,36 @@ pub fn current_tag(repo: &Repository) -> Result<Option<String>, CoreError> {
         .tag_names(None)
         .map_err(|e| CoreError::GitError(e.to_string()))?;
 
+    let tag_count = tags.iter().flatten().count();
+    let mut matched = Vec::new();
+
     for tag_name in tags.iter().flatten() {
         let ref_name = format!("refs/tags/{}", tag_name);
         if let Ok(obj) = repo.revparse_single(&ref_name) {
             if let Ok(commit) = obj.peel_to_commit() {
                 if commit.id() == target_id {
-                    return Ok(Some(tag_name.to_string()));
+                    matched.push(tag_name.to_string());
                 }
             }
         }
     }
 
-    Ok(None)
+    tracing::debug!(
+        head_name = ?head_name,
+        head_kind = ?head_kind,
+        head_commit = %target_id,
+        tag_count,
+        matched_count = matched.len(),
+        matched = ?matched,
+        "current_tag: lookup result"
+    );
+
+    if matched.is_empty() {
+        Ok(None)
+    } else {
+        // 可能有多个 tag 指向同一个 commit，返回第一个
+        Ok(Some(matched.swap_remove(0)))
+    }
 }
 
 /// 当前 HEAD commit hash
@@ -451,12 +477,42 @@ pub fn checkout_tag(repo: &mut Repository, tag: &str) -> Result<CheckoutResult, 
         .revparse_single(&ref_name)
         .map_err(|e| CoreError::GitError(format!("tag {} not found: {}", tag, e)))?;
 
+    let target_commit = obj.id();
+    let head_before = repo.head().ok().map(|h| h.target().map(|o| o.to_string())).flatten();
+    tracing::info!(
+        target_tag = tag,
+        target_commit = %target_commit,
+        head_before = ?head_before,
+        "checkout_tag: checkout_tree start"
+    );
+
     repo.checkout_tree(&obj, None)
         .map_err(|e| CoreError::GitError(e.to_string()))?;
 
-    // 设置当前分支为 launcher-current
-    repo.set_head("HEAD")
-        .map_err(|e| CoreError::GitError(e.to_string()))?;
+    tracing::info!("checkout_tag: checkout_tree done, about to set_head");
+
+    // 设置 HEAD 指向目标 tag 的 commit（detached HEAD）
+    //
+    // 注意：原代码用 `repo.set_head("HEAD")` 是无效操作（HEAD 已经存在了），
+    // 正确做法是 set_head_detached 到目标 commit id。
+    // F35-F 已经在 force_checkout 里修了，但 checkout_tag 漏掉了。
+    match repo.set_head_detached(target_commit) {
+        Ok(_) => {
+            let head_after = repo.head().ok().map(|h| h.target().map(|o| o.to_string())).flatten();
+            tracing::info!(
+                head_after = ?head_after,
+                "checkout_tag: set_head_detached SUCCESS"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "checkout_tag: set_head_detached FAILED (checkout_tree already succeeded, \
+                 working tree is correct but HEAD may be wrong)"
+            );
+            // 不返回 Err，让流程继续（working tree 是对的）
+        }
+    }
 
     let from_str = from.clone().unwrap_or_else(|| "unknown".to_string());
 

@@ -383,6 +383,7 @@ pub fn run() {
             // CoreManager
             commands::core_manager::core_clone,
             commands::core_manager::core_ensure_cloned,
+            commands::core_manager::core_ensure_cloned_for_onboarding,
             commands::core_manager::core_list_tags,
             commands::core_manager::core_list_tags_classified,
             commands::core_manager::core_check_switch_prerequisites,

@@ -29,6 +29,7 @@ import {
   coreStatus,
   coreClone,
   coreEnsureCloned,
+  coreEnsureClonedForOnboarding,
   coreListTagsClassified,
   coreCheckSwitchPrerequisites,
   coreSwitchVersionWithMode,
@@ -222,6 +223,29 @@ export const useCoreStore = defineStore("core", () => {
       await refresh();
     } catch (e) {
       console.warn("[core] refresh after ensureCloned failed:", e);
+    }
+  }
+
+  /**
+   * v3.11.5：引导安装专用 ensureCloned
+   *
+   * 与 `ensureCloned` 区别：
+   * - `ensureCloned`：仓库已存在 → 跳过（尊重用户当前版本）
+   * - `ensureClonedForOnboarding`：仓库已存在 → 仍切到安装默认版本
+   *
+   * 仅 OnboardingPage.finishWithInit 调用。
+   */
+  async function ensureClonedForOnboarding() {
+    loading.value = true;
+    try {
+      await coreEnsureClonedForOnboarding();
+    } finally {
+      loading.value = false;
+    }
+    try {
+      await refresh();
+    } catch (e) {
+      console.warn("[core] refresh after ensureClonedForOnboarding failed:", e);
     }
   }
 
@@ -447,6 +471,7 @@ export const useCoreStore = defineStore("core", () => {
     restoreBackup,
     clone,
     ensureCloned,
+    ensureClonedForOnboarding,
     switchVersion,
     clearSwitchingTask,
     ensureModelsLink,

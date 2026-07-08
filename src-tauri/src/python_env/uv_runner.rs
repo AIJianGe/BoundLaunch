@@ -278,6 +278,25 @@ impl UvRunner {
             return Err(EnvError::Cancelled);
         }
 
+        // ========== v3.11.6 关键修复：在 smoke_test 之前装 extras（numpy/psutil/six/...） ==========
+        //
+        // 原因：install_torch 步骤 2 用 `--no-deps` 装 torchvision，不会拉 numpy。
+        // 但 smoke_test_torch 会 `import torchvision` → torchvision 的 __init__.py 内部
+        // `import numpy` → numpy 不存在 → ModuleNotFoundError → 触发 D-L4 重装。
+        //
+        // D-L4 重装虽然最终会调 install_torch_extras 补装 numpy，但这是"先报错再修复"的
+        // 错误路径，白白多跑一次 --force-reinstall 重新下载 torchvision wheel（~50MB）。
+        //
+        // 修复：在 smoke_test 之前先把 numpy/psutil/six 等装好，让 smoke_test 一次通过。
+        // 幂等：install_torch_extras 用 --upgrade，已是最新版的包 uv 会跳过。
+        tracing::info!("install_torch: 预装 torch extras (numpy/psutil/six/...) 以避免 smoke_test 误判");
+        if let Err(e) = self.install_torch_extras(venv_path, cancel, line_collector).await {
+            tracing::warn!(
+                error = %e,
+                "install_torch: 预装 extras 失败（不阻塞，smoke_test 仍会尝试）"
+            );
+        }
+
         // ========== v3.8 D-L2：文件系统校验 ==========
         // 检查 site-packages/torchvision/ops/ 和 _C.pyd 是否存在
         // 不存在 → 触发 v3.8 D-L4 自动重装

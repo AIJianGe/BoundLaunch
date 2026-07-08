@@ -359,10 +359,32 @@ async function onStart() {
 
   // 守卫 2: 环境就绪（再次校验，避免后台 install 期间误启动）
   if (!envStore.readiness?.ready) {
-    // v3.2.1 关键改进：检查是否 venv 不存在
-    // - 用户改 venv 路径后新路径下没 venv（v3.2 之前版本行为）
-    // - 弹窗引导用户立即创建，比单纯 toast 引导去设置页更直接
     const missingKinds = envStore.readiness?.missing_steps?.map(s => s.kind) ?? [];
+
+    // v3.11.7：环境被重置（ComfyUI 仓库被删）→ 引导回引导页
+    // 区分"部分丢失"和"全部重置"：
+    // - CloneComfyUI 在 missing_steps 里 = ComfyUI 仓库不存在 = 环境被重置
+    // - 此时弹 venv 对话框没用（install_requirements 会因找不到 requirements.txt 失败）
+    // - 应该引导用户回引导页重新安装
+    if (missingKinds.includes("CloneComfyUI")) {
+      const ok = await showConfirm({
+        title: "检测到环境未初始化",
+        content:
+          "ComfyUI 仓库不存在，需要重新进行引导安装。\n\n" +
+          "是否进入引导安装？",
+        positiveText: "进入引导安装",
+        negativeText: "取消",
+      });
+      if (ok) {
+        router.push("/onboarding");
+      }
+      startComfyui.unmarkSubmitting();
+      return;
+    }
+
+    // v3.2.1：仅 venv 不存在（部分丢失，ComfyUI 仓库还在）
+    // - 用户改 venv 路径后新路径下没 venv
+    // - 弹窗引导用户立即创建
     if (missingKinds.includes("CreateVenv") && !installingEnv.value) {
       const venvPath = envStore.envInfo?.venv_path ?? "(未知)";
       const ok = await showConfirm({

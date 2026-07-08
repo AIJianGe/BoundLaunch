@@ -51,6 +51,24 @@ pub async fn core_ensure_cloned(state: State<'_, AppState>) -> Result<(), String
         .map_err(|e| e.to_string())
 }
 
+/// v3.11.5：引导安装专用 ensure_cloned
+///
+/// 与 `core_ensure_cloned` 区别：
+/// - `core_ensure_cloned`：仓库已存在 → 跳过（尊重用户当前版本）
+/// - `core_ensure_cloned_for_onboarding`：仓库已存在 → **仍切到安装默认版本**
+///
+/// 仅 OnboardingPage.finishWithInit 调用，避免 LaunchPage 启动时覆盖用户手选版本。
+#[tauri::command]
+pub async fn core_ensure_cloned_for_onboarding(
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .core_manager
+        .ensure_cloned_for_onboarding()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 列出所有 tag（force_refresh=true 强制刷新）
 #[tauri::command]
 pub async fn core_list_tags(

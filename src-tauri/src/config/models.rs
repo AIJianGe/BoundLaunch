@@ -461,12 +461,17 @@ pub struct ConfigPatch {
 }
 
 /// 把 PathsConfigPatch 合并到 PathsConfig（Some 字段覆盖）
+///
+/// v3.11.4：路径分隔符规范化（防御性）
+/// - 前端可能传来混合分隔符的路径（如 `D:\AIWork\myComfyui/ComfyUI`）
+/// - Windows 上统一为 `\`，Unix 上统一为 `/`
+/// - 避免错误日志、路径比对、git 操作等场景中的混淆
 pub fn apply_paths_patch(cfg: &mut PathsConfig, patch: PathsConfigPatch) {
     if let Some(v) = patch.comfyui_root {
-        cfg.comfyui_root = v;
+        cfg.comfyui_root = normalize_path_separators(&v);
     }
     if let Some(v) = patch.venv_path {
-        cfg.venv_path = v;
+        cfg.venv_path = normalize_path_separators(&v);
     }
     if let Some(v) = patch.python_version {
         cfg.python_version = v;
@@ -497,6 +502,22 @@ pub fn apply_paths_patch(cfg: &mut PathsConfig, patch: PathsConfigPatch) {
         } else {
             cfg.installation_default_version = Some(v);
         }
+    }
+}
+
+/// v3.11.4：规范化路径分隔符
+///
+/// Windows 上 `\` 和 `/` 都能被文件系统接受，但混合使用（如 `D:\AIWork\myComfyui/ComfyUI`）
+/// 在错误日志、路径比对、git 操作等场景中会造成困惑。
+///
+/// - Windows：`/` → `\`
+/// - Unix：`\` → `/`
+fn normalize_path_separators(path: &std::path::Path) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if cfg!(windows) {
+        std::path::PathBuf::from(s.replace('/', "\\"))
+    } else {
+        std::path::PathBuf::from(s.replace('\\', "/"))
     }
 }
 
