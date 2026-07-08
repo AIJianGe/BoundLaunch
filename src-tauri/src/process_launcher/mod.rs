@@ -265,8 +265,18 @@ impl ProcessLauncherService {
         // 6. check_port_available
         //
         // v3.4 增强：阶段 2 - 检查端口（20%）
+        // v3.11 增强：端口被占时通过事件发送占用方信息（process_start_failed）
         report(20, &format!("检查端口 {} 是否空闲...", port));
         if let Err(e) = check_port_available(&args.listen_host, port).await {
+            // 端口被占：调用端口诊断拿到占用方信息
+            let diagnosis = crate::commands::port_diagnostics::diagnose_port(
+                args.listen_host.clone(),
+                port,
+            )
+            .await
+            .ok();
+
+            // 状态回到 Stopped
             *self.inner.state.write() = ProcessStatus::Stopped;
             // v3.10：端口被占入 ERROR 日志
             self.inner.log_store.log_business_error(
@@ -274,6 +284,20 @@ impl ProcessLauncherService {
                 "ProcessLauncher:port",
                 &format!("端口 {} 被占用，请关闭占用进程后再试（{}）", port, e),
             );
+
+            // v3.11：发 process_start_failed 事件（含占用方信息）
+            use tauri::Emitter;
+            let _ = app.emit(
+                "process_start_failed",
+                serde_json::json!({
+                    "reason": "port_in_use",
+                    "port": port,
+                    "host": args.listen_host,
+                    "diagnosis": diagnosis,
+                    "error_message": e.to_string(),
+                }),
+            );
+
             return Err(e);
         }
         report(25, &format!("端口 {} 空闲", port));

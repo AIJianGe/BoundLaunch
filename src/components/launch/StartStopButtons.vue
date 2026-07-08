@@ -43,7 +43,7 @@
  */
 
 import { computed, onUnmounted, ref, watch } from "vue";
-import { NButton, NSpin, NProgress, NModal, NSpace, NText } from "naive-ui";
+import { NButton, NSpin, NProgress, NModal, NSpace, NText, useDialog } from "naive-ui";
 import { useRouter } from "vue-router";
 import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
@@ -52,14 +52,19 @@ import { useToast } from "@/composables/useToast";
 import { useConfirm } from "@/composables/useConfirm";
 import { useEnvInstaller } from "@/composables/useEnvInstaller";
 import { useStartComfyui } from "@/composables/useStartComfyui";
+import { useErrorClassifier } from "@/composables/useErrorClassifier";
+import { forceKillAllPython } from "@/api/port_diagnostics";
+import PortConflictModal from "./PortConflictModal.vue";
 
 const router = useRouter();
 const processStore = useProcessStore();
 const envStore = useEnvStore();
 const configStore = useConfigStore();
 const toast = useToast();
+const dialog = useDialog();
 const { confirm: showConfirm } = useConfirm();
 const { installMissingSteps, installing: installingEnv } = useEnvInstaller();
+const { classify: classifyError } = useErrorClassifier();
 
 // v3.4：启动 ComfyUI 专用 composable（包装 processStart + useTaskProgress + 跳转 + 崩溃弹窗）
 const startComfyui = useStartComfyui();
@@ -67,6 +72,11 @@ const startComfyui = useStartComfyui();
 /** v3.4：失败详情弹窗（显示 stderr tail） */
 const showCrashModal = ref(false);
 const crashModalContent = ref("");
+/** v3.11：智能错误分类结果（用于 crashModal 顶部展示） */
+const crashClassification = ref<ReturnType<typeof classifyError> | null>(null);
+
+/** v3.11：强杀按钮 loading 状态 */
+const forceKilling = ref(false);
 
 // v3.4.2：启动耗时倒计时（提交启动后每秒 +1）
 const startElapsedSec = ref(0);
@@ -466,6 +476,11 @@ async function onStart() {
             ? "健康检查发现崩溃"
             : "monitor 检测到退出";
         crashModalContent.value = `ComfyUI ${reasonLabel}（exit code: ${event.exit_code ?? "未知"}）\n\n${formatStderrTail(event.stderr_tail)}`;
+        // v3.11：智能错误分类
+        crashClassification.value = classifyError({
+          exit_code: event.exit_code ?? null,
+          stderr_tail: event.stderr_tail,
+        });
         showCrashModal.value = true;
       },
     });
@@ -492,6 +507,65 @@ async function onStop() {
     toast.error("停止失败", e);
   }
 }
+
+/**
+ * v3.11：强制停止（兜底机制）
+ *
+ * 场景：进程卡在"启动中"或健康检查一直不通过时，用户需要快速脱困
+ * 流程：
+ * 1. 二次确认（提示用户会结束所有 Python 进程）
+ * 2. 先尝试 processStore.stop()（优雅停止）
+ * 3. 等 1.5s，如果状态没变回 stopped，调用 forceKillAllPython 兜底
+ * 4. 不管结果如何，最后强制重置 status 到 stopped
+ */
+async function onForceKill() {
+  if (forceKilling.value) return;
+
+  const confirmed = await new Promise<boolean>((resolve) => {
+    dialog.warning({
+      title: "⏹ 强制停止确认",
+      content:
+        "此操作将强制结束 ComfyUI 进程（包括所有相关 Python 子进程）。\n\n" +
+        "如果 ComfyUI 正在加载模型或处理请求，可能导致未保存的数据丢失。\n\n" +
+        "确定要继续吗？",
+      positiveText: "强制结束",
+      negativeText: "取消",
+      onPositiveClick: () => resolve(true),
+      onNegativeClick: () => resolve(false),
+      onClose: () => resolve(false),
+    });
+  });
+  if (!confirmed) return;
+
+  forceKilling.value = true;
+  toast.warn("正在强制结束 ComfyUI...");
+
+  try {
+    // 1. 先尝试优雅停止
+    try {
+      await processStore.stop();
+    } catch (e) {
+      console.warn("[onForceKill] processStore.stop failed:", e);
+    }
+
+    // 2. 等 1.5s，看是否回到 stopped
+    await new Promise((r) => setTimeout(r, 1500));
+
+    if (processStore.isRunning || processStore.isStarting) {
+      // 3. 兜底：杀所有 Python 进程
+      console.warn("[onForceKill] graceful stop failed, force killing all python");
+      try {
+        await forceKillAllPython();
+        toast.success("已强制结束所有 Python 进程");
+      } catch (e) {
+        console.error("[onForceKill] forceKillAllPython failed:", e);
+        toast.error("强杀失败，请手动结束 Python 进程", String(e));
+      }
+    }
+  } finally {
+    forceKilling.value = false;
+  }
+}
 </script>
 
 <template>
@@ -516,6 +590,20 @@ async function onStop() {
       >
         <NSpin size="small" />
       </div>
+
+      <!-- v3.11：强制停止按钮（兜底）
+           在启动中 / 运行中 / 卡死等场景出现，让用户有"脱困"按钮 -->
+      <NButton
+        v-if="currentState === 'starting' || currentState === 'submitting' || (currentState === 'running' && forceKilling)"
+        type="error"
+        size="large"
+        :loading="forceKilling"
+        :disabled="forceKilling"
+        class="force-kill-button"
+        @click="onForceKill"
+      >
+        ⏹ 强制停止
+      </NButton>
     </div>
 
     <div v-if="buttonConfig.showSublabel && sublabel" class="sublabel">
@@ -551,12 +639,47 @@ async function onStop() {
       size="huge"
     >
       <NSpace vertical>
+        <!-- v3.11：智能错误分类展示 -->
+        <div v-if="crashClassification" class="classification-block">
+          <NAlert
+            :type="crashClassification.severity === 'critical' ? 'error' : crashClassification.severity === 'high' ? 'error' : crashClassification.severity === 'medium' ? 'warning' : 'info'"
+            :show-icon="true"
+          >
+            <template #header>
+              <strong>{{ crashClassification.title }}</strong>
+            </template>
+            <div class="classification-detail">
+              <p>{{ crashClassification.description }}</p>
+              <p class="root-cause">
+                <strong>根因：</strong>{{ crashClassification.root_cause }}
+              </p>
+              <div v-if="crashClassification.recommended_actions.length > 0" class="actions-list">
+                <strong>建议操作：</strong>
+                <ul>
+                  <li
+                    v-for="(action, idx) in crashClassification.recommended_actions"
+                    :key="idx"
+                    :class="{ primary: action.primary }"
+                  >
+                    <span v-if="action.primary">👉 </span>
+                    <span v-else>· </span>
+                    {{ action.label }}
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </NAlert>
+        </div>
+
         <NText depth="3">
           以下是 ComfyUI 进程崩溃前的最后日志（最多 50 行）。可全选复制后到 GitHub Issues 搜索类似错误。
         </NText>
         <pre class="crash-stderr">{{ crashModalContent }}</pre>
       </NSpace>
     </NModal>
+
+    <!-- v3.11：端口被占弹窗（processStore.startFailedReason 触发） -->
+    <PortConflictModal />
   </div>
 </template>
 
@@ -578,6 +701,51 @@ async function onStop() {
   height: 56px;
   font-size: 18px;
   font-weight: 600;
+}
+
+/* v3.11：强制停止按钮（与主按钮同行） */
+.force-kill-button {
+  height: 56px;
+  font-size: 16px;
+  font-weight: 600;
+  min-width: 130px;
+}
+
+/* v3.11：智能错误分类展示 */
+.classification-block {
+  margin-bottom: 12px;
+}
+
+.classification-detail p {
+  margin: 6px 0;
+  line-height: 1.5;
+}
+
+.classification-detail .root-cause {
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+.classification-detail .actions-list {
+  margin-top: 8px;
+  font-size: 13px;
+}
+
+.classification-detail .actions-list ul {
+  margin: 6px 0 0 0;
+  padding-left: 0;
+  list-style: none;
+}
+
+.classification-detail .actions-list li {
+  margin: 4px 0;
+  padding: 4px 0;
+  line-height: 1.4;
+}
+
+.classification-detail .actions-list li.primary {
+  font-weight: 600;
+  color: var(--app-primary, #18a058);
 }
 
 .side-indicator {

@@ -37,6 +37,7 @@ import {
 } from "@/api/process";
 import { listen, type UnlistenFn } from "@/api";
 import type { ComfyUILogEvent, ProcessStatus, ShutdownReason } from "@/api/types";
+import type { ProcessStartFailedEvent } from "@/api/port_diagnostics";
 
 /** 前端日志缓冲最大容量（超出自动剔除最旧） */
 const MAX_LOG_BUFFER = 1000;
@@ -73,6 +74,8 @@ export const useProcessStore = defineStore("process", () => {
   const exitingReason = ref<ShutdownReason | null>(null);
   /** v3.4 新增：最近一次 process_crashed 事件详情（前端弹窗 + LogsPage 顶部展示） */
   const crashedReason = ref<ProcessCrashedEvent | null>(null);
+  /** v3.11 新增：最近一次 process_start_failed 事件详情（端口被占等启动前失败） */
+  const startFailedReason = ref<ProcessStartFailedEvent | null>(null);
 
   const unlisteners: UnlistenFn[] = [];
 
@@ -218,6 +221,13 @@ export const useProcessStore = defineStore("process", () => {
   }
 
   /**
+   * v3.11 新增：清掉 startFailedReason（用户关闭端口冲突弹窗后调用）
+   */
+  function dismissStartFailed() {
+    startFailedReason.value = null;
+  }
+
+  /**
    * F24 退出流程：设置退出中标记
    *
    * 启动页按钮据此 disabled + 显示 spinner + 「正在退出...」
@@ -278,6 +288,20 @@ export const useProcessStore = defineStore("process", () => {
         };
         console.error("[processStore] process_crashed", e.payload);
       }),
+      // v3.11 新增：process_start_failed 事件
+      // - 端口被占：reason="port_in_use"，含 diagnosis
+      // - 启动前其他失败
+      // 启动失败时端口预检阶段就会 emit，不需要等 spawn
+      await listen<ProcessStartFailedEvent>("process_start_failed", (e) => {
+        startFailedReason.value = e.payload;
+        // 启动前失败 → 状态机重置为 stopped
+        status.value = { kind: "stopped" };
+        const reasonText = e.payload.reason === "port_in_use"
+          ? `端口 ${e.payload.port} 被占用`
+          : "启动失败";
+        error.value = `${reasonText}：${e.payload.error_message}`;
+        console.warn("[processStore] process_start_failed", e.payload);
+      }),
       // v3.2.2 修复：事件名 `log` → `comfyui_log`（后端 log_pipeline.rs:185）
       // payload 是 { source, line, ts }，不是字符串
       await listen<ComfyUILogEvent>("comfyui_log", (e) => {
@@ -326,6 +350,7 @@ export const useProcessStore = defineStore("process", () => {
     isExiting,
     exitingReason,
     crashedReason, // v3.4
+    startFailedReason, // v3.11
     // getters
     isRunning,
     isStarting,
@@ -344,6 +369,7 @@ export const useProcessStore = defineStore("process", () => {
     killStale,
     dismissStale,
     dismissCrashed, // v3.4
+    dismissStartFailed, // v3.11
     setExiting,
     subscribe,
     unsubscribe,

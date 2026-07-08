@@ -450,6 +450,11 @@ pub fn run() {
             commands::pseudo_terminal::pty_close,
             commands::pseudo_terminal::pty_list_sessions,
             commands::pseudo_terminal::pty_get_session,
+            // 端口诊断 + 强杀
+            commands::port_diagnostics::diagnose_port,
+            commands::port_diagnostics::force_kill_process,
+            commands::port_diagnostics::force_kill_all_python,
+            commands::port_diagnostics::force_kill_all_comfyui,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

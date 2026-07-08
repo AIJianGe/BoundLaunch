@@ -42,6 +42,7 @@ import {
   NModal,
   NText,
   NSpin,
+  useDialog,
 } from "naive-ui";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -54,6 +55,9 @@ import { logQuery, logClear } from "@/api/log";
 import { listen, type UnlistenFn } from "@/api";
 import { useToast } from "@/composables/useToast";
 import { useErrorLog } from "@/composables/useErrorLog";
+import { useErrorClassifier } from "@/composables/useErrorClassifier";
+import { forceKillAllPython } from "@/api/port_diagnostics";
+import PortConflictModal from "@/components/launch/PortConflictModal.vue";
 import { Plus, X, Terminal as TerminalIcon, ChevronDown, ChevronUp } from "lucide-vue-next";
 import type { LogEntry, LogLevel, TaskProgressEvent, TaskTerminalEvent } from "@/api/types";
 
@@ -82,6 +86,17 @@ let startTimerHandle: number | null = null;
 
 // v3.4：失败详情弹窗（从 processStore.crashedReason 同步）
 const showCrashModal = computed(() => processStore.crashedReason !== null);
+
+/** v3.11：崩溃智能错误分类（用于弹窗顶部展示） */
+const { classify: classifyError } = useErrorClassifier();
+const crashClassification = computed(() => {
+  const r = processStore.crashedReason;
+  if (!r) return null;
+  return classifyError({
+    exit_code: r.exit_code ?? null,
+    stderr_tail: r.stderr_tail,
+  });
+});
 
 /** 关闭失败弹窗 */
 function dismissCrash() {
@@ -227,6 +242,59 @@ function formatElapsed(sec: number): string {
   return m > 0 ? `${m}分${s}秒` : `${s}秒`;
 }
 
+/** v3.11：强杀 loading 状态 */
+const forceKilling = ref(false);
+/** v3.11：强杀对话框（naive-ui） */
+const dialog = useDialog();
+
+/**
+ * v3.11：强制停止（兜底机制）
+ *
+ * 场景：进程卡在"启动中"时用户需要快速脱困
+ * 流程：
+ * 1. 二次确认
+ * 2. 调 processStore.stop() 优雅停止
+ * 3. 等 1.5s，状态没回 stopped 就 forceKillAllPython 兜底
+ */
+async function onForceKill() {
+  if (forceKilling.value) return;
+  const confirmed = await new Promise<boolean>((resolve) => {
+    dialog.warning({
+      title: "⏹ 强制停止确认",
+      content:
+        "此操作将强制结束 ComfyUI 进程（包括所有相关 Python 子进程）。\n\n" +
+        "正在加载的模型或处理中的请求可能被中断。\n\n" +
+        "确定要继续吗？",
+      positiveText: "强制结束",
+      negativeText: "取消",
+      onPositiveClick: () => resolve(true),
+      onNegativeClick: () => resolve(false),
+      onClose: () => resolve(false),
+    });
+  });
+  if (!confirmed) return;
+  forceKilling.value = true;
+  toast.warn("正在强制结束 ComfyUI...");
+  try {
+    try {
+      await processStore.stop();
+    } catch (e) {
+      console.warn("[onForceKill] processStore.stop failed:", e);
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+    if (processStore.isRunning || processStore.isStarting) {
+      try {
+        await forceKillAllPython();
+        toast.success("已强制结束所有 Python 进程");
+      } catch (e) {
+        toast.error("强杀失败，请手动结束 Python 进程", String(e));
+      }
+    }
+  } finally {
+    forceKilling.value = false;
+  }
+}
+
 /** v3.10：格式化错误时间（ISO 8601 → "HH:MM:SS"） */
 function formatErrorTime(iso: string): string {
   return iso.split("T")[1]?.split(".")[0] || iso;
@@ -284,8 +352,16 @@ onMounted(async () => {
     console.warn("task load:", e);
   }
 
-  // 初始化伪终端
+  // 初始化伪终端（等 DOM 完全渲染后）
+  await nextTick();
   initPtyTerminal();
+  await nextTick();
+  if (fitAddon) {
+    fitAddon.fit();
+  }
+  if (term) {
+    term.focus();
+  }
   await setupPtyListeners();
   await loadPtySessions();
   if (ptySessions.value.length === 0) {
@@ -327,7 +403,16 @@ function toggleTerminal() {
       if (fitAddon) {
         fitAddon.fit();
       }
+      if (term) {
+        term.focus();
+      }
     });
+  }
+}
+
+function onTerminalClick() {
+  if (term) {
+    term.focus();
   }
 }
 
@@ -390,10 +475,18 @@ function initPtyTerminal() {
   window.addEventListener("resize", handleTerminalResize);
 }
 
+let resizeTimer: number | null = null;
 function handleTerminalResize() {
-  if (fitAddon && !terminalCollapsed.value) {
-    fitAddon.fit();
+  if (terminalCollapsed.value) return;
+  if (resizeTimer !== null) {
+    window.clearTimeout(resizeTimer);
   }
+  resizeTimer = window.setTimeout(() => {
+    if (fitAddon) {
+      fitAddon.fit();
+    }
+    resizeTimer = null;
+  }, 100);
 }
 
 function base64Decode(b64: string): string {
@@ -422,9 +515,11 @@ async function createPtySession() {
     activeSessionId.value = info.session_id;
     if (term) {
       term.clear();
+      term.focus();
     }
   } catch (e) {
     console.error("Failed to create pty session:", e);
+    toast.error("终端创建失败", String(e));
   }
 }
 
@@ -548,7 +643,19 @@ function formatCrashReason(reason: string): string {
             <NSpin size="small" class="start-spin" />
             🚀 ComfyUI 启动中...
           </span>
-          <NTag size="small" type="info">已等待 {{ formatElapsed(startElapsedSec) }}</NTag>
+          <NSpace>
+            <NTag size="small" type="info">已等待 {{ formatElapsed(startElapsedSec) }}</NTag>
+            <!-- v3.11：强制停止按钮（兜底） -->
+            <NButton
+              type="error"
+              size="small"
+              :loading="forceKilling"
+              :disabled="forceKilling"
+              @click="onForceKill"
+            >
+              ⏹ 强制停止
+            </NButton>
+          </NSpace>
         </div>
         <div class="start-progress-message">
           {{ startTaskMessage || "准备中..." }}
@@ -709,7 +816,7 @@ function formatCrashReason(reason: string): string {
         </div>
       </div>
       <div v-show="!terminalCollapsed" class="terminal-container-wrapper">
-        <div ref="terminalContainer" class="terminal-container"></div>
+        <div ref="terminalContainer" class="terminal-container" @click="onTerminalClick"></div>
       </div>
     </NCard>
 
@@ -724,6 +831,37 @@ function formatCrashReason(reason: string): string {
       :on-update:show="(v: boolean) => !v && dismissCrash()"
     >
       <NSpace v-if="processStore.crashedReason" vertical>
+        <!-- v3.11：智能错误分类展示 -->
+        <NAlert
+          v-if="crashClassification"
+          :type="crashClassification.severity === 'critical' || crashClassification.severity === 'high' ? 'error' : crashClassification.severity === 'medium' ? 'warning' : 'info'"
+          :show-icon="true"
+        >
+          <template #header>
+            <strong>{{ crashClassification.title }}</strong>
+          </template>
+          <div class="classification-detail">
+            <p>{{ crashClassification.description }}</p>
+            <p class="root-cause">
+              <strong>根因：</strong>{{ crashClassification.root_cause }}
+            </p>
+            <div v-if="crashClassification.recommended_actions.length > 0" class="actions-list">
+              <strong>建议操作：</strong>
+              <ul>
+                <li
+                  v-for="(action, idx) in crashClassification.recommended_actions"
+                  :key="idx"
+                  :class="{ primary: action.primary }"
+                >
+                  <span v-if="action.primary">👉 </span>
+                  <span v-else>· </span>
+                  {{ action.label }}
+                </li>
+              </ul>
+            </div>
+          </div>
+        </NAlert>
+
         <div class="crash-info">
           <NText strong>原因：</NText>
           <NText>{{ formatCrashReason(processStore.crashedReason.reason) }}</NText>
@@ -738,6 +876,9 @@ function formatCrashReason(reason: string): string {
         <pre class="crash-stderr">{{ processStore.crashedReason.stderr_tail.join("\n") || "(无 stderr 输出)" }}</pre>
       </NSpace>
     </NModal>
+
+    <!-- v3.11：端口被占弹窗（processStore.startFailedReason 触发） -->
+    <PortConflictModal />
   </div>
 </template>
 
@@ -746,6 +887,12 @@ function formatCrashReason(reason: string): string {
   padding: 16px;
   max-width: 1400px;
   margin: 0 auto;
+  height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  overflow: hidden;
+  box-sizing: border-box;
 }
 
 /* v3.10：错误面板（顶部置顶） */
@@ -753,6 +900,7 @@ function formatCrashReason(reason: string): string {
   margin-bottom: 12px;
   border-color: #d03050;
   background: linear-gradient(135deg, #fef0f0 0%, #ffffff 100%);
+  flex-shrink: 0;
 }
 
 .error-panel-header {
@@ -828,6 +976,7 @@ function formatCrashReason(reason: string): string {
   margin-bottom: 12px;
   background: linear-gradient(135deg, #e3f2fd 0%, #ffffff 100%);
   border-color: #90caf9;
+  flex-shrink: 0;
 }
 
 .start-progress-header {
@@ -862,6 +1011,7 @@ function formatCrashReason(reason: string): string {
 
 .toolbar {
   margin-bottom: 12px;
+  flex-shrink: 0;
 }
 
 .toolbar-row {
@@ -881,8 +1031,10 @@ function formatCrashReason(reason: string): string {
 }
 
 .log-card {
-  height: calc(100vh - 280px);
-  min-height: 400px;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .card-header {
@@ -909,7 +1061,7 @@ function formatCrashReason(reason: string): string {
 }
 
 .log-container {
-  height: calc(100% - 40px);
+  flex: 1;
   overflow-y: auto;
   font-family: "JetBrains Mono", "Cascadia Code", "Fira Code", Consolas, monospace;
   font-size: 12px;
@@ -917,6 +1069,14 @@ function formatCrashReason(reason: string): string {
   background: var(--app-bg-code, rgba(0, 0, 0, 0.06));
   border-radius: 4px;
   padding: 8px;
+}
+
+:deep(.log-card .n-card__content) {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding-top: 0 !important;
 }
 
 .log-line {
@@ -958,6 +1118,39 @@ function formatCrashReason(reason: string): string {
   align-items: center;
 }
 
+/* v3.11：智能错误分类展示样式 */
+.classification-detail p {
+  margin: 6px 0;
+  line-height: 1.5;
+}
+
+.classification-detail .root-cause {
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+.classification-detail .actions-list {
+  margin-top: 8px;
+  font-size: 13px;
+}
+
+.classification-detail .actions-list ul {
+  margin: 6px 0 0 0;
+  padding-left: 0;
+  list-style: none;
+}
+
+.classification-detail .actions-list li {
+  margin: 4px 0;
+  padding: 4px 0;
+  line-height: 1.4;
+}
+
+.classification-detail .actions-list li.primary {
+  font-weight: 600;
+  color: var(--app-primary, #18a058);
+}
+
 .crash-stderr {
   margin: 0;
   padding: 12px;
@@ -976,7 +1169,13 @@ function formatCrashReason(reason: string): string {
 
 /* 伪终端面板 */
 .terminal-card {
+  flex-shrink: 0;
   margin-top: 12px;
+}
+
+:deep(.terminal-card .n-card__content) {
+  padding-top: 0 !important;
+  padding-bottom: 12px !important;
 }
 
 .terminal-header {
