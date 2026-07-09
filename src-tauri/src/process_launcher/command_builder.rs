@@ -24,6 +24,13 @@ use crate::process_launcher::models::LaunchArgs;
 pub fn build_command(args: &LaunchArgs) -> Vec<String> {
     let mut cmd: Vec<String> = vec!["main.py".into()];
 
+    // v3.x：--base-directory（custom_nodes 在 ComfyUI 外时使用）
+    // 见 LaunchArgs::base_directory 字段说明
+    if let Some(base_dir) = &args.base_directory {
+        cmd.push("--base-directory".into());
+        cmd.push(base_dir.to_string_lossy().to_string());
+    }
+
     // 显存策略（复用 LaunchMode::to_args）
     cmd.extend(args.mode.to_args().iter().map(|s| s.to_string()));
 
@@ -141,6 +148,8 @@ mod tests {
             auto_launch: false,
             advanced: AdvancedArgs::default(),
             custom_args: None,
+            // v3.x：默认不传 --base-directory
+            base_directory: None,
         }
     }
 
@@ -244,5 +253,25 @@ mod tests {
         assert!(filtered.contains(&"autoencoder".to_string()));
         assert!(filtered.contains(&"1234".to_string()));
         assert!(filtered.contains(&"/path/to/something".to_string()));
+    }
+
+    // v3.x：--base-directory 行为测试
+    #[test]
+    fn test_build_command_with_base_directory() {
+        let mut args = make_args(LaunchMode::GpuHigh);
+        args.base_directory = Some(std::path::PathBuf::from("/custom/env"));
+        let cmd = build_command(&args);
+        // 验证 --base-directory 出现在 cmd 中
+        let pos = cmd.iter().position(|s| s == "--base-directory");
+        assert!(pos.is_some(), "--base-directory 应该被加入");
+        assert_eq!(cmd[pos.unwrap() + 1], "/custom/env");
+    }
+
+    #[test]
+    fn test_build_command_without_base_directory() {
+        let args = make_args(LaunchMode::GpuHigh);
+        let cmd = build_command(&args);
+        // 默认不传 --base-directory
+        assert!(!cmd.contains(&"--base-directory".to_string()));
     }
 }

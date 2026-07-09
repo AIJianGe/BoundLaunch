@@ -139,14 +139,19 @@ echo.
 echo ------------------------------------------------------------
 echo  Select build mode:
 echo ------------------------------------------------------------
-echo   [1] Full build - recommended for release, with tests
-echo   [2] Fast build - skip tests, for dev iteration
-echo   [3] NSIS installer - .exe, Windows only
-echo   [4] MSI installer - for enterprise deployment
-echo   [5] Debug mode - no optimization, compile check only
+echo   [1] Full build   - MSI + NSIS installers (for distribution)
+echo   [2] Fast build   - MSI + NSIS, skip tests (dev iteration)
+echo   [3] NSIS only    - .exe installer (Windows)
+echo   [4] MSI only     - .msi installer (enterprise)
+echo   [5] Debug mode   - no optimization, compile check only
+echo   [6] Portable     - GREEN version, ZIP, no install needed (v3.x RECOMMENDED)
+echo   [7] All-in-one   - MSI + NSIS + Portable ZIP (full distribution package)
 echo   [0] Exit
 echo ------------------------------------------------------------
-set /p CHOICE=Enter choice [1/2/3/4/5/0]:
+echo   Tip: For daily use, choose [6] Portable (extract ZIP -^> run .exe).
+echo        For distribution to other users, choose [7] All-in-one.
+echo ------------------------------------------------------------
+set /p CHOICE=Enter choice [1/2/3/4/5/6/7/0]:
 
 set BUILD_ARGS=
 if "%CHOICE%"=="1" goto :choice_1
@@ -154,6 +159,8 @@ if "%CHOICE%"=="2" goto :choice_2
 if "%CHOICE%"=="3" goto :choice_3
 if "%CHOICE%"=="4" goto :choice_4
 if "%CHOICE%"=="5" goto :choice_5
+if "%CHOICE%"=="6" goto :choice_6
+if "%CHOICE%"=="7" goto :choice_7
 if "%CHOICE%"=="0" goto :choice_exit
 echo [ERROR] Invalid choice: %CHOICE%
 pause
@@ -178,6 +185,29 @@ goto :start_build
 :choice_5
 set BUILD_ARGS=--debug --skip-tests
 goto :start_build
+
+:choice_6
+echo [INFO] Building portable (green) version...
+node scripts\build_portable.mjs %BUILD_ARGS%
+set EXIT_CODE=%ERRORLEVEL%
+goto :report
+
+:choice_7
+echo.
+echo [INFO] All-in-one build: MSI + NSIS + Portable ZIP
+echo [INFO] Step 1/2: Building MSI + NSIS installers...
+node build.mjs --skip-tests
+set EXIT_CODE_STEP1=%ERRORLEVEL%
+if not "%EXIT_CODE_STEP1%"=="0" (
+  echo [ERROR] Step 1 (installers) failed with code %EXIT_CODE_STEP1%
+  set EXIT_CODE=%EXIT_CODE_STEP1%
+  goto :report
+)
+echo.
+echo [INFO] Step 2/2: Building Portable ZIP (reuse release binary)...
+node scripts\build_portable.mjs --skip-build
+set EXIT_CODE=%ERRORLEVEL%
+goto :report
 
 :choice_exit
 exit /b 0

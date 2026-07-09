@@ -33,3 +33,6 @@ pub type SharedConfig = arc_swap::ArcSwap<Config>;
 ///
 /// 用于未来配置结构变更时的迁移
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+// re-export env_paths 子模块（v3.x）
+pub use crate::paths::env_paths;

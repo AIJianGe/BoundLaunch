@@ -35,7 +35,11 @@ const MAIN_WINDOW_LABEL: &str = "main";
 /// 创建系统托盘 + 菜单
 ///
 /// 在 lib.rs setup 钩子中调用一次。
-pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+///
+/// **v3.x**：接受 `env_name: Option<String>` 用于托盘 tooltip 显示环境名，
+/// 便于多环境同时运行时区分（窗口标题也加 env_name，但用户可能最小化看不到，
+/// tooltip 是托盘悬停唯一信息源）。
+pub fn setup<R: Runtime>(app: &AppHandle<R>, env_name: Option<String>) -> tauri::Result<()> {
     // 菜单项
     let start = MenuItem::with_id(app, MENU_ID_START, "▶ 启动 ComfyUI", true, None::<&str>)?;
     let stop = MenuItem::with_id(app, MENU_ID_STOP, "⏹ 停止 ComfyUI", true, None::<&str>)?;
@@ -51,16 +55,23 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .cloned()
         .ok_or_else(|| tauri::Error::Anyhow(anyhow::anyhow!("default window icon not found")))?;
 
+    // v3.x：托盘 tooltip 包含 env_name（多环境时区分）
+    // 单一环境走 "无界启动器"（与原行为一致）
+    let tooltip = match env_name.as_deref() {
+        Some(name) => format!("无界启动器 — {}", name),
+        None => "无界启动器".to_string(),
+    };
+
     let _tray = TrayIconBuilder::with_id("main-tray")
         .icon(default_icon)
-        .tooltip("无界启动器")
+        .tooltip(&tooltip)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(handle_menu_event)
         .on_tray_icon_event(handle_tray_icon_event)
         .build(app)?;
 
-    tracing::info!("system tray initialized");
+    tracing::info!(tooltip = %tooltip, "system tray initialized");
     Ok(())
 }
 

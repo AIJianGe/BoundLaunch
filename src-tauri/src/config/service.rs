@@ -275,8 +275,68 @@ fn build_default_config() -> Config {
 /// - `venv_path` 为空 → 设置为 `<app_data_dir>/venv`（v3.1 / F26 决策 1：venv 独立于 ComfyUI 仓库）
 /// - `models_path` 不在此处设置（保持 `None`，由用户在设置页显式配置）
 ///
+/// **v3.x 增强**：启动时调 `env_paths::resolve()`：
+/// - 如果 `launcher-portable.dat` 存在（绿色版模式）→ 用它定义的路径
+/// - 否则（传统安装模式）→ 走原有的 v1.8 逻辑
+///
 /// 已配置的路径不会被覆盖（保证老用户的 config.toml 不会被打乱）。
 fn apply_default_paths(cfg: &mut Config) {
+    // v3.x：先尝试 portable 模式（launcher-portable.dat 存在时）
+    match crate::paths::env_paths::resolve() {
+        Ok(resolved) => {
+            tracing::info!(
+                "[env_paths] portable mode active: env_root={} env_name={} port={}",
+                resolved.env_root.display(),
+                resolved.env_name,
+                resolved.port
+            );
+            tracing::info!(
+                "[env_paths] comfyui={} venv={} custom_nodes={} (in_comfyui={})",
+                resolved.comfyui_root.display(),
+                resolved.venv_path.display(),
+                resolved.custom_nodes.display(),
+                resolved.custom_nodes_in_comfyui
+            );
+
+            // comfyui_root 必填（绿色版用 resolved 覆盖）
+            if cfg.paths.comfyui_root.as_os_str().is_empty() {
+                cfg.paths.comfyui_root = resolved.comfyui_root.clone();
+            }
+            // venv 必填
+            if cfg.paths.venv_path.as_os_str().is_empty() {
+                cfg.paths.venv_path = resolved.venv_path.clone();
+            }
+            // v3.x：custom_nodes 路径
+            if cfg.paths.custom_nodes_path.is_none() {
+                cfg.paths.custom_nodes_path = Some(resolved.custom_nodes.clone());
+            }
+            // v3.x：ComfyUI base_directory
+            if cfg.paths.comfyui_base_directory.is_none() && resolved.override_base_directory {
+                // custom_nodes 在 ComfyUI 外 → 传 custom_nodes 父目录作为 base
+                let base = resolved.custom_nodes.parent()
+                    .unwrap_or(&resolved.comfyui_root)
+                    .to_path_buf();
+                cfg.paths.comfyui_base_directory = Some(base);
+            }
+            // v3.x：环境名
+            if cfg.env_name.is_none() {
+                cfg.env_name = Some(resolved.env_name.clone());
+            }
+            // v3.x：端口（来自 portable.dat）
+            if resolved.port != 8188 {
+                // 只有非默认值才覆盖（避免误改老用户的 config）
+                cfg.launch.listen_port = resolved.port;
+            }
+            return;
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "env_paths::resolve 失败，回退到 v1.8 默认逻辑"
+            );
+        }
+    }
+
     // 关键：comfyui_root 必须是 portable_base_dir 的**子目录**（如 "ComfyUI"），
     // 不能直接等于 portable_base_dir 本身。原因：
     //   - portable_base_dir 通常已包含 launcher 自己的 .git、node_modules、src/ 等
@@ -297,6 +357,10 @@ fn apply_default_paths(cfg: &mut Config) {
     //   - 用户已配置的路径保留不动（向后兼容）
     if cfg.paths.venv_path.as_os_str().is_empty() {
         cfg.paths.venv_path = paths::app_data_dir().join("venv");
+    }
+    // v3.x：传统模式下默认 custom_nodes = `<comfyui_root>/custom_nodes`
+    if cfg.paths.custom_nodes_path.is_none() {
+        cfg.paths.custom_nodes_path = Some(cfg.paths.comfyui_root.join("custom_nodes"));
     }
 }
 

@@ -307,8 +307,14 @@ impl PluginManagerService {
     }
 
     /// 读取当前 custom_nodes 路径（每次调用读最新 config）
-    fn current_custom_nodes_path(&self) -> PathBuf {
-        self.config.get().paths.comfyui_root.join("custom_nodes")
+    ///
+    /// v3.x：优先用 `custom_nodes_path`，fallback 到 `<comfyui_root>/custom_nodes`
+    /// （用户配置 custom_nodes 在 ComfyUI 外时，custom_nodes_path 会被设置）
+    pub fn current_custom_nodes_path(&self) -> PathBuf {
+        let cfg = self.config.get();
+        cfg.paths.custom_nodes_path
+            .clone()
+            .unwrap_or_else(|| cfg.paths.comfyui_root.join("custom_nodes"))
     }
 
     /// 读取当前 venv 路径（每次调用读最新 config）

@@ -21,6 +21,12 @@ pub struct Config {
     pub ui: UiConfig,
     /// 配置 schema 版本，用于迁移
     pub schema_version: u32,
+    /// v3.x：环境名（来自 launcher-portable.dat 或目录名）
+    ///
+    /// - 用于日志、UI 显示、数据库命名空间
+    /// - 不参与路径解析
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_name: Option<String>,
 }
 
 /// 路径配置
@@ -72,6 +78,32 @@ pub struct PathsConfig {
     /// 降级到自动规则 + warn 日志（不阻塞 onboarding）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation_default_version: Option<String>,
+    /// v3.x：custom_nodes 绝对路径
+    ///
+    /// 优先级（启动时由 `paths::env_paths::resolve` 决定）：
+    /// 1. `launcher-portable.dat` 的 `paths.custom_nodes`（绝对路径或相对 env_root）
+    /// 2. 默认 `<comfyui_root>/custom_nodes/`（即 ComfyUI 内）
+    ///
+    /// **运行时如何生效**：
+    /// - 业务代码（plugin_manager）从这里读
+    /// - ComfyUI 启动时是否生效，取决于 `comfyui_base_directory` 字段：
+    ///   - `comfyui_base_directory == comfyui_root` → ComfyUI 用 `folder_paths.py:41` 默认 → 找到这里
+    ///   - 不等 → launcher 启动 ComfyUI 时加 `--base-directory <...>` 让 ComfyUI 用新 base
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_nodes_path: Option<PathBuf>,
+    /// v3.x：ComfyUI 启动时要传的 `--base-directory` 参数值
+    ///
+    /// **何时生效**：
+    /// - `Some(path)`：launcher 启动 ComfyUI 时加 `--base-directory <path>`
+    ///   → ComfyUI 内部 `folder_paths.py` 的 `base_path` 变成这个值
+    ///   → `custom_nodes / models / input / output` 都从这下面找
+    /// - `None`：不传 → ComfyUI 用自己的 base_path（`folder_paths.py` 所在目录）
+    ///
+    /// **典型用法**：
+    /// - 默认：`None`（不传）→ ComfyUI 内部默认
+    /// - 自定义 custom_nodes 在 ComfyUI 外：`Some(custom_nodes 父目录)`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comfyui_base_directory: Option<PathBuf>,
 }
 
 /// 启动配置
@@ -351,6 +383,9 @@ impl Default for Config {
                 models_path: None,
                 comfyui_repo_url: None,
                 installation_default_version: None,
+                // v3.x：custom_nodes / comfyui_base_directory 启动时由 env_paths 填充
+                custom_nodes_path: None,
+                comfyui_base_directory: None,
             },
             launch: LaunchConfig {
                 mode: LaunchMode::GpuHigh,
@@ -377,6 +412,8 @@ impl Default for Config {
                 minimize_to_tray: true,
             },
             schema_version: super::CURRENT_SCHEMA_VERSION,
+            // v3.x：环境名（首次启动时由 env_paths::resolve 填充）
+            env_name: None,
         }
     }
 }
@@ -414,6 +451,14 @@ pub struct PathsConfigPatch {
     /// - `Some("")`：清空（恢复走自动规则）
     /// - `Some(非空)`：用户显式指定
     pub installation_default_version: Option<String>,
+    /// v3.x：custom_nodes 绝对路径（高级用户配置）
+    /// - `None`：跳过（用 env_paths 解析的默认值）
+    /// - `Some(path)`：显式设置
+    pub custom_nodes_path: Option<PathBuf>,
+    /// v3.x：ComfyUI 启动时传的 `--base-directory` 参数
+    /// - `None`：不传
+    /// - `Some(path)`：传这个值
+    pub comfyui_base_directory: Option<PathBuf>,
 }
 
 /// Launch section 的 patch
@@ -504,6 +549,24 @@ pub fn apply_paths_patch(cfg: &mut PathsConfig, patch: PathsConfigPatch) {
             cfg.installation_default_version = None;
         } else {
             cfg.installation_default_version = Some(v);
+        }
+    }
+    // v3.x：custom_nodes_path（高级用户配置）
+    // - 业务代码通常不通过 patch 改这个字段（启动时由 env_paths 自动设置）
+    // - 这里保留 patch 支持，方便测试和未来 UI 直接编辑
+    if let Some(v) = patch.custom_nodes_path {
+        if v.as_os_str().is_empty() {
+            cfg.custom_nodes_path = None;
+        } else {
+            cfg.custom_nodes_path = Some(normalize_path_separators(&v));
+        }
+    }
+    // v3.x：comfyui_base_directory（高级用户配置）
+    if let Some(v) = patch.comfyui_base_directory {
+        if v.as_os_str().is_empty() {
+            cfg.comfyui_base_directory = None;
+        } else {
+            cfg.comfyui_base_directory = Some(normalize_path_separators(&v));
         }
     }
 }

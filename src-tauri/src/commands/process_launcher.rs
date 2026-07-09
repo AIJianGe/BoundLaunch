@@ -51,6 +51,9 @@ fn build_launch_args_from_config(cfg: &crate::config::Config) -> LaunchArgs {
         auto_launch: launch.auto_open_browser,
         advanced: launch.advanced.clone(),
         custom_args,
+        // v3.x：custom_nodes 在 ComfyUI 外时传 --base-directory
+        // 见 PathsConfig::comfyui_base_directory 字段说明
+        base_directory: cfg.paths.comfyui_base_directory.clone(),
     }
 }
 
@@ -249,6 +252,9 @@ mod tests {
                 models_path: None,
                 comfyui_repo_url: None,
                 installation_default_version: None,
+                // v3.x：custom_nodes / base_directory 在测试中保持 None
+                custom_nodes_path: None,
+                comfyui_base_directory: None,
             },
             launch: LaunchConfig {
                 mode,
@@ -273,6 +279,8 @@ mod tests {
                 minimize_to_tray: true,
             },
             schema_version: 1,
+            // v3.x：环境名（测试中不关心）
+            env_name: None,
         }
     }
 

@@ -10,6 +10,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 // 复用 Config 中的类型，减少冗余
 pub use crate::config::{AdvancedArgs, LaunchMode, PreviewMethod};
@@ -35,6 +36,14 @@ pub struct LaunchArgs {
     pub advanced: AdvancedArgs,
     /// 自定义启动参数（仅 `LaunchMode::Custom` 时使用，空字符串视为 None）
     pub custom_args: Option<String>,
+    /// v3.x：ComfyUI `--base-directory` 参数
+    ///
+    /// - `None`：不传 → ComfyUI 用 `folder_paths.py:41` 的默认 base_path
+    /// - `Some(path)`：传 `--base-directory <path>` → ComfyUI 内部 base_path 变成这个值
+    ///   → custom_nodes / models / input / output 都从这下面找
+    ///
+    /// 典型用法：custom_nodes 放在 ComfyUI 外时，传 custom_nodes 父目录
+    pub base_directory: Option<PathBuf>,
 }
 
 impl LaunchArgs {
@@ -49,6 +58,8 @@ impl LaunchArgs {
             auto_launch: true,
             advanced: AdvancedArgs::default(),
             custom_args: None,
+            // v3.x：默认不传 --base-directory
+            base_directory: None,
         }
     }
 }

@@ -24,6 +24,7 @@ mod env_inspector;
 mod error;
 mod event_bus;
 mod log_store;
+mod paths;  // v3.x：paths 模块入口（含 env_paths 绿色版路径解析）
 mod plugin_manager;
 mod process_launcher;
 mod pseudo_terminal;
@@ -33,7 +34,7 @@ mod task_scheduler;
 mod tray;
 mod uv_sidecar;
 
-use crate::common::paths;
+use crate::common::paths as common_paths;
 use crate::config::ConfigService;
 use crate::core_manager::CoreManagerService;
 use crate::env_inspector::EnvironmentInspectorService;
@@ -54,6 +55,51 @@ pub fn run() {
         .init();
 
     tracing::info!("BoundLaunch launcher starting up...");
+
+    // v3.x：启动期解析 portable 路径，用于 WebView2 UserData 重定向
+    //
+    // **问题**：Tauri 2.x 默认把 WebView2 UserData（Cache、Cookies、IndexedDB 等）
+    // 写到 `%LOCALAPPDATA%\<identifier>\EBWebView\`（C 盘）。两个相同 identifier 的
+    // BoundLaunch 同时启动会触发 WebView2 的 lock 文件冲突，第二个进程直接退出。
+    //
+    // **方案 A**：启动时调 `env_paths::resolve()` 拿到 env_root（exe 所在目录），
+    // 把 webview2 data 目录重定向到 `<env_root>/.boundlaunch/webview2/`。
+    // 每个绿色版环境（复制多份）天然独立，零冲突。
+    //
+    // **必须**在 setup 闭包外解析——因为 `webview2_data_dir` 需要在 tauri::Builder
+    // 启动前就准备好，再 move 进 setup 用 WebviewWindowBuilder::data_directory()
+    // 传给 WebView2。
+    //
+    // **失败回退**：resolve 失败（不是绿色版模式，比如开发模式或安装版）时，
+    // 用空 PathBuf 标记"不重定向"，走 Tauri 默认路径——不阻塞启动。
+    let (webview2_data_dir, env_name_for_window) = match crate::paths::env_paths::resolve() {
+        Ok(env_paths) => {
+            let dir = env_paths.boundlaunch_data.join("webview2");
+            let env_name = env_paths.env_name.clone();
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                tracing::warn!(
+                    error = %e,
+                    dir = %dir.display(),
+                    "failed to create webview2 data dir, fallback to Tauri default"
+                );
+                (std::path::PathBuf::new(), Some(env_name))
+            } else {
+                tracing::info!(
+                    env_name = %env_name,
+                    webview2_dir = %dir.display(),
+                    "v3.x portable: WebView2 UserData isolated to env_root"
+                );
+                (dir, Some(env_name))
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "v3.x: failed to resolve env_paths, WebView2 will use default location"
+            );
+            (std::path::PathBuf::new(), None)
+        }
+    };
 
     // v3.10：启动期 VC++ Runtime 检测（解决"prod 打包后用户机器少 VCRUNTIME140.dll，弹英文错误后消失"问题）
     //
@@ -82,7 +128,56 @@ pub fn run() {
     .plugin(tauri_plugin_shell::init())
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_process::init())
-        .setup(|app| {
+        .setup(move |app| {
+            // v3.x：动态创建主窗口
+            //
+            // **背景**：tauri.conf.json::app.windows 已改为 []（见配置文件），
+            // 由本闭包用 WebviewWindowBuilder 显式创建。这样做的目的：
+            // 1. 传 data_directory 重定向 WebView2 UserData 到 env_root 旁
+            //    （避免两个绿色版同时启动时 %LOCALAPPDATA%\<id>\EBWebView 锁冲突）
+            // 2. 窗口 title 加 env_name（任务栏区分多实例）
+            //
+            // **配置同步**：原 tauri.conf.json::app.windows 段所有属性在此显式列出
+            // （width=1200 height=800 minWidth=960 minHeight=640 resizable center title），
+            // 修改 tauri.conf.json 时请同步这里（这是 Tauri 2.x 的已知限制：
+            // static config 和 dynamic builder 不能完全替代）。
+            let mut window_builder = tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::App("index.html".into()),
+            )
+            .title({
+                // 窗口标题：多环境时显示 env_name 便于区分
+                // 单一环境（默认安装版）保持原始 "无界启动器"
+                match &env_name_for_window {
+                    Some(name) => format!("无界启动器 — {}", name),
+                    None => "无界启动器".to_string(),
+                }
+            })
+            .inner_size(1200.0, 800.0)
+            .min_inner_size(960.0, 640.0)
+            .resizable(true)
+            .center()
+            .fullscreen(false);
+
+            // v3.x：仅当 webview2_data_dir 有效（绿色版模式）时传 data_directory
+            // 路径非空 = 用户使用绿色版；空 = 走 Tauri 默认（开发模式 / 安装版 / 解析失败）
+            //
+            // **WebView2 data_directory 行为**：
+            // - 传 Some(abs_path)：WebView2 把 cache/cookies/IndexedDB 全部写到 abs_path
+            // - 传 None：默认 `%LOCALAPPDATA%\<identifier>\EBWebView`（C 盘，会冲突）
+            if !webview2_data_dir.as_os_str().is_empty() {
+                window_builder = window_builder.data_directory(webview2_data_dir.clone());
+                tracing::info!(
+                    webview2_dir = %webview2_data_dir.display(),
+                    "WebView2 data_directory configured (portable mode)"
+                );
+            } else {
+                tracing::info!("WebView2 using default data location (non-portable mode)");
+            }
+
+            window_builder.build()?;
+
             // 初始化 AppState（异步块在 setup 内同步执行）
             let handle = app.handle().clone();
 
@@ -96,15 +191,15 @@ pub fn run() {
                 // 启动时探测并复制到新的 portable 位置（dev → <project_root>/data/，
                 // prod → <exe_dir>/data/）。详见 paths::maybe_migrate_to_portable。
                 // 注意：必须在 Config 初始化之前，否则 Config 会读到老位置而不是新位置
-                match paths::maybe_migrate_to_portable().await {
-                    Ok(paths::MigrationOutcome::Migrated { from, to }) => {
+                match common_paths::maybe_migrate_to_portable().await {
+                    Ok(common_paths::MigrationOutcome::Migrated { from, to }) => {
                         tracing::info!(
                             from = %from.display(),
                             to = %to.display(),
                             "F38: legacy data migrated to portable location"
                         );
                     }
-                    Ok(paths::MigrationOutcome::Noop) => {
+                    Ok(common_paths::MigrationOutcome::Noop) => {
                         tracing::debug!("F38: no portable migration needed");
                     }
                     Err(e) => {
@@ -114,7 +209,7 @@ pub fn run() {
                 }
 
                 // Config 初始化
-                let config_path = paths::config_path();
+                let config_path = common_paths::config_path();
                 tracing::info!(?config_path, "loading config");
                 let config = std::sync::Arc::new(
                     ConfigService::load(config_path, (*event_bus).clone())
@@ -123,7 +218,7 @@ pub fn run() {
                 );
 
                 // LogStore 初始化（WAL 模式 + 启动 7 天清理后台 task）
-                let log_db = paths::log_db_path();
+                let log_db = common_paths::log_db_path();
                 tracing::info!(?log_db, "initializing logstore");
                 let log_store = std::sync::Arc::new(
                     LogStoreService::new(Some(log_db))
@@ -214,8 +309,8 @@ pub fn run() {
                 // ProcessLauncher 初始化
                 // - comfyui_root / venv_path 由 config 运行时提供（路径热加载）
                 // - data_dir 用于存放 comfyui.pid（崩溃恢复用），属于 app 状态不通过 config 改
-                let data_dir = paths::app_data_dir();
-                if let Err(e) = paths::ensure_dir(&data_dir).await {
+                let data_dir = common_paths::app_data_dir();
+                if let Err(e) = common_paths::ensure_dir(&data_dir).await {
                     tracing::warn!(?data_dir, error = %e, "failed to ensure data_dir");
                 }
                 let python_env_arc = std::sync::Arc::new(python_env);
@@ -250,7 +345,7 @@ pub fn run() {
                 // 缓存文件位于 <app_data_dir>/transformers_versions.json
                 // v1.8 / F38：跟随 portable 模式
                 // 注：此处仅构造，spawn_refresh 在 manage 之后调用（避免 manage 前 spawn 访问 State 失败）
-                let transformers_cache_file = paths::transformers_cache_path();
+                let transformers_cache_file = common_paths::transformers_cache_path();
                 let transformers_index = std::sync::Arc::new(TransformersVersionIndex::new(
                     transformers_cache_file,
                     (*event_bus).clone(),
@@ -284,7 +379,8 @@ pub fn run() {
             }
 
             // 初始化系统托盘（详见 tray.rs）
-            if let Err(e) = tray::setup(&handle) {
+            // v3.x：传 env_name 让托盘 tooltip 显示环境名（多环境区分）
+            if let Err(e) = tray::setup(&handle, env_name_for_window.clone()) {
                 tracing::warn!(error = %e, "failed to setup system tray");
                 // 托盘初始化失败不阻塞应用启动（用户仍可通过窗口操作）
             }
