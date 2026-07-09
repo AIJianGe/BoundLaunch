@@ -20,7 +20,7 @@ pub const DISABLED_SUFFIX: &str = ".disabled";
 ///
 /// - 跳过隐藏目录（`.trash` / `.git` 等）
 /// - 识别 `.disabled` 后缀判断启停状态
-/// - 读 git 元信息（commit / branch / remote_url / dirty）
+/// - 读 git 元信息（commit / branch / ref / detached / remote_url / dirty）
 /// - 描述信息从 `pyproject.toml` / `__init__.py` 读取（简单实现）
 pub fn scan_plugins(custom_nodes_path: &Path) -> Result<Vec<PluginInfo>, PluginError> {
     let mut plugins = vec![];
@@ -59,16 +59,19 @@ pub fn scan_plugins(custom_nodes_path: &Path) -> Result<Vec<PluginInfo>, PluginE
         };
 
         // 读 git 元信息
-        let (current_commit, current_branch, git_url, has_local_changes) =
+        let (current_commit, current_branch, current_ref, is_detached, git_url, has_local_changes) =
             match Repository::open(&path) {
                 Ok(repo) => {
                     let commit = git_ops::current_commit(&repo).unwrap_or_default();
                     let branch = git_ops::current_branch(&repo).unwrap_or(None);
+                    let is_detached = branch.is_none() && !commit.is_empty();
+                    // v3.x：解析当前 ref（tag 优先，再 branch，最后 commit short）
+                    let current_ref = resolve_current_ref(&repo);
                     let url = git_ops::remote_url(&repo);
                     let dirty = git_ops::has_local_changes(&repo).unwrap_or(false);
-                    (commit, branch, url, dirty)
+                    (commit, branch, current_ref, is_detached, url, dirty)
                 }
-                Err(_) => (String::new(), None, None, false),
+                Err(_) => (String::new(), None, None, false, None, false),
             };
 
         // 描述信息（延迟加载策略可后续优化，本期直接读）
@@ -79,6 +82,12 @@ pub fn scan_plugins(custom_nodes_path: &Path) -> Result<Vec<PluginInfo>, PluginE
         // - 有 requirements.txt → 暂视为未安装（真实判断需 venv pip list 比对，性能成本高）
         let requirements_installed = !path.join("requirements.txt").exists();
 
+        // v3.x：读 backup_commit（持久化在 `<plugin>/.launcher_backup_commit`）
+        let backup_commit = std::fs::read_to_string(path.join(".launcher_backup_commit"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()));
+
         plugins.push(PluginInfo {
             name: plugin_name,
             dir_name,
@@ -86,6 +95,9 @@ pub fn scan_plugins(custom_nodes_path: &Path) -> Result<Vec<PluginInfo>, PluginE
             git_url,
             current_commit,
             current_branch,
+            current_ref,
+            backup_commit,
+            is_detached,
             has_updates: None,
             has_local_changes,
             installed_at: read_installed_at(&path),
@@ -97,6 +109,41 @@ pub fn scan_plugins(custom_nodes_path: &Path) -> Result<Vec<PluginInfo>, PluginE
     // 按名字排序，保证多次扫描结果稳定
     plugins.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(plugins)
+}
+
+/// 解析当前 HEAD 对应的可读 ref 名
+///
+/// 优先级：tag > branch > commit short
+fn resolve_current_ref(repo: &Repository) -> Option<String> {
+    let head = repo.head().ok()?;
+    let commit = head.peel_to_commit().ok()?;
+    let commit_id = commit.id().to_string();
+
+    // 1. 检查是否在某个 tag 上
+    let tags = repo.tag_names(None).ok()?;
+    for tag in tags.iter().flatten() {
+        if tag.ends_with("^{}") {
+            continue;
+        }
+        let ref_name = format!("refs/tags/{}", tag);
+        if let Ok(tag_ref) = repo.find_reference(&ref_name) {
+            if let Ok(tag_commit) = tag_ref.peel_to_commit() {
+                if tag_commit.id().to_string() == commit_id {
+                    return Some(tag.to_string());
+                }
+            }
+        }
+    }
+
+    // 2. 检查是否在某个 branch 上
+    if head.is_branch() {
+        if let Some(s) = head.shorthand() {
+            return Some(s.to_string());
+        }
+    }
+
+    // 3. fallback: commit short
+    Some(commit_id[..7].to_string())
 }
 
 /// 启停插件（rename `<name>` ↔ `<name>.disabled`）

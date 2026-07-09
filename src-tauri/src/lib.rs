@@ -194,10 +194,12 @@ pub fn run() {
                 );
 
                 // PluginManager 初始化（custom_nodes + venv，路径热加载）
+                // v3.x：注入 log_store + app_handle，让 install_requirements 流式 emit 日志
                 let plugin_manager = PluginManagerService::new(
                     config.clone(),
                     (*event_bus).clone(),
-                );
+                )
+                .with_emit(log_store.clone(), handle.clone());
 
                 // TaskScheduler 初始化（max_concurrent=3 / max_queued=20 默认值，可经 Config 扩展字段覆盖）
                 // 设计文档 §2.1 提到可经 [advanced].max_concurrent_tasks 配置，但当前 Config 模块未含此字段，
@@ -413,6 +415,15 @@ pub fn run() {
             commands::plugin_manager::plugin_install_requirements,
             commands::plugin_manager::plugin_check_updates,
             commands::plugin_manager::plugin_info,
+            commands::plugin_manager::plugin_list_available_versions,
+            commands::plugin_manager::plugin_switch_version,
+            commands::plugin_manager::plugin_rollback_version,
+            commands::plugin_manager::plugin_health_check_venv,
+            commands::plugin_manager::plugin_fix_venv,
+            // v3.x：ComfyUI 核心依赖管理
+            commands::plugin_manager::plugin_check_comfyui_requirements,
+            commands::plugin_manager::plugin_launch_pre_check,
+            commands::plugin_manager::plugin_install_comfyui_requirements,
             // TaskScheduler
             commands::task_scheduler::task_list,
             commands::task_scheduler::task_cancel,

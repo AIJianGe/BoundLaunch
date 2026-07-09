@@ -10,7 +10,7 @@ pub mod repository;
 pub mod retention;
 pub mod schema;
 
-pub use repository::{LogRepository, TaskRepository, TaskHistoryRecord};
+pub use repository::{LogEntry, LogLevel, LogRepository, TaskRepository, TaskHistoryRecord};
 
 use crate::common::paths;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};

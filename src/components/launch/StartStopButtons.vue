@@ -48,6 +48,7 @@ import { useRouter } from "vue-router";
 import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
 import { useConfigStore } from "@/stores/config";
+import { usePluginStore } from "@/stores/plugin";
 import { useToast } from "@/composables/useToast";
 import { useConfirm } from "@/composables/useConfirm";
 import { useEnvInstaller } from "@/composables/useEnvInstaller";
@@ -60,6 +61,7 @@ const router = useRouter();
 const processStore = useProcessStore();
 const envStore = useEnvStore();
 const configStore = useConfigStore();
+const pluginStore = usePluginStore();
 const toast = useToast();
 const dialog = useDialog();
 const { confirm: showConfirm } = useConfirm();
@@ -458,6 +460,53 @@ async function onStart() {
     }
   } catch (e) {
     console.warn("[start] checkConflicts failed:", e);
+  }
+
+  // v3.x：守卫 3.5：ComfyUI 核心 / 插件 依赖预检
+  // - ComfyUI 核心 requirements.txt hash 变了（git checkout 后常见）
+  // - 插件 requirements_installed = false
+  // → 弹窗让用户选择：跳过启动去装 / 立即装 / 直接启动（可能失败）
+  try {
+    const preCheck = await pluginStore.preCheckLaunch(false);
+    if (!preCheck.all_ok) {
+      const coreNeeds = preCheck.core_requirements.needs_install;
+      const pluginsCount = preCheck.plugins_needing_install.length;
+      const lines: string[] = [];
+      if (coreNeeds) {
+        lines.push(
+          `• ComfyUI 核心依赖：${preCheck.core_requirements.reason}`,
+        );
+      }
+      if (pluginsCount > 0) {
+        const sample = preCheck.plugins_needing_install
+          .slice(0, 3)
+          .map((p) => p.name)
+          .join(", ");
+        const more = pluginsCount > 3 ? ` 等 ${pluginsCount} 个` : "";
+        lines.push(`• 插件待装依赖（${sample}${more}）`);
+      }
+      const ok = await showConfirm({
+        title: "检测到待装依赖",
+        content:
+          "启动 ComfyUI 前发现以下依赖未装：\n\n" +
+          lines.join("\n") +
+          "\n\n" +
+          "如不装直接启动，ComfyUI 可能因找不到模块而启动失败。\n" +
+          "建议先装依赖再启动。\n\n" +
+          "（可点「去装依赖」转到「插件管理」页）",
+        positiveText: "去装依赖",
+        negativeText: "仍然启动",
+      });
+      if (ok) {
+        startComfyui.unmarkSubmitting();
+        router.push("/plugin");
+        return;
+      }
+      // 仍然启动：不阻断（让后端 verify_preconditions 给出具体错误）
+    }
+  } catch (e) {
+    // 预检失败不能阻断启动
+    console.warn("[start] preCheckLaunch failed:", e);
   }
 
   // v3.4：用 useStartComfyui 替代 processStore.start()

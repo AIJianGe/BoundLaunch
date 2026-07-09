@@ -15,6 +15,13 @@ pub struct PluginInfo {
     pub git_url: Option<String>,
     pub current_commit: String,
     pub current_branch: Option<String>,
+    /// v3.x：当前检出的 ref（tag 名或 commit short）
+    /// 用于 UI 显示"在 v1.2.0" vs "在 main"
+    pub current_ref: Option<String>,
+    /// v3.x：上次切版本前的 commit（用于回滚）
+    pub backup_commit: Option<String>,
+    /// v3.x：是否处于 detached HEAD 状态（切到 tag 后会有这个状态）
+    pub is_detached: bool,
     /// `None` = 未检查；`Some(bool)` = 已检查
     pub has_updates: Option<bool>,
     pub has_local_changes: bool,
@@ -65,6 +72,30 @@ pub struct RemoteTagInfo {
     pub commit: String,
 }
 
+/// 本地仓库的 ref 信息（tag + branch，用于切版本时选择目标）
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalRefInfo {
+    /// "tag" | "branch"
+    pub kind: String,
+    /// 名称，如 "v1.2.0" 或 "main"
+    pub name: String,
+    /// 对应的 commit hash
+    pub commit: String,
+    /// 是否是当前 HEAD
+    pub is_current: bool,
+}
+
+/// 切换版本结果（含回滚信息）
+#[derive(Debug, Clone, Serialize)]
+pub struct SwitchResult {
+    /// 切换后的 plugin info
+    pub plugin: PluginInfo,
+    /// 切换前的 commit（供前端"回滚"按钮使用）
+    pub previous_commit: String,
+    /// 切换后是否需要重启 ComfyUI（如果 ComfyUI 在跑）
+    pub need_restart: bool,
+}
+
 /// 插件操作进度（用于 install / update / install_requirements 流式推送）
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]
@@ -73,8 +104,12 @@ pub enum PluginProgress {
     Cloning { percent: u32 },
     /// 正在装依赖（0-100）
     InstallingRequirements { percent: u32 },
+    /// v3.x：依赖装过程中的中间 percent（带 plugin 名，用于多插件并发场景）
+    RequirementsPercent { plugin: String, percent: u32 },
     /// 正在拉取更新
     Pulling { percent: u32 },
+    /// v3.x：正在切版本（fetch + checkout，0-100）
+    Switching { percent: u32 },
     /// 完成
     Done,
     /// 失败

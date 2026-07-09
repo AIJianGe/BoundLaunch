@@ -214,6 +214,174 @@ pub fn checkout_tag(repo: &Repository, tag_name: &str) -> Result<(), PluginError
     Ok(())
 }
 
+// ============ v3.x：版本切换相关函数 ============
+
+/// 列出本地仓库的所有可用 ref（tag + branch），用于切版本时选择目标
+///
+/// 返回按"当前在用 → tag 降序 → branch 字母序"排序的列表
+pub fn list_local_refs(repo: &Repository) -> Result<Vec<super::models::LocalRefInfo>, PluginError> {
+    let mut refs: Vec<super::models::LocalRefInfo> = Vec::new();
+    let head_commit = current_commit(repo)?;
+
+    // 1. 收集所有 tag
+    let tags = repo.tag_names(None).map_err(PluginError::GitError)?;
+    for tag_name in tags.iter() {
+        let tag_name = match tag_name {
+            Some(n) => n,
+            None => continue,
+        };
+        // 跳过 peeled tag 后缀
+        if tag_name.ends_with("^{}") {
+            continue;
+        }
+        let ref_name = format!("refs/tags/{}", tag_name);
+        let tag_ref = match repo.find_reference(&ref_name) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let commit = match tag_ref.peel_to_commit() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        refs.push(super::models::LocalRefInfo {
+            kind: "tag".to_string(),
+            name: tag_name.to_string(),
+            commit: commit.id().to_string(),
+            is_current: commit.id().to_string() == head_commit,
+        });
+    }
+
+    // 2. 收集所有本地 branch
+    let branches = repo
+        .branches(Some(git2::BranchType::Local))
+        .map_err(PluginError::GitError)?;
+    for branch_result in branches {
+        let (branch, _) = match branch_result {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let name = match branch.name() {
+            Ok(Some(n)) => n.to_string(),
+            _ => continue,
+        };
+        let commit = match branch.get().peel_to_commit() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        refs.push(super::models::LocalRefInfo {
+            kind: "branch".to_string(),
+            name,
+            commit: commit.id().to_string(),
+            is_current: commit.id().to_string() == head_commit,
+        });
+    }
+
+    // 3. 排序：is_current 优先 → tag 降序 → branch 字母序
+    refs.sort_by(|a, b| {
+        // current 优先
+        if a.is_current != b.is_current {
+            return b.is_current.cmp(&a.is_current);
+        }
+        // tag 在前
+        if a.kind != b.kind {
+            return a.kind.cmp(&b.kind); // "branch" < "tag"
+        }
+        // 同 kind 内部
+        if a.kind == "tag" {
+            // 语义化版本倒序：v2.0 > v1.0
+            // 简化处理：按字符串倒序（对 vX.Y.Z 大致正确）
+            return b.name.cmp(&a.name);
+        }
+        a.name.cmp(&b.name)
+    });
+
+    Ok(refs)
+}
+
+/// 拉取所有远程 tag（不拉其他 ref，节省带宽）
+///
+/// 用于切版本前刷新本地 tag 列表。
+pub fn fetch_all_tags(repo: &Repository) -> Result<(), PluginError> {
+    let mut remote = repo.find_remote("origin").map_err(PluginError::GitError)?;
+    let mut fo = FetchOptions::new();
+    fo.download_tags(git2::AutotagOption::All);
+    remote
+        .fetch(&[] as &[&str], Some(&mut fo), None) // 空 spec = fetch all configured
+        .map_err(|e| PluginError::GitError(e))?;
+    Ok(())
+}
+
+/// Checkout 到指定 ref（tag / branch / commit hash），detached HEAD
+///
+/// 返回 (previous_commit, new_commit)
+pub fn checkout_ref(
+    repo: &Repository,
+    target_ref: &str,
+) -> Result<(String, String), PluginError> {
+    let previous_commit = current_commit(repo)?;
+
+    // 1. 解析 ref：先按 tag 找 → branch 找 → 直接当 commit hash 找
+    let target_commit_id = {
+        // 尝试 tag
+        let tag_ref_name = format!("refs/tags/{}", target_ref);
+        if let Ok(tag_ref) = repo.find_reference(&tag_ref_name) {
+            tag_ref
+                .peel_to_commit()
+                .map_err(PluginError::GitError)?
+                .id()
+        }
+        // 尝试 branch
+        else if let Ok(branch) = repo.find_branch(target_ref, git2::BranchType::Local) {
+            branch
+                .get()
+                .peel_to_commit()
+                .map_err(PluginError::GitError)?
+                .id()
+        }
+        // 尝试 commit hash（短或全）
+        else if let Ok(obj) = repo.revparse_single(target_ref) {
+            obj.peel_to_commit().map_err(PluginError::GitError)?.id()
+        } else {
+            return Err(PluginError::GitError(git2::Error::from_str(&format!(
+                "ref not found: {}",
+                target_ref
+            ))));
+        }
+    };
+
+    // 2. set_head_detached
+    repo.set_head_detached(target_commit_id)
+        .map_err(PluginError::GitError)?;
+
+    // 3. checkout
+    let mut checkout_opts = git2::build::CheckoutBuilder::new();
+    checkout_opts.force();
+    repo.checkout_head(Some(&mut checkout_opts))
+        .map_err(PluginError::GitError)?;
+
+    let new_commit = current_commit(repo)?;
+    tracing::info!(
+        target = target_ref,
+        previous = %previous_commit,
+        new = %new_commit,
+        "checked out ref"
+    );
+    Ok((previous_commit, new_commit))
+}
+
+/// 切回指定 commit（用于回滚）
+pub fn restore_commit(repo: &Repository, commit: &str) -> Result<(), PluginError> {
+    let commit_oid = git2::Oid::from_str(commit).map_err(PluginError::GitError)?;
+    repo.set_head_detached(commit_oid)
+        .map_err(PluginError::GitError)?;
+    let mut checkout_opts = git2::build::CheckoutBuilder::new();
+    checkout_opts.force();
+    repo.checkout_head(Some(&mut checkout_opts))
+        .map_err(PluginError::GitError)?;
+    tracing::info!(commit, "restored to commit");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

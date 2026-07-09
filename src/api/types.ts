@@ -482,6 +482,12 @@ export interface PluginInfo {
   git_url: string | null;
   current_commit: string;
   current_branch: string | null;
+  /** v3.x：当前检出的 ref（tag 名或 commit short） */
+  current_ref: string | null;
+  /** v3.x：上次切版本前的 commit（用于回滚） */
+  backup_commit: string | null;
+  /** v3.x：是否处于 detached HEAD 状态 */
+  is_detached: boolean;
   /** null = 未检查；boolean = 已检查结果 */
   has_updates: boolean | null;
   has_local_changes: boolean;
@@ -519,10 +525,137 @@ export interface UninstallResult {
 
 /** 远程仓库 tag 信息（对应后端 RemoteTagInfo） */
 export interface RemoteTagInfo {
-  /** tag 名称，如 "v1.2.0" */
+    /** tag 名称，如 "v1.2.0" */
+    name: string;
+    /** tag 对应的 commit hash */
+    commit: string;
+}
+
+/** 本地仓库 ref 信息（对应后端 LocalRefInfo） */
+export interface LocalRefInfo {
+    /** "tag" | "branch" */
+    kind: string;
+    /** 名称，如 "v1.2.0" 或 "main" */
+    name: string;
+    /** 对应的 commit hash */
+    commit: string;
+    /** 是否是当前 HEAD */
+    is_current: boolean;
+}
+
+/** 切版本结果（对应后端 SwitchResult） */
+export interface SwitchResult {
+    plugin: PluginInfo;
+    /** 切换前的 commit */
+    previous_commit: string;
+    /** 切换后是否需要重启 ComfyUI */
+    need_restart: boolean;
+}
+
+/** 插件操作进度（对应后端 PluginProgress，install 流程实时推送） */
+export type PluginProgress =
+    | { stage: "cloning"; percent: number }
+    | { stage: "installing_requirements"; percent: number }
+    | { stage: "requirements_percent"; plugin: string; percent: number }
+    | { stage: "pulling"; percent: number }
+    | { stage: "switching"; percent: number }
+    | { stage: "done" }
+    | { stage: "failed"; error: string };
+
+/** 插件安装实时日志（对应后端 plugin_progress_log 事件） */
+export interface PluginProgressLog {
+  plugin: string;
+  level: "info" | "warn" | "error" | "debug" | "trace";
+  message: string;
+}
+
+// ============================================================================
+// venv 健康检查（对应后端 plugin_manager::venv_health）
+// ============================================================================
+
+/** venv 健康状态 */
+export type VenvHealthStatus =
+  | "healthy"                // 正常
+  | "has_broken_distributions" // 有损坏包但 import 还 OK
+  | "import_failed"           // 关键 import 失败
+  | "broken_and_import_failed" // 损坏包 + import 失败
+  | "venv_not_found"          // venv 目录不存在
+  | "site_packages_not_found"; // site-packages 目录不存在
+
+/** 损坏包（`~xxx*`） */
+export interface BrokenDistribution {
   name: string;
-  /** tag 对应的 commit hash */
-  commit: string;
+  path: string;
+  size_bytes: number;
+  last_modified: string | null;
+}
+
+/** 单个 import 验证结果 */
+export interface ImportCheckResult {
+  module: string;
+  ok: boolean;
+  error: string | null;
+}
+
+/** venv 健康检查报告（对应后端 VenvHealthReport） */
+export interface VenvHealthReport {
+  venv_path: string;
+  site_packages: string;
+  broken_distributions: BrokenDistribution[];
+  critical_imports: ImportCheckResult[];
+  status: VenvHealthStatus;
+  elapsed_ms: number;
+}
+
+/** venv 关键 import 失败警告（对应后端 venv_import_warning 事件） */
+export interface VenvImportWarning {
+  plugin: string;
+  failed_modules: string[];
+  summary: string;
+}
+
+// ============================================================================
+// v3.x：ComfyUI 核心依赖管理（对应 src-tauri/src/plugin_manager/comfyui_core.rs）
+// ============================================================================
+
+/** ComfyUI 核心依赖状态 */
+export interface ComfyUICoreRequirementsStatus {
+  /** ComfyUI 核心目录路径 */
+  comfyui_root: string;
+  /** requirements.txt 路径（不存在则为 null） */
+  requirements_path: string | null;
+  /** 当前 requirements.txt 的 SHA256 hash（64 字符） */
+  current_hash: string | null;
+  /** 上次装成功时记录的 hash（不存在则为 null） */
+  last_installed_hash: string | null;
+  /** 是否需要重装 */
+  needs_install: boolean;
+  /** 原因（人类可读） */
+  reason: string;
+  /** 距离上次装多久（秒，未来扩展用） */
+  last_install_seconds_ago: number | null;
+  /** 耗时（毫秒） */
+  elapsed_ms: number;
+}
+
+/** 待装依赖的 plugin 信息（pre_launch_check 返回） */
+export interface PluginInstallNeeded {
+  name: string;
+  path: string;
+  commit: string | null;
+  current_ref: string | null;
+}
+
+/** 启动 ComfyUI 前的完整检查 */
+export interface PreLaunchCheck {
+  /** ComfyUI 核心依赖状态 */
+  core_requirements: ComfyUICoreRequirementsStatus;
+  /** 待装依赖的 custom node 列表 */
+  plugins_needing_install: PluginInstallNeeded[];
+  /** 是否所有都 OK（core 不需要装 + 没有待装插件） */
+  all_ok: boolean;
+  /** 总体耗时（毫秒） */
+  elapsed_ms: number;
 }
 
 // ============================================================================
