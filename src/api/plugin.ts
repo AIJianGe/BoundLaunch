@@ -1,70 +1,69 @@
-/**
- * PluginManager 模块 API
- *
- * 对应后端 `commands/plugin_manager.rs`
- * 详见 `PR/03-模块设计/04-PluginManager.md`
- */
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import type {
+    PluginInfo,
+    PluginListResult,
+    PluginUpdateInfo,
+    RemoteTagInfo,
+    UninstallResult,
+    UpdateResult,
+} from "./types";
 
-import { invoke } from "./index";
-import type { PluginInfo } from "./types";
-
-/** 列出所有插件（含已安装与可识别的未安装项） */
-export function pluginList(): Promise<PluginInfo[]> {
-  return invoke<PluginInfo[]>("plugin_list");
+/** 拉取插件列表（force=true 跳过 30s 缓存） */
+export function pluginList(force = false): Promise<PluginListResult> {
+    return invoke<PluginListResult>("plugin_list", { force });
 }
 
-/**
- * 安装插件（git clone + requirements 安装）
- *
- * @param gitUrl Git URL（如 "https://github.com/author/comfyui-plugin"）
- */
-export function pluginInstall(gitUrl: string): Promise<void> {
-  return invoke<void>("plugin_install", { gitUrl });
+/** 通过 git URL 安装插件到 custom_nodes（可选 checkout 到指定 tag） */
+export function pluginInstall(
+    url: string,
+    tag?: string | null,
+): Promise<PluginInfo> {
+    return invoke<PluginInfo>("plugin_install", { url, tag: tag ?? null });
 }
 
-/**
- * 更新插件（git pull）
- *
- * @param name 插件目录名（如 "ComfyUI-Manager"）
- */
-export function pluginUpdate(name: string): Promise<void> {
-  return invoke<void>("plugin_update", { name });
+/** 列出远程仓库的 tag（不下载整个仓库，仅 ls-remote） */
+export function pluginListRemoteTags(url: string): Promise<RemoteTagInfo[]> {
+    return invoke<RemoteTagInfo[]>("plugin_list_remote_tags", { url });
 }
 
-/**
- * 卸载插件（移到 .trash 目录，可恢复）
- *
- * @param name 插件目录名
- */
-export function pluginUninstall(name: string): Promise<void> {
-  return invoke<void>("plugin_uninstall", { name });
+/** 卸载插件（移动到 .trash 目录） */
+export function pluginUninstall(name: string): Promise<UninstallResult> {
+    return invoke<UninstallResult>("plugin_uninstall", { name });
 }
 
-/**
- * 启用 / 禁用插件（重命名目录加 .disabled 后缀）
- *
- * @param name 插件目录名
- * @param enabled true=启用，false=禁用
- */
+/** 启用/禁用插件（切换 .disabled 后缀） */
 export function pluginToggle(name: string, enabled: boolean): Promise<void> {
-  return invoke<void>("plugin_toggle", { name, enabled });
+    return invoke<void>("plugin_toggle", { name, enabled });
 }
 
-/**
- * 安装插件的 requirements.txt
- *
- * @param name 插件目录名
- */
+/** 拉取单个插件更新（git pull） */
+export function pluginUpdate(name: string): Promise<UpdateResult> {
+    return invoke<UpdateResult>("plugin_update", { name });
+}
+
+/** 批量检查所有插件的远程更新状态 */
+export function pluginCheckUpdates(): Promise<PluginUpdateInfo[]> {
+    return invoke<PluginUpdateInfo[]>("plugin_check_updates");
+}
+
+/** 安装插件 requirements.txt 到 venv */
 export function pluginInstallRequirements(name: string): Promise<void> {
-  return invoke<void>("plugin_install_requirements", { name });
+    return invoke<void>("plugin_install_requirements", { name });
 }
 
-/** 检查所有插件的更新（批量 git fetch） */
-export function pluginCheckUpdates(): Promise<PluginInfo[]> {
-  return invoke<PluginInfo[]>("plugin_check_updates");
+/** 监听后端 plugin_list_changed 事件 */
+export function onPluginListChanged(cb: () => void) {
+    return listen("plugin_list_changed", () => cb());
 }
 
-/** 查询单个插件详情 */
-export function pluginInfo(name: string): Promise<PluginInfo> {
-  return invoke<PluginInfo>("plugin_info", { name });
+/** 监听后端 plugin_progress 事件（安装/更新进度） */
+export function onPluginProgress(
+    cb: (payload: { plugin: string; stage: string; message: string }) => void,
+) {
+    return listen<{
+        plugin: string;
+        stage: string;
+        message: string;
+    }>("plugin_progress", (e) => cb(e.payload));
 }

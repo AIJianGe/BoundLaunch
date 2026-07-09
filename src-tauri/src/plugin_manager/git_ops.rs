@@ -163,6 +163,57 @@ pub fn remote_url(repo: &Repository) -> Option<String> {
     remote.url().map(|s| s.to_string())
 }
 
+/// 列出远程仓库的 tag（不下载整个仓库，仅 ls-remote）
+///
+/// 用于安装前让用户选择 tag 版本。
+/// 返回按名称排序的 tag 列表（最新的在前）。
+pub fn list_remote_tags(url: &str) -> Result<Vec<super::models::RemoteTagInfo>, PluginError> {
+    let mut remote = git2::Remote::create_detached(url)
+        .map_err(|e| PluginError::GitError(e))?;
+
+    // connect + list 远程引用
+    remote.connect(git2::Direction::Fetch)?;
+    let heads = remote.list().map_err(|e| PluginError::GitError(e))?;
+
+    let mut tags: Vec<super::models::RemoteTagInfo> = heads
+        .iter()
+        .filter(|h| h.name().starts_with("refs/tags/"))
+        .map(|h| super::models::RemoteTagInfo {
+            name: h.name().strip_prefix("refs/tags/").unwrap_or(h.name()).to_string(),
+            commit: h.oid().to_string(),
+        })
+        .filter(|t| !t.name.ends_with("^{}")) // 过滤 peeled tags
+        .collect();
+
+    // 按名称降序排序（新版本在前，v2.0 > v1.0）
+    tags.sort_by(|a, b| b.name.cmp(&a.name));
+
+    remote.disconnect().ok();
+    Ok(tags)
+}
+
+/// clone 后 checkout 到指定 tag（detached HEAD）
+///
+/// `tag_name` 是纯名称，如 "v1.2.0"（不含 refs/tags/ 前缀）。
+pub fn checkout_tag(repo: &Repository, tag_name: &str) -> Result<(), PluginError> {
+    let ref_name = format!("refs/tags/{}", tag_name);
+    let tag_ref = repo.find_reference(&ref_name).map_err(|e| PluginError::GitError(e))?;
+    let tag_commit = tag_ref.peel_to_commit().map_err(|e| PluginError::GitError(e))?;
+
+    // set detached HEAD to tag commit
+    repo.set_head_detached(tag_commit.id())
+        .map_err(|e| PluginError::GitError(e))?;
+
+    // checkout to match HEAD
+    let mut checkout_opts = git2::build::CheckoutBuilder::new();
+    checkout_opts.force();
+    repo.checkout_head(Some(&mut checkout_opts))
+        .map_err(|e| PluginError::GitError(e))?;
+
+    tracing::info!(tag = tag_name, commit = %tag_commit.id(), "checked out tag");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

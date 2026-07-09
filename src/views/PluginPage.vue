@@ -5,17 +5,18 @@
  * 详见 `PR/06-界面设计.md §5.2 插件管理页`
  *
  * 区块：
- * 1. 顶部工具栏：Git URL 输入 + [安装] + 搜索框 + [批量检查更新]
+ * 1. 顶部工具栏：Git URL 输入 + [获取版本] + [安装] + 搜索框 + [批量检查更新]
  * 2. 统计栏：总数 / 启用 / 禁用 / 待更新
- * 3. 插件列表表格：插件名 | commit | 启用开关 | [更新] [卸载]
+ * 3. 插件列表表格：插件名 | commit | 启用开关 | [更新] [装依赖] [卸载]
  * 4. 空状态：提示输入 Git URL
  * 5. 操作确认弹窗
  *
- * 设计模式：
- * - **Facade**：本页面整合 plugin store
- * - **Repository**：通过 pluginStore 访问后端
- *
- * 实现：表格列使用 h 函数（避免 JSX 依赖）
+ * Tag 选择流程：
+ * 1. 用户输入 URL → 点"获取版本"
+ * 2. 调 pluginListRemoteTags(url) 获取 tag 列表
+ * 3. 有 tag → NSelect 下拉选择（默认"最新 commit（默认分支）"）
+ * 4. 无 tag → 提示"无 tag，直接安装最新版"
+ * 5. 点"安装" → pluginInstall(url, selectedTag)
  */
 
 import { h, ref, computed, onMounted } from "vue";
@@ -30,11 +31,13 @@ import {
   NDataTable,
   NPopconfirm,
   NSpin,
+  NSelect,
   type DataTableColumns,
 } from "naive-ui";
 import { usePluginStore } from "@/stores/plugin";
 import { useToast } from "@/composables/useToast";
-import type { PluginInfo } from "@/api/types";
+import { pluginListRemoteTags } from "@/api/plugin";
+import type { PluginInfo, RemoteTagInfo } from "@/api/types";
 
 const pluginStore = usePluginStore();
 const toast = useToast();
@@ -42,6 +45,22 @@ const toast = useToast();
 const gitUrlInput = ref("");
 const searchQuery = ref("");
 const installing = ref(false);
+const fetchingTags = ref(false);
+
+// Tag 选择相关
+const remoteTags = ref<RemoteTagInfo[]>([]);
+const selectedTag = ref<string | null>(null);
+
+/** tag 下拉选项：第一项是"最新 commit（默认分支）"，后面是所有 tag */
+const tagOptions = computed(() => {
+  const opts = [
+    { label: "最新 commit（默认分支）", value: "__latest__" },
+  ];
+  for (const t of remoteTags.value) {
+    opts.push({ label: t.name, value: t.name });
+  }
+  return opts;
+});
 
 const filteredPlugins = computed(() => {
   if (!searchQuery.value.trim()) return pluginStore.plugins;
@@ -62,9 +81,15 @@ const columns = computed<DataTableColumns<PluginInfo>>(() => [
     width: 100,
   },
   {
+    title: "分支",
+    key: "current_branch",
+    render: (row) => row.current_branch || "-",
+    width: 100,
+  },
+  {
     title: "状态",
     key: "enabled",
-    width: 100,
+    width: 80,
     render: (row) =>
       h(
         NTag,
@@ -76,15 +101,17 @@ const columns = computed<DataTableColumns<PluginInfo>>(() => [
     title: "更新",
     key: "has_updates",
     width: 80,
-    render: (row) =>
-      row.has_updates
+    render: (row) => {
+      if (row.has_updates === null) return null;
+      return row.has_updates
         ? h(NTag, { size: "small", type: "warning" }, { default: () => "有更新" })
-        : null,
+        : h(NTag, { size: "small", type: "info" }, { default: () => "最新" });
+    },
   },
   {
     title: "操作",
     key: "actions",
-    width: 260,
+    width: 320,
     render: (row) =>
       h(NSpace, { size: "small" }, {
         default: () => [
@@ -97,11 +124,24 @@ const columns = computed<DataTableColumns<PluginInfo>>(() => [
             NButton,
             {
               size: "tiny",
-              disabled: !row.has_updates,
+              disabled: row.has_updates !== true,
               onClick: () => onUpdate(row.name),
             },
             { default: () => "更新" },
           ),
+          // 依赖安装按钮：有 requirements.txt 且未装时显示
+          !row.requirements_installed
+            ? h(
+                NButton,
+                {
+                  size: "tiny",
+                  type: "warning",
+                  ghost: true,
+                  onClick: () => onInstallRequirements(row.name),
+                },
+                { default: () => "装依赖" },
+              )
+            : null,
           h(
             NPopconfirm,
             {
@@ -132,6 +172,38 @@ onMounted(async () => {
   }
 });
 
+/** 获取远程仓库的 tag 列表 */
+async function onFetchTags() {
+  const url = gitUrlInput.value.trim();
+  if (!url) {
+    toast.error("请输入 Git URL");
+    return;
+  }
+  if (!url.startsWith("https://")) {
+    toast.error("仅支持 https:// GitHub 仓库");
+    return;
+  }
+
+  fetchingTags.value = true;
+  remoteTags.value = [];
+  selectedTag.value = null;
+  try {
+    const tags = await pluginListRemoteTags(url);
+    if (tags.length > 0) {
+      remoteTags.value = tags;
+      selectedTag.value = "__latest__";
+      toast.success(`找到 ${tags.length} 个 tag，请选择版本`);
+    } else {
+      toast.info("该仓库无 tag，将直接安装最新 commit");
+      selectedTag.value = "__latest__";
+    }
+  } catch (e) {
+    toast.error("获取 tag 失败", e);
+  } finally {
+    fetchingTags.value = false;
+  }
+}
+
 async function onInstall() {
   const url = gitUrlInput.value.trim();
   if (!url) {
@@ -143,11 +215,18 @@ async function onInstall() {
     return;
   }
 
+  // __latest__ 表示不指定 tag（用默认分支 HEAD）
+  const tag = selectedTag.value && selectedTag.value !== "__latest__"
+    ? selectedTag.value
+    : null;
+
   installing.value = true;
   try {
-    await pluginStore.install(url);
+    await pluginStore.install(url, tag);
     toast.success("插件安装完成");
     gitUrlInput.value = "";
+    remoteTags.value = [];
+    selectedTag.value = null;
   } catch (e) {
     toast.error("安装失败", e);
   } finally {
@@ -182,10 +261,21 @@ async function onUninstall(name: string) {
   }
 }
 
+async function onInstallRequirements(name: string) {
+  try {
+    await pluginStore.installRequirements(name);
+    toast.success(`${name} 依赖安装完成`);
+    // 刷新列表以更新 requirements_installed 字段
+    await pluginStore.refresh(true);
+  } catch (e) {
+    toast.error("依赖安装失败", e);
+  }
+}
+
 async function onCheckAllUpdates() {
   try {
     await pluginStore.checkUpdates();
-    const count = pluginStore.plugins.filter((p) => p.has_updates).length;
+    const count = pluginStore.plugins.filter((p) => p.has_updates === true).length;
     if (count > 0) {
       toast.success(`检测到 ${count} 个插件有更新`);
     } else {
@@ -207,8 +297,15 @@ async function onCheckAllUpdates() {
           placeholder="https://github.com/user/comfyui-plugin"
           :disabled="installing"
           class="url-input"
-          @keyup.enter="onInstall"
+          @keyup.enter="onFetchTags"
         />
+        <NButton
+          :loading="fetchingTags"
+          :disabled="fetchingTags || installing || !gitUrlInput.trim()"
+          @click="onFetchTags"
+        >
+          获取版本
+        </NButton>
         <NButton
           type="primary"
           :loading="installing"
@@ -217,6 +314,19 @@ async function onCheckAllUpdates() {
         >
           安装
         </NButton>
+      </div>
+
+      <!-- Tag 选择行（获取版本后显示） -->
+      <div v-if="remoteTags.length > 0 || selectedTag === '__latest__'" class="toolbar-row">
+        <NSelect
+          v-model:value="selectedTag"
+          :options="tagOptions"
+          :disabled="installing"
+          size="small"
+          class="tag-select"
+          placeholder="选择版本"
+        />
+        <span class="hint">{{ remoteTags.length }} 个 tag 可选</span>
       </div>
 
       <div class="toolbar-row">
@@ -285,7 +395,7 @@ async function onCheckAllUpdates() {
     </NCard>
 
     <div class="footer-tip">
-      ℹ 卸载的插件移到 .trash 子目录，可手动恢复。
+      ℹ 卸载的插件移到 .trash 子目录，可手动恢复。安装后会自动装依赖，如失败可点「装依赖」重试。
     </div>
   </div>
 </template>
@@ -306,6 +416,7 @@ async function onCheckAllUpdates() {
   display: flex;
   gap: 8px;
   margin-bottom: 8px;
+  align-items: center;
 }
 
 .toolbar-row:last-child {
@@ -315,6 +426,10 @@ async function onCheckAllUpdates() {
 .url-input,
 .search-input {
   flex: 1;
+}
+
+.tag-select {
+  width: 300px;
 }
 
 .loading {

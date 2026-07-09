@@ -33,6 +33,7 @@ import { useProcessStore } from "@/stores/process";
 import { useEnvStore } from "@/stores/env";
 import { useTaskStore } from "@/stores/task";
 import { useCoreStore } from "@/stores/core";
+import { usePluginStore } from "@/stores/plugin";
 import { useErrorLog } from "@/composables/useErrorLog";
 
 const configStore = useConfigStore();
@@ -40,6 +41,7 @@ const processStore = useProcessStore();
 const envStore = useEnvStore();
 const taskStore = useTaskStore();
 const coreStore = useCoreStore();
+const pluginStore = usePluginStore();
 
 // v3.10：全局错误日志 store（ErrorPanel + 菜单红点）
 const errorLog = useErrorLog();
@@ -52,6 +54,8 @@ onMounted(async () => {
     envStore.subscribe(),
     taskStore.subscribe(),
     coreStore.subscribe(),
+    // v3.x：订阅插件列表变更事件（install/uninstall/toggle 后 emit）
+    pluginStore.subscribe(),
     // v3.10：订阅后端 business_log 事件 + 拉取历史错误
     errorLog.subscribe(),
     errorLog.loadHistory(),
@@ -71,6 +75,8 @@ onUnmounted(() => {
   envStore.unsubscribe();
   taskStore.unsubscribe();
   coreStore.unsubscribe();
+  // v3.x：取消插件事件订阅
+  pluginStore.unsubscribe();
   // v3.10：取消 business_log 订阅
   errorLog.unsubscribe();
   crashRecovery.cleanup();

@@ -56,6 +56,15 @@ pub struct PluginUpdateInfo {
     pub latest_commit: Option<String>,
 }
 
+/// 远程仓库 tag 信息（用于安装时选择版本）
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteTagInfo {
+    /// tag 名称，如 "v1.2.0"
+    pub name: String,
+    /// tag 对应的 commit hash
+    pub commit: String,
+}
+
 /// 插件操作进度（用于 install / update / install_requirements 流式推送）
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]

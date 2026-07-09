@@ -37,8 +37,8 @@ pub mod trash;
 pub mod url_util;
 
 pub use models::{
-    PluginError, PluginInfo, PluginListResult, PluginProgress, PluginUpdateInfo, UninstallResult,
-    UpdateResult,
+    PluginError, PluginInfo, PluginListResult, PluginProgress, PluginUpdateInfo, RemoteTagInfo,
+    UninstallResult, UpdateResult,
 };
 pub use url_util::{derive_plugin_name, validate_git_url};
 
@@ -153,19 +153,38 @@ impl PluginManagerService {
         Ok(result)
     }
 
-    /// 安装插件（git clone）
+    /// 列出远程仓库的 tag 列表（不下载整个仓库，仅 ls-remote）
+    ///
+    /// 用于安装前让用户选择 tag 版本。
+    /// 返回按名称降序排列（新版本在前）。
+    pub async fn list_remote_tags(
+        &self,
+        url: &str,
+    ) -> Result<Vec<models::RemoteTagInfo>, PluginError> {
+        validate_git_url(url)?;
+        let url_clone = url.to_string();
+        tokio::task::spawn_blocking(move || git_ops::list_remote_tags(&url_clone))
+            .await
+            .map_err(|e| PluginError::CloneFailed {
+                stderr: format!("list_remote_tags task panicked: {}", e),
+            })?
+    }
+
+    /// 安装插件（git clone，可选 checkout 到指定 tag）
     ///
     /// 流程：
     /// 1. 校验 URL（仅 https://）
     /// 2. derive_plugin_name → 检查是否已存在
     /// 3. with_plugin_lock
-    /// 4. spawn_blocking(git2 clone + 流式进度)
-    /// 5. 读 __init__.py / pyproject.toml 取描述
-    /// 6. 检查 requirements.txt → install_requirements
-    /// 7. invalidate_list_cache + emit(PluginListChanged)
+    /// 4. spawn_blocking(git2 clone)
+    /// 5. 如果 tag 参数存在 → checkout 到该 tag（detached HEAD）
+    /// 6. 读 __init__.py / pyproject.toml 取描述
+    /// 7. 检查 requirements.txt → install_requirements
+    /// 8. invalidate_list_cache + emit(PluginListChanged)
     pub async fn install<F>(
         &self,
         url: &str,
+        tag: Option<&str>,
         progress: F,
     ) -> Result<PluginInfo, PluginError>
     where
@@ -221,8 +240,28 @@ impl PluginManagerService {
         }
         // clone 成功后 Repository 实例不需要保留（info 在后续 spawn_blocking 中重新打开）
 
+        // 4.5 如果指定了 tag → checkout 到该 tag（detached HEAD）
+        if let Some(tag_name) = tag {
+            let target_dir_checkout = target_dir.clone();
+            let tag_name_clone = tag_name.to_string();
+            let checkout_result = tokio::task::spawn_blocking(move || -> Result<(), PluginError> {
+                let repo = git2::Repository::open(&target_dir_checkout)?;
+                git_ops::checkout_tag(&repo, &tag_name_clone)
+            })
+            .await
+            .map_err(|e| PluginError::CloneFailed {
+                stderr: format!("checkout tag task panicked: {}", e),
+            })?;
+            if let Err(e) = checkout_result {
+                tracing::warn!(tag = tag_name, error = %e, "checkout tag failed, keeping default branch HEAD");
+                progress(PluginProgress::Failed {
+                    error: format!("切换到 tag {} 失败：{}（将使用默认分支）", tag_name, e),
+                });
+            }
+        }
+
         // 5. 读 git 信息 + 描述（路径热加载）
-        let info_result = tokio::task::spawn_blocking({
+        let mut info_result = tokio::task::spawn_blocking({
             let custom_nodes = self.current_custom_nodes_path();
             let plugin_name = plugin_name.clone();
             move || -> Result<PluginInfo, PluginError> {
@@ -264,9 +303,22 @@ impl PluginManagerService {
 
         // 6. install_requirements（如果 requirements.txt 存在）
         if !info_result.requirements_installed {
-            // 不阻塞 install 成功，仅 warn；前端通过 requirements_installed 字段判断
-            if let Err(e) = self.install_requirements(&info_result.name).await {
-                tracing::warn!(name = %info_result.name, error = %e, "requirements install failed");
+            progress(PluginProgress::InstallingRequirements { percent: 0 });
+            match self.install_requirements(&info_result.name).await {
+                Ok(()) => {
+                    info_result.requirements_installed = true;
+                    progress(PluginProgress::InstallingRequirements { percent: 100 });
+                }
+                Err(e) => {
+                    tracing::warn!(name = %info_result.name, error = %e, "requirements install failed");
+                    // 不阻塞安装成功，但通知前端依赖安装失败
+                    progress(PluginProgress::Failed {
+                        error: format!(
+                            "插件已安装，但依赖安装失败：{}\n请稍后在插件列表中点击「装依赖」重试",
+                            e
+                        ),
+                    });
+                }
             }
         }
 

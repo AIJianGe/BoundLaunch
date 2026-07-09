@@ -8,7 +8,8 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::app_state::AppState;
 use crate::plugin_manager::{
-    PluginInfo, PluginListResult, PluginProgress, PluginUpdateInfo, UninstallResult, UpdateResult,
+    PluginInfo, PluginListResult, PluginProgress, PluginUpdateInfo, RemoteTagInfo,
+    UninstallResult, UpdateResult,
 };
 
 /// 列出所有已安装插件（30s 缓存）
@@ -25,15 +26,17 @@ pub async fn plugin_list(
     })
 }
 
-/// 安装插件（git clone）
+/// 安装插件（git clone，可选 checkout 到指定 tag）
 ///
 /// - 仅支持 `https://` 协议
 /// - 已存在则返回 `AlreadyExists`
+/// - `tag` 非 None 时 clone 后 checkout 到该 tag（detached HEAD）
 /// - 克隆成功后自动尝试安装 requirements.txt（失败不影响插件本身可用）
 /// - 进度通过 `plugin_progress` 事件推送到前端
 #[tauri::command]
 pub async fn plugin_install(
     url: String,
+    tag: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PluginInfo, String> {
@@ -44,10 +47,32 @@ pub async fn plugin_install(
         }
     };
 
-    state.plugin_manager.install(&url, progress).await.map_err(|e| {
-        tracing::error!(error = %e, url = %url, "plugin_install failed");
-        e.to_string()
-    })
+    state
+        .plugin_manager
+        .install(&url, tag.as_deref(), progress)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, url = %url, "plugin_install failed");
+            e.to_string()
+        })
+}
+
+/// 列出远程仓库的 tag（不下载整个仓库，仅 ls-remote）
+///
+/// 用于安装前让用户选择 tag 版本。返回按名称降序排列。
+#[tauri::command]
+pub async fn plugin_list_remote_tags(
+    url: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<RemoteTagInfo>, String> {
+    state
+        .plugin_manager
+        .list_remote_tags(&url)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, url = %url, "plugin_list_remote_tags failed");
+            e.to_string()
+        })
 }
 
 /// 更新插件（git pull）

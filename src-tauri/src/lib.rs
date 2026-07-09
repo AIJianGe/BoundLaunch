@@ -406,6 +406,7 @@ pub fn run() {
             // PluginManager
             commands::plugin_manager::plugin_list,
             commands::plugin_manager::plugin_install,
+            commands::plugin_manager::plugin_list_remote_tags,
             commands::plugin_manager::plugin_update,
             commands::plugin_manager::plugin_uninstall,
             commands::plugin_manager::plugin_toggle,

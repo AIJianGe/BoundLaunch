@@ -472,15 +472,57 @@ export type SwitchRepoResult =
 
 export type PluginStatus = "enabled" | "disabled" | "updating" | "error";
 
+/** 单个插件信息（对应后端 plugin_manager/models.rs::PluginInfo） */
 export interface PluginInfo {
+  /** 插件名（去掉 .disabled 后缀的目录名） */
   name: string;
-  git_url: string;
+  /** 目录名（可能是 xxx.disabled） */
+  dir_name: string;
   enabled: boolean;
-  installed: boolean;
-  current_commit: string | null;
+  git_url: string | null;
+  current_commit: string;
+  current_branch: string | null;
+  /** null = 未检查；boolean = 已检查结果 */
+  has_updates: boolean | null;
+  has_local_changes: boolean;
+  installed_at: string | null;
+  /** 从 pyproject.toml / __init__.py 读取的描述 */
+  description: string | null;
+  /** 无 requirements.txt 视为 true；有则暂视为 false */
+  requirements_installed: boolean;
+}
+
+/** 插件列表查询结果（对应后端 PluginListResult） */
+export interface PluginListResult {
+  plugins: PluginInfo[];
+  fetched_at: string;
+}
+
+/** 插件更新检查结果（对应后端 PluginUpdateInfo） */
+export interface PluginUpdateInfo {
+  name: string;
+  has_update: boolean;
+  current_commit: string;
   latest_commit: string | null;
-  has_updates: boolean;
-  last_updated: string | null;
+}
+
+/** 插件更新结果（对应后端 UpdateResult） */
+export type UpdateResult =
+  | { kind: "updated"; from: string; to: string }
+  | { kind: "already_up_to_date" };
+
+/** 插件卸载结果（对应后端 UninstallResult） */
+export interface UninstallResult {
+  moved_to: string;
+  recoverable: boolean;
+}
+
+/** 远程仓库 tag 信息（对应后端 RemoteTagInfo） */
+export interface RemoteTagInfo {
+  /** tag 名称，如 "v1.2.0" */
+  name: string;
+  /** tag 对应的 commit hash */
+  commit: string;
 }
 
 // ============================================================================
