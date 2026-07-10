@@ -30,9 +30,34 @@ pub struct Config {
 }
 
 /// 路径配置
+///
+/// **v3.x 绿色版关键设计**：本结构**不**持久化到 config.toml！
+///
+/// ## 为什么
+///
+/// 绿色版（launcher-portable.dat 存在）的核心需求是"**复制多目录 = 多环境**"。
+/// 用户经常把整个环境目录用 zip 工具压缩后分发到新位置解压。
+/// 如果 config.toml 里存了**绝对路径**（如 `D:\EnvA\ComfyUI`），分发到 `E:\EnvB\` 后
+/// 路径失效，配置变成"看上去配好了但找不到 ComfyUI"的状态。
+///
+/// ## 解决方案
+///
+/// - 所有路径字段加 `#[serde(default, skip_serializing)]`
+/// - config.toml **不**写 [paths] 段
+/// - 内存中 cfg.paths 永远从 `launcher-portable.dat` 解析（`apply_default_paths`）
+/// - 解压到新目录 → env_paths 自动用新 `<exe_dir>` 解析 → 路径自动适配 ✅
+///
+/// ## 用户改路径怎么办
+///
+/// 绿色版用户想改 ComfyUI / venv 路径 → 直接编辑 `launcher-portable.dat`（相对路径）。
+/// UI 上"仓库地址管理"页面的路径字段展示的是**当前解析结果**，修改后**不持久化**到 config.toml。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathsConfig {
     /// ComfyUI 仓库根目录
+    ///
+    /// 内存中：来自 `env_paths::resolve()` 解析的绝对路径（每次启动重新解析）
+    /// 持久化：**不**写入 config.toml（v3.x 绿色版约定）
+    #[serde(default, skip_serializing)]
     pub comfyui_root: PathBuf,
     /// venv 虚拟环境路径
     ///
@@ -44,8 +69,16 @@ pub struct PathsConfig {
     /// `uv pip install` 修改 venv 内部文件（.lock、site-packages 等）会触发启动器重启，
     /// 导致长任务（torch 安装）被打断、用户环境永远装不全。
     /// 校验函数：[`crate::config::service::validate_paths`]
+    ///
+    /// 内存中：来自 `env_paths::resolve()` 解析的绝对路径
+    /// 持久化：**不**写入 config.toml（v3.x 绿色版约定）
+    #[serde(default, skip_serializing)]
     pub venv_path: PathBuf,
     /// Python 版本（如 "3.11"）
+    ///
+    /// 内存中：从已安装的 venv 解析
+    /// 持久化：**不**写入 config.toml（避免"版本对了但 venv 在别处"的混乱）
+    #[serde(default, skip_serializing)]
     pub python_version: String,
     /// 自定义 models 数据目录（v3.1 / F26 决策 12：C. 只允许 models 路径自定义）
     ///
@@ -54,7 +87,7 @@ pub struct PathsConfig {
     ///   `<comfyui_root>/models` 软链接到该路径，实现跨版本共享模型数据
     ///
     /// 切换 ComfyUI 版本时，会重新建立软链接关系，确保数据不丢失。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub models_path: Option<PathBuf>,
     /// ComfyUI 仓库 URL（F31 新增）
     ///
@@ -63,7 +96,9 @@ pub struct PathsConfig {
     ///
     /// 日志和 UI 显示时需脱敏（把 token 部分替换为 ***）。
     /// 切换仓库地址时由 `core_set_repo_url` 命令写入。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// 持久化：**不**写入 config.toml（绿色版约定）
+    #[serde(default, skip_serializing)]
     pub comfyui_repo_url: Option<String>,
     /// 引导安装默认版本（v3.10 新增）
     ///
@@ -76,7 +111,9 @@ pub struct PathsConfig {
     ///
     /// 校验：`update_latest_stable_for_installation` 中若 tag 不存在，
     /// 降级到自动规则 + warn 日志（不阻塞 onboarding）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// 持久化：**不**写入 config.toml（绿色版约定）
+    #[serde(default, skip_serializing)]
     pub installation_default_version: Option<String>,
     /// v3.x：custom_nodes 绝对路径
     ///
@@ -89,7 +126,7 @@ pub struct PathsConfig {
     /// - ComfyUI 启动时是否生效，取决于 `comfyui_base_directory` 字段：
     ///   - `comfyui_base_directory == comfyui_root` → ComfyUI 用 `folder_paths.py:41` 默认 → 找到这里
     ///   - 不等 → launcher 启动 ComfyUI 时加 `--base-directory <...>` 让 ComfyUI 用新 base
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub custom_nodes_path: Option<PathBuf>,
     /// v3.x：ComfyUI 启动时要传的 `--base-directory` 参数值
     ///
@@ -102,7 +139,7 @@ pub struct PathsConfig {
     /// **典型用法**：
     /// - 默认：`None`（不传）→ ComfyUI 内部默认
     /// - 自定义 custom_nodes 在 ComfyUI 外：`Some(custom_nodes 父目录)`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub comfyui_base_directory: Option<PathBuf>,
 }
 

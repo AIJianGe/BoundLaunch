@@ -27,10 +27,15 @@ pub struct ConfigService {
 impl ConfigService {
     /// 加载配置文件
     ///
-    /// 文件不存在时自动创建默认配置
-    /// TOML 解析失败时备份原文件 + 创建默认配置
+    /// **v3.x 绿色版行为变更**：
+    /// - 文件不存在时**不**自动创建 config.toml（避免"看上去配好了"的污染）
+    /// - 内存中用默认 Config（paths 由 `apply_default_paths` 从 `launcher-portable.dat` 解析注入）
+    /// - 第一次 `update()` 才会真正写盘
+    /// - 加载现有文件时，**重新注入** paths（忽略文件里的旧值，保证跨目录分发后路径自动适配）
+    ///
+    /// TOML 解析失败时备份原文件 + 内存用默认配置
     pub async fn load(path: PathBuf, event_bus: EventBus) -> Result<Self, ConfigError> {
-        // 确保父目录存在
+        // 确保父目录存在（v3.x：保留，让 SQLite 之类能找到 data/）
         if let Some(parent) = path.parent() {
             paths::ensure_dir(parent).await.map_err(io_err)?;
         }
@@ -88,23 +93,30 @@ impl ConfigService {
                         cfg.paths.venv_path = new_venv;
                         save_to_disk(&path, &cfg).await?;
                     }
+                    // **v3.x 绿色版**：重新注入 paths 字段
+                    //
+                    // 原因：用户可能从 A 目录压缩整个环境分发到 B 目录解压启动。
+                    // config.toml 里旧的 paths（来自 A 目录）已失效，必须用 B 目录重新解析。
+                    // 配合 models.rs 的 `skip_serializing`，写盘时 paths 永远不会被持久化。
+                    apply_default_paths(&mut cfg);
                     cfg
                 }
                 Err(e) => {
-                    // 解析失败：备份 + 创建默认
+                    // 解析失败：备份 + 内存用默认（**v3.x：不写新文件**）
                     let backup = path.with_extension(format!("toml.corrupt-{}", chrono::Utc::now().timestamp()));
                     tracing::warn!(error = %e, ?backup, "config parse failed, backing up");
                     let _ = tokio::fs::rename(&path, &backup).await;
-                    let cfg = build_default_config();
-                    save_to_disk(&path, &cfg).await?;
-                    cfg
+                    build_default_config()
                 }
             }
         } else {
-            // 文件不存在：创建默认
-            let cfg = build_default_config();
-            save_to_disk(&path, &cfg).await?;
-            cfg
+            // **v3.x 绿色版**：config.toml 不存在时**不**创建
+            //
+            // 理由：解压到新目录后，BoundLaunch 首次启动不应该"看上去配好了"。
+            // 让用户认为这是全新环境，所有配置由 launcher-portable.dat 决定。
+            // 等用户**首次 update** 时才真正写盘（此时用户已经显式改过配置）。
+            // apply_default_paths 已经在 build_default_config 里调过了
+            build_default_config()
         };
 
         Ok(Self {
@@ -541,6 +553,7 @@ mod tests {
         EventBus::new()
     }
 
+    /// **v3.x 绿色版**：load() 不创建 config.toml（等首次 update 时才创建）
     #[tokio::test]
     async fn test_load_default_when_absent() {
         let dir = tempdir().unwrap();
@@ -548,10 +561,39 @@ mod tests {
         let svc = ConfigService::load(path.clone(), test_event_bus()).await.unwrap();
 
         assert_eq!(svc.config_path(), path);
-        // 文件应被创建
-        assert!(path.exists());
-        // 加载的应该是默认值
+        // v3.x：首次 load **不**创建文件（让"看上去没配置过"成为默认）
+        assert!(!path.exists(), "v3.x: 首次启动不应自动创建 config.toml");
+        // 内存中应该有默认配置
         assert_eq!(svc.get().launch.listen_port, 8188);
+    }
+
+    /// **v3.x**：第一次 update 才创建 config.toml
+    #[tokio::test]
+    async fn test_load_creates_config_on_first_update() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let svc = ConfigService::load(path.clone(), test_event_bus()).await.unwrap();
+
+        // load 不创建
+        assert!(!path.exists());
+
+        // update 后才创建
+        svc.update(|cfg| {
+            cfg.launch.listen_port = 9999;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(path.exists(), "v3.x: 首次 update 后应创建 config.toml");
+
+        // **v3.x 绿色版关键断言**：config.toml 里**不**含 [paths] 段
+        // 配合 models.rs 的 skip_serializing
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("[paths]"),
+            "v3.x: config.toml 不应包含 [paths] 段（paths 字段 skip_serializing）"
+        );
     }
 
     #[tokio::test]

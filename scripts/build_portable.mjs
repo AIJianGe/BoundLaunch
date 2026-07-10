@@ -43,7 +43,6 @@ import {
   existsSync,
   mkdirSync,
   copyFileSync,
-  copySync,
   readFileSync,
   writeFileSync,
   readdirSync,
@@ -52,6 +51,33 @@ import {
 } from "node:fs";
 import { join, resolve, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+
+// ============================================================================
+// 工具函数：递归复制目录
+// ============================================================================
+//
+// **为什么手写而不是用 fs-extra**：
+// - Node.js 内置 `fs.copyFileSync` 只支持单文件，不支持目录递归
+// - 引入 fs-extra 增加 ~1MB 依赖，且需要 npm install
+// - 手写 ~20 行即可，避免外部依赖
+//
+// 与 `fs-extra.copySync(src, dest, { recursive: true })` 行为等价：
+// - 源是目录 → 递归复制整个目录
+// - 源是文件 → 复制单文件
+// - 自动创建目标父目录
+function copyDirSync(src, dest) {
+  const stat = statSync(src);
+  if (stat.isDirectory()) {
+    mkdirSync(dest, { recursive: true });
+    for (const entry of readdirSync(src)) {
+      copyDirSync(join(src, entry), join(dest, entry));
+    }
+  } else {
+    mkdirSync(dirname(dest), { recursive: true });
+    copyFileSync(src, dest);
+  }
+}
 import { createWriteStream } from "node:fs";
 import { createGzip } from "node:zlib";
 import { createReadStream } from "node:fs";
@@ -130,15 +156,31 @@ function preparePortableDir(version) {
   mkdirSync(portableDir, { recursive: true });
 
   // 拷贝 BoundLaunch.exe
-  const exeName = "BoundLaunch.exe";
-  const exeSrc = join(TAURI_TARGET, exeName);
-  if (!existsSync(exeSrc)) {
-    log("error", `未找到 ${exeSrc}`);
-    log("error", "请先运行 `cargo build --release`");
+  //
+  // **多来源兼容**：
+  // - `BoundLaunch.exe`（大写）来自 `tauri build`（走 productName 重命名）
+  // - `bound-launch.exe`（小写+连字符）来自 `cargo build`（按 Cargo.toml name）
+  //
+  // 优先用 tauri 产物（更规范），找不到再 fallback 到 cargo 原始产物。
+  // 不管哪个来源，**输出到 portable 目录时统一改成 BoundLaunch.exe**（与 productName 对齐）。
+  const candidates = ["BoundLaunch.exe", "bound-launch.exe"];
+  let actualExeName = null;
+  for (const name of candidates) {
+    const src = join(TAURI_TARGET, name);
+    if (existsSync(src)) {
+      actualExeName = name;
+      break;
+    }
+  }
+  if (!actualExeName) {
+    log("error", `未找到 ${TAURI_TARGET}/{${candidates.join(", ")}}`);
+    log("error", "请先运行 `cargo build --release` 或 `npx tauri build`");
     process.exit(1);
   }
+  const exeName = "BoundLaunch.exe";  // 输出统一用 productName
+  const exeSrc = join(TAURI_TARGET, actualExeName);
   copyFileSync(exeSrc, join(portableDir, exeName));
-  log("info", `已拷贝 ${exeName} (${formatSize(statSync(exeSrc).size)})`);
+  log("info", `已拷贝 ${actualExeName} -> ${exeName} (${formatSize(statSync(exeSrc).size)})`);
 
   // 拷贝 BoundLaunch.dll
   const dllName = "BoundLaunch.dll";
@@ -153,7 +195,7 @@ function preparePortableDir(version) {
   // 拷贝 resources/uv
   if (existsSync(RESOURCES_UV)) {
     const uvTarget = join(portableDir, "resources", "uv");
-    copySync(RESOURCES_UV, uvTarget, { recursive: true });
+    copyDirSync(RESOURCES_UV, uvTarget);
     const uvFiles = readdirSync(uvTarget);
     log("info", `已拷贝 resources/uv/ (${uvFiles.length} 个文件)`);
   } else {
@@ -339,7 +381,6 @@ async function packZip(portableDir, version) {
 // ============================================================================
 
 function computeHash(filePath) {
-  const { createHash } = require("node:crypto");
   const hash = createHash("sha256");
   const data = readFileSync(filePath);
   hash.update(data);

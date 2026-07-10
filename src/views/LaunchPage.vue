@@ -38,8 +38,10 @@ import BasicParamsForm from "@/components/launch/BasicParamsForm.vue";
 import DependencyList from "@/components/launch/DependencyList.vue";
 import CommandPreview from "@/components/launch/CommandPreview.vue";
 import AdvancedParamsPanel from "@/components/launch/AdvancedParamsPanel.vue";
-// v3.2.2：实时终端面板（订阅 comfyui_log 事件）
-import TerminalPanel from "@/components/launch/TerminalPanel.vue";
+// v3.2.2：实时终端面板（订阅 comfyui_log 事件）—— v3.x 移除
+// 原因：侧边栏已有独立"终端"页面（LogsPage 的 TerminalTab），首页保留会重复
+// 移除时间：v3.x
+// import TerminalPanel from "@/components/launch/TerminalPanel.vue";
 // v2.18：服务状态合并到 StatusCard，移除 RunningStatusPanel
 // import RunningStatusPanel from "@/components/launch/RunningStatusPanel.vue";
 
@@ -173,11 +175,13 @@ const initialLoading = computed(
       <!-- §3.6 命令预览 -->
       <CommandPreview />
 
-      <!-- §3.7 高级参数折叠 -->
+      <!-- v3.7：高级参数折叠 -->
       <AdvancedParamsPanel />
 
-      <!-- v3.2.2：实时终端面板（订阅 comfyui_log 事件，显示 ComfyUI stdout/stderr） -->
-      <TerminalPanel />
+      <!-- v3.x：移除首页的实时终端面板
+           原因：侧边栏已有独立"终端"页面（LogsPage 的 TerminalTab），
+           用户从那里能看到完整实时输出。
+           详见 PR/06-界面设计.md §3 首页布局 -->
 
       <!-- v2.18：§3.8 启动后状态合并到 StatusCard，不再单独渲染 -->
       <!-- <RunningStatusPanel /> -->
