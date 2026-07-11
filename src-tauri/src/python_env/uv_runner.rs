@@ -209,10 +209,11 @@ impl UvRunner {
             .map_err(|e| EnvError::TorchInstallFailed(e.to_string()))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(EnvError::TorchInstallFailed(format!(
-                "torch 主包安装失败: {}",
-                stderr
-            )));
+            // **v3.x Phase 2**：失败时调智能推荐算 fallback
+            return Err(self.compute_torch_incompatible_error(
+                cuda_version,
+                format!("torch 主包安装失败: {}", stderr),
+            ).await);
         }
 
         if cancel.is_cancelled() {
@@ -268,10 +269,11 @@ impl UvRunner {
             .map_err(|e| EnvError::TorchInstallFailed(e.to_string()))?;
         if !output2.status.success() {
             let stderr = String::from_utf8_lossy(&output2.stderr);
-            return Err(EnvError::TorchInstallFailed(format!(
-                "torchvision/torchaudio 安装失败: {}",
-                stderr
-            )));
+            // **v3.x Phase 2**：失败时调智能推荐算 fallback
+            return Err(self.compute_torch_incompatible_error(
+                cuda_version,
+                format!("torchvision/torchaudio 安装失败: {}", stderr),
+            ).await);
         }
 
         if cancel.is_cancelled() {
@@ -934,6 +936,49 @@ impl UvRunner {
             "requirements upgraded with --force-reinstall"
         );
         Ok(())
+    }
+
+    /// **v3.x Phase 2**：torch 安装失败时算 fallback 错误
+    ///
+    /// 调 `get_or_detect()` 拿当前 GPU，调 `recommend_torch_variant_with_gpus()` 算推荐值。
+    /// `check_driver_compatibility` 内部已经会基于 driver_major 降级到合适的 CUDA，
+    /// 所以推荐结果就是 fallback。
+    ///
+    /// fallback 是字符串形式（"cu118" / "cu126" / "cu128" / "cu130"），
+    /// 这样 EnvError 不需要依赖 config::CudaVersion 类型。
+    async fn compute_torch_incompatible_error(
+        &self,
+        attempted: &crate::config::CudaVersion,
+        reason: String,
+    ) -> EnvError {
+        let gpus = crate::system::gpu_cache::get_or_detect().await;
+        let recommended = crate::system::recommend::recommend_torch_variant_with_gpus(&gpus);
+        let fallback_str = if let crate::python_env::torch_variant::TorchVariant::NvidiaCuda(cuda) =
+            recommended
+        {
+            Some(
+                match cuda {
+                    crate::python_env::torch_variant::CudaVersion::V11_8 => "cu118",
+                    crate::python_env::torch_variant::CudaVersion::V12_6 => "cu126",
+                    crate::python_env::torch_variant::CudaVersion::V12_8 => "cu128",
+                    crate::python_env::torch_variant::CudaVersion::V13_0 => "cu130",
+                }
+                .to_string(),
+            )
+        } else {
+            None
+        };
+        tracing::warn!(
+            attempted = ?attempted,
+            fallback = ?fallback_str,
+            reason = %reason,
+            "v3.x Phase 2: torch 安装失败，返回带 fallback 建议的结构化错误"
+        );
+        EnvError::TorchIncompatible {
+            attempted: format!("{:?}", attempted),
+            reason,
+            fallback: fallback_str,
+        }
     }
 
     /// 执行 uv 子命令（带 CancellationToken）

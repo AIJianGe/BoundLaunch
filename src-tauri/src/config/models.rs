@@ -31,7 +31,7 @@ pub struct Config {
 
 /// 路径配置
 ///
-/// **v3.x 绿色版关键设计**：本结构**不**持久化到 config.toml！
+/// **v3.x 绿色版关键设计**：本结构**只在 TOML 持久化时跳过**，不影响 invoke 序列化！
 ///
 /// ## 为什么
 ///
@@ -40,24 +40,31 @@ pub struct Config {
 /// 如果 config.toml 里存了**绝对路径**（如 `D:\EnvA\ComfyUI`），分发到 `E:\EnvB\` 后
 /// 路径失效，配置变成"看上去配好了但找不到 ComfyUI"的状态。
 ///
-/// ## 解决方案
+/// ## 解决方案（v3.x 修复版）
 ///
-/// - 所有路径字段加 `#[serde(default, skip_serializing)]`
-/// - config.toml **不**写 [paths] 段
+/// - **invoke 序列化**（给前端）：返回完整 PathsConfig
+///   - 前端依赖 `cfg.paths.comfyui_root` 做路由守卫、UI 展示
+///   - **绝对不能 skip**（否则路由守卫会误判为"未初始化"，把用户弹回 /onboarding）
+/// - **TOML 持久化**（写 config.toml）：用 `ConfigForToml` 视图结构**根本不带 paths 段**
+///   - 旧版用 `#[serde(skip_serializing)]` 同时影响两个序列化器 → 导致前端拿不到
+///   - 修复：去掉字段级 skip_serializing，改用视图结构控制 TOML 序列化
 /// - 内存中 cfg.paths 永远从 `launcher-portable.dat` 解析（`apply_default_paths`）
-/// - 解压到新目录 → env_paths 自动用新 `<exe_dir>` 解析 → 路径自动适配 ✅
+///   - 解压到新目录 → env_paths 自动用新 `<exe_dir>` 解析 → 路径自动适配 ✅
 ///
 /// ## 用户改路径怎么办
 ///
 /// 绿色版用户想改 ComfyUI / venv 路径 → 直接编辑 `launcher-portable.dat`（相对路径）。
 /// UI 上"仓库地址管理"页面的路径字段展示的是**当前解析结果**，修改后**不持久化**到 config.toml。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PathsConfig {
     /// ComfyUI 仓库根目录
     ///
     /// 内存中：来自 `env_paths::resolve()` 解析的绝对路径（每次启动重新解析）
     /// 持久化：**不**写入 config.toml（v3.x 绿色版约定）
-    #[serde(default, skip_serializing)]
+    ///
+    /// v3.x 修复：去掉 `skip_serializing`，让前端 invoke 能拿到这个字段。
+    /// TOML 持久化由 `ConfigForToml` 视图结构控制（不写 paths 段）。
+    #[serde(default)]
     pub comfyui_root: PathBuf,
     /// venv 虚拟环境路径
     ///
@@ -72,13 +79,13 @@ pub struct PathsConfig {
     ///
     /// 内存中：来自 `env_paths::resolve()` 解析的绝对路径
     /// 持久化：**不**写入 config.toml（v3.x 绿色版约定）
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub venv_path: PathBuf,
     /// Python 版本（如 "3.11"）
     ///
     /// 内存中：从已安装的 venv 解析
     /// 持久化：**不**写入 config.toml（避免"版本对了但 venv 在别处"的混乱）
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub python_version: String,
     /// 自定义 models 数据目录（v3.1 / F26 决策 12：C. 只允许 models 路径自定义）
     ///
@@ -87,7 +94,7 @@ pub struct PathsConfig {
     ///   `<comfyui_root>/models` 软链接到该路径，实现跨版本共享模型数据
     ///
     /// 切换 ComfyUI 版本时，会重新建立软链接关系，确保数据不丢失。
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub models_path: Option<PathBuf>,
     /// ComfyUI 仓库 URL（F31 新增）
     ///
@@ -98,7 +105,7 @@ pub struct PathsConfig {
     /// 切换仓库地址时由 `core_set_repo_url` 命令写入。
     ///
     /// 持久化：**不**写入 config.toml（绿色版约定）
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub comfyui_repo_url: Option<String>,
     /// 引导安装默认版本（v3.10 新增）
     ///
@@ -113,7 +120,7 @@ pub struct PathsConfig {
     /// 降级到自动规则 + warn 日志（不阻塞 onboarding）
     ///
     /// 持久化：**不**写入 config.toml（绿色版约定）
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub installation_default_version: Option<String>,
     /// v3.x：custom_nodes 绝对路径
     ///
@@ -126,7 +133,7 @@ pub struct PathsConfig {
     /// - ComfyUI 启动时是否生效，取决于 `comfyui_base_directory` 字段：
     ///   - `comfyui_base_directory == comfyui_root` → ComfyUI 用 `folder_paths.py:41` 默认 → 找到这里
     ///   - 不等 → launcher 启动 ComfyUI 时加 `--base-directory <...>` 让 ComfyUI 用新 base
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub custom_nodes_path: Option<PathBuf>,
     /// v3.x：ComfyUI 启动时要传的 `--base-directory` 参数值
     ///
@@ -139,7 +146,7 @@ pub struct PathsConfig {
     /// **典型用法**：
     /// - 默认：`None`（不传）→ ComfyUI 内部默认
     /// - 自定义 custom_nodes 在 ComfyUI 外：`Some(custom_nodes 父目录)`
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub comfyui_base_directory: Option<PathBuf>,
 }
 
@@ -160,6 +167,43 @@ pub struct LaunchConfig {
     pub custom_args: String,
     /// 高级参数
     pub advanced: AdvancedArgs,
+    /// **v3.x Phase 5**：多 GPU 选择（仅"全部使用"和"单卡模式"）
+    ///
+    /// - `None` 或 `{ mode: "all" }`：所有 GPU 都参与（不设 CUDA_VISIBLE_DEVICES）
+    /// - `{ mode: "single", single_index: 0 }`：只用第 0 块 GPU（CUDA_VISIBLE_DEVICES=0）
+    ///
+    /// 不存到 `config.toml` 路径相关字段（与 paths 不同），但作为 launch 配置项持久化。
+    /// 简化决策：暂不考虑 NVLink 集群等高级配置。
+    #[serde(default)]
+    pub gpu_selection: Option<GpuSelectionConfig>,
+}
+
+/// v3.x Phase 5：多 GPU 选择配置
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct GpuSelectionConfig {
+    /// 选择模式
+    pub mode: GpuSelectionMode,
+    /// 单卡模式时选中的 GPU 索引（0-based）
+    pub single_index: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuSelectionMode {
+    /// 全部使用
+    All,
+    /// 单卡模式
+    Single,
+}
+
+impl Default for GpuSelectionConfig {
+    fn default() -> Self {
+        Self {
+            mode: GpuSelectionMode::All,
+            single_index: 0,
+        }
+    }
 }
 
 /// 运行模式
@@ -434,6 +478,8 @@ impl Default for Config {
                 preview_method: PreviewMethod::Latent2Rgb,
                 custom_args: String::new(),
                 advanced: AdvancedArgs::default(),
+                // v3.x Phase 5：默认全部 GPU
+                gpu_selection: Some(GpuSelectionConfig::default()),
             },
             torch: TorchConfig {
                 // v3.7：默认 CUDA 12.8（PyTorch 2.11 稳定版推荐）
@@ -508,6 +554,8 @@ pub struct LaunchConfigPatch {
     pub preview_method: Option<PreviewMethod>,
     pub custom_args: Option<String>,
     pub advanced: Option<AdvancedArgs>,
+    /// **v3.x Phase 5**：多 GPU 选择 patch
+    pub gpu_selection: Option<GpuSelectionConfig>,
 }
 
 /// Torch section 的 patch
@@ -624,6 +672,113 @@ fn normalize_path_separators(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+// ============================================================================
+// v3.x：TOML 持久化专用视图（关键修复）
+// ============================================================================
+
+/// **v3.x 关键修复**：TOML 持久化专用视图结构
+///
+/// ## 为什么需要这个
+///
+/// 之前 PathsConfig 字段标了 `#[serde(skip_serializing)]`，意图是不让绝对路径
+/// 写入 config.toml（绿色版约定：复制目录后路径自动适配）。
+///
+/// **但 `skip_serializing` 是 serde 级别标记，对所有序列化器都生效**——
+/// 包括 `serde_json`（Tauri invoke 用）。结果：
+/// - 前端拿到的 `cfg.paths.comfyui_root` 永远是空字符串
+/// - 路由守卫 `!configStore.comfyuiRoot === true` → 把用户弹回 /onboarding
+/// - 看起来"按钮没反应"或"页面没跳转"
+///
+/// ## 修复方案
+///
+/// - **PathsConfig 字段**：去掉 `skip_serializing`，只保留 `#[serde(default)]`
+///   - 反序列化时缺失字段用默认值（PathBuf::new() / 空字符串）
+///   - 序列化时正常写出所有字段
+/// - **TOML 持久化**：用本视图结构 `ConfigForToml`
+///   - **不**包含 `paths` 字段（绝对路径不写到 config.toml）
+///   - 也不包含 `listen_port`（来自 `launcher-portable.dat`，每个目录独立）
+///   - launch 段保留其他用户配置（mode / listen_host / preview_method / custom_args / advanced / gpu_selection）
+/// - **invoke 序列化**（给前端）：走完整 `Config`（带 paths）
+///   - 前端 `configStore.comfyuiRoot` 能拿到真实路径
+///   - 路由守卫正常工作
+///
+/// ## 不同目录互不影响（绿色版核心保证）
+///
+/// - `launcher-portable.dat` 每个目录独立
+/// - config.toml **不**含绝对路径 + listen_port
+/// - 复制目录到新位置 → 启动时 `env_paths::resolve()` 用新 `<exe_dir>` 重新解析
+///   - 绝对路径自动适配 ✅
+///   - 端口自动适配（每个目录可独立配置）✅
+/// - WebView2 UserData / SQLite 数据库 已在 `exe_dir/.boundlaunch/`（不同目录天然隔离）
+#[derive(Debug, Serialize)]
+pub struct ConfigForToml<'a> {
+    /// 配置 schema 版本
+    pub schema_version: u32,
+    /// v3.x：环境名（来自 launcher-portable.dat 或目录名）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_name: Option<&'a str>,
+    /// 启动配置
+    pub launch: LaunchConfigForToml<'a>,
+    /// torch 配置
+    pub torch: &'a TorchConfig,
+    /// UI 配置
+    pub ui: &'a UiConfig,
+    /// v3.x：models 段已废弃，仅用于向后兼容
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models: Option<&'a serde_json::Value>,
+}
+
+/// **v3.x 关键修复**：LaunchConfig 的 TOML 视图
+///
+/// **listen_port 字段说明**：
+/// - 字段正常序列化到 TOML（保留老用户的自定义端口）
+/// - 但在 portable 模式下，`apply_default_paths` 会**总是**用 `resolved.port` 覆盖
+///   - `launcher-portable.dat` 定义每个绿色版目录的端口
+///   - 复制目录到新位置 → resolved 用新目录的端口 → listen_port 立即更新
+///   - 老用户的自定义端口会被覆盖（这是绿色版"目录级配置"约定的代价）
+/// - 非 portable 模式（传统安装）→ `apply_default_paths` 不覆盖 → 老用户端口保留
+///
+/// 其他字段正常持久化（mode / listen_host / auto_open_browser / preview_method /
+/// custom_args / advanced / gpu_selection 都是用户级配置，不依赖目录）。
+#[derive(Debug, Serialize)]
+pub struct LaunchConfigForToml<'a> {
+    pub mode: &'a LaunchMode,
+    pub listen_host: &'a str,
+    /// 启动端口
+    /// - 非便携版：用户配置 → 写 TOML → 重启保留
+    /// - 绿色版：被 `apply_default_paths` 每次启动用 `resolved.port` 覆盖
+    pub listen_port: u16,
+    pub auto_open_browser: bool,
+    pub preview_method: &'a PreviewMethod,
+    pub custom_args: &'a str,
+    pub advanced: &'a AdvancedArgs,
+    /// v3.x Phase 5：多 GPU 选择
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_selection: Option<&'a GpuSelectionConfig>,
+}
+
+impl<'a> From<&'a Config> for ConfigForToml<'a> {
+    fn from(cfg: &'a Config) -> Self {
+        Self {
+            schema_version: cfg.schema_version,
+            env_name: cfg.env_name.as_deref(),
+            launch: LaunchConfigForToml {
+                mode: &cfg.launch.mode,
+                listen_host: &cfg.launch.listen_host,
+                listen_port: cfg.launch.listen_port,
+                auto_open_browser: cfg.launch.auto_open_browser,
+                preview_method: &cfg.launch.preview_method,
+                custom_args: &cfg.launch.custom_args,
+                advanced: &cfg.launch.advanced,
+                gpu_selection: cfg.launch.gpu_selection.as_ref(),
+            },
+            torch: &cfg.torch,
+            ui: &cfg.ui,
+            models: cfg.models.as_ref(),
+        }
+    }
+}
+
 /// 把 LaunchConfigPatch 合并到 LaunchConfig
 pub fn apply_launch_patch(cfg: &mut LaunchConfig, patch: LaunchConfigPatch) {
     if let Some(v) = patch.mode {
@@ -646,6 +801,12 @@ pub fn apply_launch_patch(cfg: &mut LaunchConfig, patch: LaunchConfigPatch) {
     }
     if let Some(v) = patch.advanced {
         cfg.advanced = v;
+    }
+    // **v3.x Phase 5**：gpu_selection 接受 Some/None 两种语义
+    // - `Some(config)`：使用新配置
+    // - `None`：保留原值（patch 未传 = 不修改）
+    if let Some(v) = patch.gpu_selection {
+        cfg.gpu_selection = Some(v);
     }
 }
 

@@ -116,7 +116,15 @@ export function useEnvInstaller(): UseEnvInstallerReturn {
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      toast.error("环境补装失败", msg);
+      // **v3.x Phase 2**：检测是否为 torch 不兼容错误
+      // 触发全局事件让 HardwareChangeDialog / TorchInstallFallbackDialog 响应
+      if (msg.includes("torch 安装失败") && msg.includes(":")) {
+        window.dispatchEvent(
+          new CustomEvent("torch-install-incompatible", { detail: msg }),
+        );
+      } else {
+        toast.error("环境补装失败", msg);
+      }
       return false;
     } finally {
       installing.value = false;

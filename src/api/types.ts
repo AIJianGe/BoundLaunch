@@ -33,6 +33,19 @@ export interface AdvancedArgs {
   directml: boolean;
 }
 
+/**
+ * v3.x Phase 5：多 GPU 选择模式
+ */
+export type GpuSelectionMode = "all" | "single";
+
+/**
+ * v3.x Phase 5：多 GPU 选择配置
+ */
+export interface GpuSelectionConfig {
+  mode: GpuSelectionMode;
+  single_index: number;
+}
+
 export interface PathsConfig {
   comfyui_root: string;
   venv_path: string;
@@ -68,6 +81,8 @@ export interface LaunchConfig {
   preview_method: PreviewMethod;
   custom_args: string;
   advanced: AdvancedArgs;
+  /** v3.x Phase 5：多 GPU 选择（None = 全部使用） */
+  gpu_selection?: GpuSelectionConfig | null;
 }
 
 export interface TorchConfig {
@@ -913,3 +928,59 @@ export interface GpuInfo {
   /** ROCm 版本（AMD 专用，预留） */
   rocm_version: string | null;
 }
+
+// ============================================================================
+// v3.x Phase 3：硬件指纹（对应 src-tauri/src/system/hardware_fingerprint.rs）
+// ============================================================================
+
+/**
+ * 单次硬件探测快照（对应后端 `HardwareFingerprint`）
+ */
+export interface HardwareFingerprint {
+  gpu_models: string[];
+  nvidia_driver: string | null;
+  fingerprint_hash: string;
+  recorded_at: string;
+}
+
+/**
+ * 推荐的应对动作（对应后端 `RecommendedAction`）
+ */
+export type RecommendedAction = "no_action" | "reinstall_torch" | "optional";
+
+/**
+ * 硬件变化检测报告（对应后端 `HardwareChangeReport`）
+ */
+export interface HardwareChangeReport {
+  has_change: boolean;
+  current: HardwareFingerprint;
+  previous: HardwareFingerprint | null;
+  recommended_action: RecommendedAction;
+  notes: string[];
+}
+
+/**
+ * 驱动兼容性报告（v3.10）
+ *
+ * 后端 `DriverCompatReport` 的 serde 形式
+ */
+export interface DriverCompatReport {
+  severity: "ok" | "warning" | "error";
+  gpus: GpuInfo[];
+  recommended_variant: TorchVariant;
+  notes: string[];
+  recommendation: string;
+}
+
+/**
+ * venv torch 一致性检查结果
+ *
+ * 后端 `Option<Result<(), String>>` 的语义：
+ * - `null` → 探测失败（无 python / 无 torch / python 启动失败）
+ * - `{ ok: true }` → 一致
+ * - `{ ok: false, reason: string }` → 不一致
+ */
+export type VenvTorchConsistency =
+  | { ok: true }
+  | { ok: false; reason: string }
+  | null;

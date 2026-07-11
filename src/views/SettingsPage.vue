@@ -34,6 +34,7 @@ import DependenciesPanel from "@/components/settings/DependenciesPanel.vue";
 import UiPanel from "@/components/settings/UiPanel.vue";
 import DangerZonePanel from "@/components/settings/DangerZonePanel.vue";
 import DataLocationPanel from "@/components/settings/DataLocationPanel.vue"; // v1.8 / F38
+import GpuPanel from "@/components/settings/GpuPanel.vue"; // v3.x Phase 5
 
 const configStore = useConfigStore();
 const envStore = useEnvStore();
@@ -70,6 +71,7 @@ onMounted(async () => {
       <PathsPanel />
       <PythonVersionPanel />
       <TorchConfigPanel />
+      <GpuPanel />
       <TransformersConfigPanel />
       <DependenciesPanel />
       <UiPanel />

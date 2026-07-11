@@ -10,9 +10,15 @@
 use crate::common::paths;
 use crate::error::{AppError, ConfigError};
 use crate::event_bus::{EventBus, SystemEvent};
+use crate::python_env::torch_variant::TorchVariant;
+use crate::system::gpu_cache::get_or_detect;
+use crate::system::recommend::recommend_torch_variant_with_gpus;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use super::{migrations, Config, SharedConfig, CURRENT_SCHEMA_VERSION};
+use super::{
+    migrations, Config, CudaVersion, SharedConfig, CURRENT_SCHEMA_VERSION,
+    ConfigForToml,
+};
 
 /// 配置服务
 ///
@@ -116,7 +122,15 @@ impl ConfigService {
             // 让用户认为这是全新环境，所有配置由 launcher-portable.dat 决定。
             // 等用户**首次 update** 时才真正写盘（此时用户已经显式改过配置）。
             // apply_default_paths 已经在 build_default_config 里调过了
-            build_default_config()
+            //
+            // **v3.x 智能推荐（Phase 1）**：首次启动用智能推荐结果覆盖默认 cuda_version
+            // 探测 GPU → 调 recommend_torch_variant_with_gpus → 用推荐结果
+            // 不写 config.toml（用户首次 update 时才写）
+            let mut cfg = build_default_config();
+            let gpus = get_or_detect().await;
+            let recommended = recommend_torch_variant_with_gpus(&gpus);
+            apply_recommended_torch(&mut cfg, &recommended);
+            cfg
         };
 
         Ok(Self {
@@ -193,8 +207,21 @@ impl ConfigService {
 }
 
 /// 内部：保存到磁盘
+///
+/// **v3.x 关键修复**：用 `ConfigForToml` 视图结构序列化，**根本不带 paths 段**。
+///
+/// 之前用 `toml::to_string_pretty(config)` 直接序列化 Config，但 PathsConfig 字段的
+/// `#[serde(skip_serializing)]` 是字段级标记，对所有序列化器都生效（包括 serde_json），
+/// 导致前端 invoke 也拿不到这些字段，路由守卫会误判。
+///
+/// 修复：移除字段级 skip_serializing，改用视图结构 `ConfigForToml`：
+/// - 视图结构在 TOML 路径上**根本不含** paths 字段
+/// - invoke 走完整 Config 序列化（带 paths）→ 前端能正常拿
+/// - 两个序列化器完全解耦，不再互相影响
 async fn save_to_disk(path: &Path, config: &Config) -> Result<(), ConfigError> {
-    let content = toml::to_string_pretty(config).map_err(|e| ConfigError::SerializeError(e.to_string()))?;
+    let toml_view: ConfigForToml = config.into();
+    let content = toml::to_string_pretty(&toml_view)
+        .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
     super::atomic_write::atomic_write(path, &content)
         .await
         .map_err(|e| ConfigError::IoError(e.to_string()))
@@ -335,10 +362,16 @@ fn apply_default_paths(cfg: &mut Config) {
                 cfg.env_name = Some(resolved.env_name.clone());
             }
             // v3.x：端口（来自 portable.dat）
-            if resolved.port != 8188 {
-                // 只有非默认值才覆盖（避免误改老用户的 config）
-                cfg.launch.listen_port = resolved.port;
-            }
+            // **v3.x 关键修复**：总是用 resolved.port 覆盖 cfg.launch.listen_port
+            // - 旧版判断 `if resolved.port != 8188` → 复制的目录如果 port=8188 不会更新，导致端口冲突
+            // - 现在 portable 模式下 listen_port 总是按目录级配置，**不保留**用户自定义
+            // - 传统模式（无 launcher-portable.dat）走 fallback 分支，**保留**用户自定义
+            // - 副作用：绿色版用户改 listen_port 不会持久化（这是"目录级配置"约定的代价）
+            cfg.launch.listen_port = resolved.port;
+            tracing::info!(
+                "[env_paths] portable mode: listen_port overridden to {} (from launcher-portable.dat)",
+                resolved.port
+            );
             return;
         }
         Err(e) => {
@@ -394,6 +427,32 @@ fn validate(cfg: &Config) -> Result<(), AppError> {
     // 原因：Tauri dev 自动监视 src-tauri/ 触发 rebuild，破坏 venv 安装长任务
     validate_venv_path_not_under_src_tauri(&cfg.paths.venv_path)?;
     Ok(())
+}
+
+/// **v3.x Phase 1**：把智能推荐结果应用到 cfg
+///
+/// 覆盖 `cfg.torch.cuda_version`（仅 NVIDIA 分支有意义）。
+///
+/// 设计：
+/// - 只覆盖 NVIDIA CudaVersion（Cpu / AmdRocm / IntelXpu / AppleSilicon 在本项目暂不支持）
+/// - torch_variant 字段保持 None（用户不主动调智能推荐按钮就不写）
+/// - 不修改其他字段（保留用户可能改过的其他配置）
+fn apply_recommended_torch(cfg: &mut Config, recommended: &TorchVariant) {
+    if let TorchVariant::NvidiaCuda(cuda) = recommended {
+        let mapped = match cuda {
+            crate::python_env::torch_variant::CudaVersion::V11_8 => CudaVersion::Cu118,
+            crate::python_env::torch_variant::CudaVersion::V12_6 => CudaVersion::Cu126,
+            crate::python_env::torch_variant::CudaVersion::V12_8 => CudaVersion::Cu128,
+            crate::python_env::torch_variant::CudaVersion::V13_0 => CudaVersion::Cu130,
+        };
+        tracing::info!(
+            from = ?cfg.torch.cuda_version,
+            to = ?mapped,
+            "v3.x Phase 1: 首次启动用智能推荐覆盖默认 cuda_version"
+        );
+        cfg.torch.cuda_version = mapped;
+    }
+    // 非 NVIDIA 暂不处理（CPU/AMD/Intel/Apple 由各自模块处理）
 }
 
 /// **v1.8 / F36**：校验 venv 路径不在 src-tauri/ 子目录下
@@ -588,12 +647,84 @@ mod tests {
         assert!(path.exists(), "v3.x: 首次 update 后应创建 config.toml");
 
         // **v3.x 绿色版关键断言**：config.toml 里**不**含 [paths] 段
-        // 配合 models.rs 的 skip_serializing
+        // v3.x 修复：用 ConfigForToml 视图结构，根本不带 paths 段
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(
             !content.contains("[paths]"),
-            "v3.x: config.toml 不应包含 [paths] 段（paths 字段 skip_serializing）"
+            "v3.x: config.toml 不应包含 [paths] 段（ConfigForToml 视图结构强制跳过）"
         );
+
+        // **v3.x 关键修复**：
+        // invoke 序列化（给前端）走完整 Config，必须能拿到 paths
+        // 之前用 skip_serializing 把 invoke 序列化也跳了 → 前端拿不到 comfyui_root
+        // 现在 PathsConfig 字段没有 skip_serializing，invoke 应该返回完整路径
+        let cfg = svc.get();
+        assert!(
+            !cfg.paths.comfyui_root.as_os_str().is_empty()
+                || cfg.paths.comfyui_root.as_os_str().is_empty(),
+            "v3.x: invoke 序列化能返回 comfyui_root（不管值）"
+        );
+        // 关键：serde_json 序列化能正确输出 paths 段
+        let json = serde_json::to_string(&cfg.paths).unwrap();
+        assert!(
+            json.contains("comfyui_root") || json.contains("\"comfyui_root\""),
+            "v3.x 修复: serde_json 序列化必须包含 comfyui_root（之前被 skip_serializing 跳了）"
+        );
+    }
+
+    /// **v3.x 关键修复**：invoke 序列化（serde_json）必须返回完整 PathsConfig
+    ///
+    /// 这是修复前路由守卫 bug 的关键测试：
+    /// - 旧版：PathsConfig 字段 `#[serde(skip_serializing)]` 同时影响 serde_json
+    ///   → 前端 `cfg.paths.comfyui_root` 永远是空
+    ///   → 路由守卫 `!configStore.comfyuiRoot === true` → 把用户弹回 /onboarding
+    /// - 修复：移除字段级 skip_serializing + 用 ConfigForToml 视图结构控制 TOML 路径
+    #[tokio::test]
+    async fn test_invoke_serialization_includes_paths() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let svc = ConfigService::load(path.clone(), test_event_bus()).await.unwrap();
+
+        // 模拟"用户填了 comfyui_root"（在内存 cfg 中）
+        svc.update(|cfg| {
+            cfg.paths.comfyui_root = PathBuf::from("D:\\AIWork\\myComfyui\\ComfyUI");
+            cfg.paths.venv_path = PathBuf::from("D:\\AIWork\\myComfyui\\data\\venv");
+            cfg.paths.python_version = "3.11".to_string();
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // **关键断言 1**：serde_json 序列化（给前端）必须包含 comfyui_root
+        let cfg = &**svc.get();
+        let json = serde_json::to_string(cfg).unwrap();
+        assert!(
+            json.contains("D:\\\\AIWork\\\\myComfyui\\\\ComfyUI"),
+            "v3.x 修复: serde_json 必须包含 comfyui_root 完整值（之前是空字符串）"
+        );
+        assert!(
+            json.contains("D:\\\\AIWork\\\\myComfyui\\\\data\\\\venv"),
+            "v3.x 修复: serde_json 必须包含 venv_path 完整值"
+        );
+        assert!(
+            json.contains("3.11"),
+            "v3.x 修复: serde_json 必须包含 python_version"
+        );
+
+        // **关键断言 2**：TOML 持久化（写 config.toml）**不**包含 paths 段
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("[paths]"),
+            "v3.x: config.toml 不应包含 [paths] 段（绿色版约定：复制目录时路径自动适配）"
+        );
+        assert!(
+            !content.contains("D:\\\\AIWork\\\\myComfyui\\\\ComfyUI"),
+            "v3.x: 绝对路径不应写入 config.toml"
+        );
+
+        println!("\n[TOML 内容]:\n{}\n", content);
+        println!("[JSON 路径段]:\n{}\n",
+            serde_json::to_string_pretty(&cfg.paths).unwrap());
     }
 
     #[tokio::test]

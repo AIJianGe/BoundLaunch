@@ -28,6 +28,9 @@ import type {
   TorchVariant,
   GpuInfo,
   RepairAction,
+  HardwareChangeReport,
+  DriverCompatReport,
+  VenvTorchConsistency,
 } from "./types";
 
 // ============================================================================
@@ -222,6 +225,70 @@ export function systemClearGpuCache(): Promise<void> {
  */
 export function systemRecommendTorch(): Promise<TorchVariant> {
   return invoke<TorchVariant>("system_recommend_torch");
+}
+
+/**
+ * v3.10 驱动兼容性深度检查
+ *
+ * 一站式入口：检测 GPU + 推荐变体 + 驱动兼容性检查。
+ *
+ * 触发场景：
+ * - 用户点击「智能推荐」按钮
+ * - 启动时检测到 torch 与驱动不匹配
+ *
+ * @returns 驱动兼容性报告（含 `severity` / `recommended_variant` / `notes`）
+ */
+export function systemCheckDriverCompat(): Promise<DriverCompatReport> {
+  return invoke<DriverCompatReport>("system_check_driver_compat");
+}
+
+// ============================================================================
+// v3.x Phase 3：硬件变化检测（对应 src-tauri/src/commands/system.rs）
+// ============================================================================
+
+/**
+ * 硬件变化检测（启动时调用）
+ *
+ * 用途：
+ * - 用户升级驱动 / 换显卡 / 跨机器复制环境时主动探测
+ * - 检测到变化返回 `has_change: true` + `recommended_action`
+ *
+ * 推荐动作（前端弹窗决策）：
+ * - `reinstall_torch`：GPU 列表变化 → 强烈建议重装
+ * - `optional`：仅驱动版本变化 → 可选
+ * - `no_action`：无变化
+ *
+ * 前端在启动 5-10s 后调用，避免阻塞主流程。
+ */
+export function systemCheckHardwareChange(): Promise<HardwareChangeReport> {
+  return invoke<HardwareChangeReport>("system_check_hardware_change");
+}
+
+// ============================================================================
+// v3.x Phase 6：venv torch 一致性检测
+// ============================================================================
+
+/**
+ * 检查 venv 里的 torch 与配置 cuda_version 是否一致
+ *
+ * 用 `python -c "import torch; print(torch.version.cuda, torch.cuda.is_available())"`
+ * 拿 venv 里 torch 的实际 CUDA 版本，对比配置。
+ *
+ * @param venvPython venv 里的 python 路径
+ * @param configuredCuda 当前配置的 CUDA 版本（"cu118" | "cu126" | "cu128" | "cu130"）
+ * @returns
+ * - `null` → 探测失败（无 python / 无 torch / python 启动失败）
+ * - `{ ok: true }` → 一致
+ * - `{ ok: false, reason }` → 不一致
+ */
+export function systemCheckVenvTorchConsistency(
+  venvPython: string,
+  configuredCuda: string,
+): Promise<VenvTorchConsistency> {
+  return invoke<VenvTorchConsistency>("system_check_venv_torch_consistency", {
+    venvPython,
+    configuredCuda,
+  });
 }
 
 // ============================================================================

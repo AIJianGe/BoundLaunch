@@ -7,9 +7,10 @@
 
 use crate::python_env::TorchVariant;
 use crate::system::{
-    check_driver_compatibility_full, clear_gpu_cache, detect_and_cache, recommend_torch_variant,
-    DriverCompatReport,
+    check_driver_compatibility_full, check_hardware_change, clear_gpu_cache, detect_and_cache,
+    recommend_torch_variant, DriverCompatReport, HardwareChangeReport,
 };
+use crate::app_state::AppState;
 
 /// 跨平台 GPU 检测（带 5 分钟缓存）
 #[tauri::command]
@@ -57,4 +58,45 @@ pub async fn system_recommend_torch() -> Result<TorchVariant, String> {
 #[tauri::command]
 pub async fn system_check_driver_compat() -> Result<DriverCompatReport, String> {
     Ok(check_driver_compatibility_full().await)
+}
+
+/// **v3.x Phase 3**：硬件变化检测
+///
+/// 探测当前硬件 + 读 SQLite 历史 → 返回变化报告。
+///
+/// 行为：
+/// - 首次记录（无历史）→ 写入 + 返回 `has_change: false`
+/// - 无变化 → 返回 `has_change: false`
+/// - 有变化（GPU 列表不同 或 NVIDIA 驱动不同）→ 返回 `has_change: true` + 推荐动作
+///
+/// 前端应在启动 5-10 秒后调用，根据 `recommended_action` 决定是否弹窗。
+#[tauri::command]
+pub async fn system_check_hardware_change(
+    state: tauri::State<'_, AppState>,
+) -> Result<HardwareChangeReport, String> {
+    let pool = state.log_store.pool();
+    Ok(check_hardware_change(pool).await)
+}
+
+/// **v3.x Phase 6**：venv 里 torch 一致性检测
+///
+/// 用 `python -c "import torch; print(torch.version.cuda, torch.cuda.is_available())"`
+/// 拿 venv 里 torch 的实际 CUDA 版本，对比配置。
+///
+/// 返回：
+/// - `None` → 探测失败（无 python / 无 torch / python 启动失败）
+/// - `Some(Ok(()))` → 一致
+/// - `Some(Err(msg))` → 不一致，msg 是诊断信息
+#[tauri::command]
+pub async fn system_check_venv_torch_consistency(
+    venv_python: String,
+    configured_cuda: String,
+) -> Result<Option<Result<(), String>>, String> {
+    Ok(
+        crate::system::check_venv_torch_consistency(
+            std::path::Path::new(&venv_python),
+            &configured_cuda,
+        )
+        .await,
+    )
 }

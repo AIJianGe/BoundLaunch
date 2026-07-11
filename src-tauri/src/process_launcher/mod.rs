@@ -44,7 +44,7 @@ use self::command_builder::build_command;
 use self::log_pipeline::{DEFAULT_BUFFER_CAPACITY, LogPipeline};
 use self::models::StopReason;
 use self::start::{
-    check_port_available, spawn_health_check, spawn_process, spawn_stderr_reader,
+    check_port_available, spawn_health_check, spawn_process_with_env, spawn_stderr_reader,
     spawn_stdout_reader, verify_preconditions, venv_python_path, write_pid_file,
     HealthCheckOutcome, PID_FILE_NAME,
 };
@@ -344,6 +344,7 @@ impl ProcessLauncherService {
         // 8. build_command + spawn
         //
         // v3.4 增强：阶段 4 - spawn ComfyUI 进程（50%）
+        // v3.x Phase 5：根据 cfg.launch.gpu_selection 注入 CUDA_VISIBLE_DEVICES
         report(50, "启动 ComfyUI 进程...");
         let cmd_args = build_command(&args);
         let venv_python = venv_python_path(&self.current_venv_path());
@@ -352,7 +353,27 @@ impl ProcessLauncherService {
             ?cmd_args,
             "spawning ComfyUI process"
         );
-        let mut child = match spawn_process(&venv_python, &self.current_comfyui_root(), cmd_args) {
+
+        // **v3.x Phase 5**：收集额外环境变量
+        let mut extra_env: Vec<(&str, String)> = Vec::new();
+        let gpu_cfg = self.inner.config.get();
+        if let Some(sel) = gpu_cfg.launch.gpu_selection.as_ref() {
+            if matches!(sel.mode, crate::config::GpuSelectionMode::Single) {
+                extra_env.push(("CUDA_VISIBLE_DEVICES", sel.single_index.to_string()));
+                tracing::info!(
+                    "v3.x Phase 5: 注入 CUDA_VISIBLE_DEVICES={}（单卡模式）",
+                    sel.single_index
+                );
+            }
+        }
+        drop(gpu_cfg);
+
+        let mut child = match spawn_process_with_env(
+            &venv_python,
+            &self.current_comfyui_root(),
+            cmd_args,
+            &extra_env,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 *self.inner.state.write() = ProcessStatus::Stopped;

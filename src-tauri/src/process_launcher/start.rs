@@ -207,6 +207,21 @@ pub fn spawn_process(
     comfyui_root: &Path,
     cmd_args: Vec<String>,
 ) -> Result<Child, ProcessError> {
+    spawn_process_with_env(venv_python, comfyui_root, cmd_args, &[])
+}
+
+/// **v3.x Phase 5**：spawn + 注入额外环境变量（CUDA_VISIBLE_DEVICES 等）
+///
+/// 为什么不直接在 `spawn_process` 内访问 `ConfigService`：
+/// - `process_launcher::start` 已被 `process_launcher::service` 调用（持有 ConfigService）
+/// - 避免循环依赖 + 单测 mock
+/// - 调用方传入 gpu_selection，决定是否注入 `CUDA_VISIBLE_DEVICES`
+pub fn spawn_process_with_env(
+    venv_python: &Path,
+    comfyui_root: &Path,
+    cmd_args: Vec<String>,
+    extra_env: &[(&str, String)],
+) -> Result<Child, ProcessError> {
     // v3.4 统一改用 process_util::new_command：消除此处重复实现 creation_flags
     // （Windows 上自动加 CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP，非 Windows 等价 Command::new）
     let mut cmd = crate::common::process_util::new_command(venv_python);
@@ -215,6 +230,11 @@ pub fn spawn_process(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
+    // **v3.x Phase 5**：注入额外环境变量（如 CUDA_VISIBLE_DEVICES）
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
 
     // Unix 进程组隔离：spawn 后立即调 setsid()，让 ComfyUI + 其子进程归属新 session
     // pre_exec 在 fork 之后、exec 之前执行，仍在子进程上下文中

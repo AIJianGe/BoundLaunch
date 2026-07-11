@@ -87,6 +87,19 @@ pub enum EnvError {
     /// v3.6：用户主动取消（CancellationToken 触发）
     #[error("操作已取消")]
     Cancelled,
+    /// **v3.x Phase 2**：torch 安装失败 + 驱动/CUDA 不兼容（含 fallback 建议）
+    ///
+    /// 当 `install_torch` 失败时，**重新探测** GPU 算 fallback CUDA，
+    /// 包装成结构化错误返回给前端。前端展示"是否切换到 {fallback} 重试？"。
+    #[error("torch 安装失败 (尝试 {attempted}): {reason}")]
+    TorchIncompatible {
+        /// 用户尝试的 CUDA 版本
+        attempted: String,
+        /// 失败原因（pip/uv stderr 摘要）
+        reason: String,
+        /// 推荐的 fallback CUDA 版本（None = 没有合适的 fallback，建议改 CPU）
+        fallback: Option<String>,
+    },
 }
 
 #[derive(Debug, Error, Serialize)]

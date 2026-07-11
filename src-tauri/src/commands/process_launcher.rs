@@ -265,6 +265,8 @@ mod tests {
                 preview_method: PreviewMethod::Latent2Rgb,
                 custom_args: custom_args.into(),
                 advanced: AdvancedArgs::default(),
+                // v3.x Phase 5：测试中默认全部 GPU
+                gpu_selection: Some(crate::config::GpuSelectionConfig::default()),
             },
             torch: TorchConfig {
                 cuda_version: crate::config::CudaVersion::Cu128,

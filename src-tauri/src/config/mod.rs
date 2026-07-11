@@ -21,6 +21,10 @@ pub use models::{
     // v3.x：models 段已废弃，类型仅保留向后兼容
     AdvancedModels, ModelsConfig, ModelsConfigPatch, ModelsMode,
     apply_models_patch,
+    // v3.x Phase 5：多 GPU 选择
+    GpuSelectionConfig, GpuSelectionMode,
+    // v3.x 关键修复：TOML 持久化专用视图（不带 paths 段）
+    ConfigForToml, LaunchConfigForToml,
 };
 pub use service::ConfigService;
 
