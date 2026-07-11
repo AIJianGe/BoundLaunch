@@ -15,11 +15,13 @@
  * - no_half
  * - no_half_vae
  * - directml
+ * - gpu_only（v3.x 新增："使用共享显存"开关的反面 → --gpu-only）
  *
  * 行为：
  * - 默认折叠，点击「高级参数」展开
  * - 任一复选框变更时立即调用 configStore.update（部分更新 advanced）
  * - directml 与 no_half 通常互斥（不强制，仅 UI 提示）
+ * - gpu_only 与 LaunchMode 联动：GpuLow/GpuNo 时禁灰（lowvram/novram 故意 spill）
  */
 
 import { computed } from "vue";
@@ -55,6 +57,10 @@ const advancedOptions: Array<{
   { key: "no_half", label: "--no-half", hint: "禁用半精度（兼容旧显卡）" },
   { key: "no_half_vae", label: "--no-half-vae", hint: "VAE 不使用半精度" },
   { key: "directml", label: "--directml", hint: "使用 DirectML（Windows 通用 GPU）" },
+  // v3.x：使用共享显存开关的反面
+  // - 开启：传 --gpu-only → ComfyUI 强制全部在 GPU 显存
+  // - 关闭（默认）：ComfyUI 行为不变（spill 到 CPU 内存）
+  { key: "gpu_only", label: "--gpu-only", hint: "禁用 spill 到 CPU 内存（强制全部在 GPU，OOM 时报错）" },
 ];
 
 async function updateAdvanced(key: keyof AdvancedArgs, value: boolean) {

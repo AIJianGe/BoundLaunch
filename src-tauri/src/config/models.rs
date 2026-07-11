@@ -310,6 +310,9 @@ pub fn migrate_legacy_preview_method(s: &str) -> Option<String> {
 }
 
 /// 高级启动参数
+///
+/// **v3.x 新增字段**：
+/// - `gpu_only` — "使用共享显存"开关（与 ComfyUI `--gpu-only` 互为反义）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdvancedArgs {
     pub use_split_cross_attention: bool,
@@ -320,6 +323,29 @@ pub struct AdvancedArgs {
     pub no_half: bool,
     pub no_half_vae: bool,
     pub directml: bool,
+    /// **v3.x 新增**：禁用自动 spill 到 CPU 内存（"使用共享显存"开关）
+    ///
+    /// ## 含义（与 ComfyUI `--gpu-only` 互为反义）
+    /// - `false`（默认）：ComfyUI 默认行为 — 模型/CLIP/VAE/conditioning 在显存不够时
+    ///   **自动 spill 到 CPU 内存**（"使用共享显存"）
+    /// - `true`：传 `--gpu-only` 给 ComfyUI — **所有组件强制在 GPU 显存**，
+    ///   OOM 时直接报错，不会 spill 到内存
+    ///
+    /// ## 与其他参数的关系
+    /// | LaunchMode | gpu_only 建议 |
+    /// |-----------|---------------|
+    /// | `Cpu`     | 强制 false（无 GPU） |
+    /// | `GpuHigh` | 任意（highvram 已在显存） |
+    /// | `GpuLow`  | 建议 false（lowvram 故意 spill，强制会 OOM） |
+    /// | `GpuNo`   | 强制 false（novram 完全 spill，强制会 OOM） |
+    ///
+    /// UI 层在 `LaunchMode` 为 `GpuLow`/`GpuNo` 时强制禁用该开关并禁灰。
+    ///
+    /// ## 性能权衡
+    /// - **开启**（默认值，spill 模式）：模型大小不受显存限制，性能可能降级
+    ///   （PCIe/NVLink 带宽比 HBM/GDDR 低几十倍）
+    /// - **关闭**（gpu_only）：性能稳定，但模型总大小 ≤ 显存容量
+    pub gpu_only: bool,
 }
 
 impl Default for AdvancedArgs {
@@ -333,6 +359,7 @@ impl Default for AdvancedArgs {
             no_half: false,
             no_half_vae: false,
             directml: false,
+            gpu_only: false,
         }
     }
 }

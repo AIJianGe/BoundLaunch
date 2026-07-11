@@ -81,6 +81,12 @@ pub fn build_command(args: &LaunchArgs) -> Vec<String> {
     if adv.directml {
         cmd.push("--directml".into());
     }
+    // v3.x：--gpu-only（"使用共享显存"开关的反面）
+    // - adv.gpu_only == true：ComfyUI 强制全部在 GPU 显存
+    // - adv.gpu_only == false（默认）：ComfyUI 行为不变（允许 spill 到 CPU 内存）
+    if adv.gpu_only {
+        cmd.push("--gpu-only".into());
+    }
 
     cmd
 }
@@ -253,6 +259,43 @@ mod tests {
         assert!(filtered.contains(&"autoencoder".to_string()));
         assert!(filtered.contains(&"1234".to_string()));
         assert!(filtered.contains(&"/path/to/something".to_string()));
+    }
+
+    /// v3.x：--gpu-only 行为测试（"使用共享显存"开关的反面）
+    #[test]
+    fn test_build_command_gpu_only_default_off() {
+        // 默认 gpu_only=false → 不传 --gpu-only
+        let args = make_args(LaunchMode::GpuHigh);
+        let cmd = build_command(&args);
+        assert!(
+            !cmd.contains(&"--gpu-only".to_string()),
+            "默认 gpu_only=false 时不应传 --gpu-only（保留 ComfyUI 默认 spill 行为）"
+        );
+    }
+
+    #[test]
+    fn test_build_command_gpu_only_enabled() {
+        // gpu_only=true → 传 --gpu-only
+        let mut args = make_args(LaunchMode::GpuHigh);
+        args.advanced.gpu_only = true;
+        let cmd = build_command(&args);
+        assert!(
+            cmd.contains(&"--gpu-only".to_string()),
+            "gpu_only=true 时应传 --gpu-only（强制 ComfyUI 全部在 GPU 显存）"
+        );
+    }
+
+    /// 验证 LaunchMode 为 GpuLow/GpuNoVram 时 gpu_only 也被正确处理
+    /// （UI 层会禁灰，但底层仍然按配置执行）
+    #[test]
+    fn test_build_command_gpu_only_with_lowvram() {
+        // 组合：--lowvram + --gpu-only
+        // 实际使用中 UI 会禁灰防止，但底层代码不应该隐藏
+        let mut args = make_args(LaunchMode::GpuLow);
+        args.advanced.gpu_only = true;
+        let cmd = build_command(&args);
+        assert!(cmd.contains(&"--lowvram".to_string()));
+        assert!(cmd.contains(&"--gpu-only".to_string()));
     }
 
     // v3.x：--base-directory 行为测试

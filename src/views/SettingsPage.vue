@@ -35,6 +35,7 @@ import UiPanel from "@/components/settings/UiPanel.vue";
 import DangerZonePanel from "@/components/settings/DangerZonePanel.vue";
 import DataLocationPanel from "@/components/settings/DataLocationPanel.vue"; // v1.8 / F38
 import GpuPanel from "@/components/settings/GpuPanel.vue"; // v3.x Phase 5
+import LaunchAdvancedPanel from "@/components/settings/LaunchAdvancedPanel.vue"; // v3.x 启动高级参数
 
 const configStore = useConfigStore();
 const envStore = useEnvStore();
@@ -72,6 +73,8 @@ onMounted(async () => {
       <PythonVersionPanel />
       <TorchConfigPanel />
       <GpuPanel />
+      <!-- v3.x：启动高级参数（"使用共享显存"开关）放在 GPU 选择后 -->
+      <LaunchAdvancedPanel />
       <TransformersConfigPanel />
       <DependenciesPanel />
       <UiPanel />

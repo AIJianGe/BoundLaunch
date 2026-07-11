@@ -31,6 +31,18 @@ export interface AdvancedArgs {
   no_half: boolean;
   no_half_vae: boolean;
   directml: boolean;
+  /**
+   * v3.x 新增："使用共享显存"开关的反面（对应 ComfyUI `--gpu-only`）
+   *
+   * - `false`（默认）：ComfyUI 默认行为 — 模型/CLIP/VAE/conditioning 在显存不够时
+   *   自动 spill 到 CPU 内存（"使用共享显存"）
+   * - `true`：传 `--gpu-only` 给 ComfyUI — 所有组件强制在 GPU 显存，
+   *   OOM 时直接报错，不会 spill 到内存
+   *
+   * UI 层在 `LaunchMode` 为 `GpuLow`/`GpuNo` 时强制禁用该开关并禁灰
+   * （lowvram/novram 故意 spill，强制 GPU-only 必然 OOM）
+   */
+  gpu_only: boolean;
 }
 
 /**
