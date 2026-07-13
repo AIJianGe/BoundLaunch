@@ -114,8 +114,38 @@ watch(
   },
 );
 
+// v3.x：restarting 状态独立计时（不在 task 进度体系内）
+// - 触发：后端 emit process_respawning
+// - 结束：后端 emit process_respawned（→Running）/ process_respawn_failed（→Stopped/Crashed）
+const restartingElapsedSec = ref(0);
+let restartingTimerHandle: number | null = null;
+function startRestartingTimer() {
+  stopRestartingTimer();
+  restartingElapsedSec.value = 0;
+  restartingTimerHandle = window.setInterval(() => {
+    restartingElapsedSec.value += 1;
+  }, 1000);
+}
+function stopRestartingTimer() {
+  if (restartingTimerHandle !== null) {
+    clearInterval(restartingTimerHandle);
+    restartingTimerHandle = null;
+  }
+}
+watch(
+  () => processStore.isRestarting,
+  (restarting) => {
+    if (restarting) {
+      startRestartingTimer();
+    } else {
+      stopRestartingTimer();
+    }
+  },
+);
+
 onUnmounted(() => {
   stopElapsedTimer();
+  stopRestartingTimer();
 });
 
 /** v3.4：把 stderr tail 转成纯文本（用于 NModal 展示） */
@@ -132,6 +162,7 @@ type ButtonState =
   | "submitting" // v3.4.1：本地提交中（防连点，最高优先级）
   | "env_switching"
   | "starting"
+  | "restarting" // v3.x：ComfyUI-Manager 触发的自动重启
   | "running"
   | "crashed"
   | "stopped";
@@ -145,13 +176,16 @@ const currentState = computed<ButtonState>(() => {
   if (processStore.isExiting) return "exiting";
   // 3. 环境切换中（torch 切换等，由 envStore.switchingTorch 驱动）
   if (envStore.switchingTorch) return "env_switching";
-  // 4. 启动中（process 状态机驱动）
+  // 4. v3.x：ComfyUI-Manager 自动重启中（用户在 Manager 点了 Restart）
+  // - 不允许用户再点启动/停止（重启中状态由后端独占）
+  if (processStore.isRestarting) return "restarting";
+  // 5. 启动中（process 状态机驱动）
   if (processStore.isStarting) return "starting";
-  // 5. 运行中
+  // 6. 运行中
   if (processStore.isRunning) return "running";
-  // 6. 进程崩溃（可重启）
+  // 7. 进程崩溃（可重启）
   if (processStore.isCrashed) return "crashed";
-  // 7. 已就绪或未就绪，统一归 stopped 态（未就绪由 sublabel + 点击 toast 引导）
+  // 8. 已就绪或未就绪，统一归 stopped 态（未就绪由 sublabel + 点击 toast 引导）
   return "stopped";
 });
 
@@ -229,6 +263,17 @@ const buttonConfig = computed(() => {
         label: "▶ 启动中",
         showSublabel: false,
       };
+    // v3.x：ComfyUI-Manager 触发的自动重启中
+    // - 不允许用户干预（避免状态机混乱）
+    // - 显示"重启中"提示，spinner 提示用户在等
+    case "restarting":
+      return {
+        type: "info" as const,
+        loading: true,
+        disabled: true,
+        label: "↻ Manager 重启中",
+        showSublabel: true,
+      };
     case "running":
       return {
         type: "error" as const,
@@ -277,6 +322,17 @@ const sublabel = computed(() => {
   if (currentState.value === "env_switching") {
     return "正在切换 torch 变体，请稍候...";
   }
+  // v3.x：ComfyUI-Manager 触发的自动重启
+  if (currentState.value === "restarting") {
+    const reason = processStore.respawningReason;
+    if (reason?.reason === "manager_reboot") {
+      return "ComfyUI-Manager 触发重启，正在重新加载...";
+    }
+    if (reason?.reason === "auto_recovery") {
+      return "崩溃自动恢复中...";
+    }
+    return "正在重启 ComfyUI...";
+  }
   if (currentState.value === "crashed") {
     return processStore.error || "ComfyUI 进程已崩溃";
   }
@@ -299,6 +355,7 @@ async function onClick() {
     case "exiting":
     case "env_switching":
     case "starting":
+    case "restarting":
       // 这些状态下按钮已 disabled，这里只是兜底
       return;
     case "running":
@@ -322,7 +379,7 @@ async function onStart() {
   startComfyui.markSubmitting();
 
   // 守卫 1: 进程状态机
-  if (processStore.isRunning || processStore.isStarting) {
+  if (processStore.isRunning || processStore.isStarting || processStore.isRestarting) {
     startComfyui.unmarkSubmitting();
     toast.info("ComfyUI 已在运行中");
     return;
@@ -600,7 +657,7 @@ async function onForceKill() {
     // 2. 等 1.5s，看是否回到 stopped
     await new Promise((r) => setTimeout(r, 1500));
 
-    if (processStore.isRunning || processStore.isStarting) {
+    if (processStore.isRunning || processStore.isStarting || processStore.isRestarting) {
       // 3. 兜底：杀所有 Python 进程
       console.warn("[onForceKill] graceful stop failed, force killing all python");
       try {
@@ -632,9 +689,9 @@ async function onForceKill() {
         {{ buttonConfig.label }}
       </NButton>
 
-      <!-- 旁置指示：提交中 / 启动中 / 环境切换中 -->
+      <!-- 旁置指示：提交中 / 启动中 / 环境切换中 / 重启中 -->
       <div
-        v-if="currentState === 'submitting' || currentState === 'starting' || currentState === 'env_switching'"
+        v-if="currentState === 'submitting' || currentState === 'starting' || currentState === 'env_switching' || currentState === 'restarting'"
         class="side-indicator indicator-warning"
       >
         <NSpin size="small" />
@@ -643,7 +700,7 @@ async function onForceKill() {
       <!-- v3.11：强制停止按钮（兜底）
            在启动中 / 运行中 / 卡死等场景出现，让用户有"脱困"按钮 -->
       <NButton
-        v-if="currentState === 'starting' || currentState === 'submitting' || (currentState === 'running' && forceKilling)"
+        v-if="currentState === 'starting' || currentState === 'submitting' || currentState === 'restarting' || (currentState === 'running' && forceKilling)"
         type="error"
         size="large"
         :loading="forceKilling"
@@ -675,6 +732,26 @@ async function onForceKill() {
       <div class="progress-elapsed">
         <NSpin size="small" class="progress-spin" />
         <span>已等待 {{ formatElapsed(startElapsedSec) }}</span>
+      </div>
+    </div>
+
+    <!-- v3.x：restarting 状态进度展示（独立计时，不走 task 进度体系） -->
+    <div v-else-if="currentState === 'restarting'" class="progress-section restarting-section">
+      <NProgress
+        type="line"
+        :percentage="0"
+        :indicator-placement="'inside'"
+        :height="14"
+        :border-radius="4"
+        processing
+        :show-indicator="false"
+      />
+      <div class="progress-message">
+        {{ sublabel || "ComfyUI-Manager 触发重启，正在重新加载..." }}
+      </div>
+      <div class="progress-elapsed">
+        <NSpin size="small" class="progress-spin" />
+        <span>已等待 {{ formatElapsed(restartingElapsedSec) }}</span>
       </div>
     </div>
 
@@ -823,6 +900,11 @@ async function onForceKill() {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* v3.x：restarting 状态进度样式（与启动中一致，但用 info 主题色） */
+.restarting-section :deep(.n-progress--line .n-progress-graph-line-fill) {
+  background-color: var(--app-info, #2080f0) !important;
 }
 
 .progress-message {

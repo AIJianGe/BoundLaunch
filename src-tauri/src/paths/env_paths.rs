@@ -188,6 +188,19 @@ pub struct ResolvedEnvPaths {
     pub database_path: PathBuf,
     /// logs 目录
     pub logs_dir: PathBuf,
+    /// **v3.x 新增**：ComfyUI session 目录（每个实例独立，多实例隔离）
+    ///
+    /// 用于 `__COMFY_CLI_SESSION__` 协议：
+    /// - 每个 ComfyUI 进程生成一个 `<sessions_dir>/<random>.session` 文件
+    /// - ComfyUI-Manager 检测到 `__COMFY_CLI_SESSION__` 环境变量后
+    ///   → 写 `<session_path>.reboot` 标志 + `exit(0)`
+    /// - 客户端检测 `.reboot` → 自动 respawn（无缝重启）
+    ///
+    /// **多实例隔离保证**：
+    /// - 路径 = `<exe_dir>/.boundlaunch/sessions/`
+    /// - 复制目录到新位置 → 新实例用自己的 sessions/ → 互不影响 ✅
+    /// - 同一实例多 ComfyUI 进程：文件名带随机后缀 → 不冲突 ✅
+    pub sessions_dir: PathBuf,
     /// ComfyUI 启动时是否要传 --base-directory
     pub override_base_directory: bool,
     /// portable.dat 路径
@@ -329,6 +342,10 @@ pub fn resolve() -> Result<ResolvedEnvPaths, EnvPathsError> {
         config_path: boundlaunch_data.join("config.toml"),
         database_path: boundlaunch_data.join("launcher.db"),
         logs_dir: boundlaunch_data.join("logs"),
+        // **v3.x 新增**：ComfyUI session 目录
+        // 放在 `<exe_dir>/.boundlaunch/sessions/`，与 WebView2 UserData 平行
+        // 复制目录时整个 .boundlaunch/ 一起被复制 → 多实例完全隔离
+        sessions_dir: env_root.join(".boundlaunch").join("sessions"),
         override_base_directory,
         portable_config_path: portable_path,
     })

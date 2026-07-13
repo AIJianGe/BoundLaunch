@@ -127,6 +127,8 @@ const processStatusText = computed(() => {
       return { text: "停止中", color: "warning" as const };
     case "crashed":
       return { text: "已崩溃", color: "error" as const };
+    case "restarting":
+      return { text: "重启中 (Manager)", color: "info" as const };
   }
 });
 
@@ -415,8 +417,8 @@ function onJumpToTorchSettings() {
         {{ readinessStatus.tooltip }}
       </NTooltip>
 
-      <!-- v2.18：服务地址 + 打开浏览器（仅运行中/启动中显示） -->
-      <NTooltip placement="top" v-if="processStore.status.kind === 'running' || processStore.status.kind === 'starting'">
+      <!-- v2.18：服务地址 + 打开浏览器（仅运行中/启动中/重启中显示） -->
+      <NTooltip placement="top" v-if="processStore.status.kind === 'running' || processStore.status.kind === 'starting' || processStore.status.kind === 'restarting'">
         <template #trigger>
           <div class="status-item service-item">
             <span class="item-label">服务地址</span>

@@ -60,7 +60,9 @@ pub use self::models::{HealthInfo, LaunchArgs, ProcessStatus, ShutdownReport};
 pub mod command_builder;
 pub mod log_pipeline;
 pub mod models;
+pub mod respawn;
 pub mod ring_buffer;
+pub mod session;
 pub mod shutdown;
 pub mod start;
 pub mod state_machine;
@@ -102,6 +104,15 @@ pub struct Inner {
     /// - stop_impl() 时调 `token.cancel()` → 三个 task 在合适位置 `token.is_cancelled()` 检查后退出
     /// - start() 完成（spawn 成功）后保留 token（直到 stop 时 cancel）
     cancel_token: PlRwLock<Option<CancellationToken>>,
+    /// **v3.x 新增**：当前 ComfyUI 进程的 session 信息（用于 ComfyUI-Manager 自动重启）
+    ///
+    /// - `None`：auto_restart 关闭或会话未创建
+    /// - `Some(info)`：session_path + reboot_flag_path
+    ///
+    /// 复制目录到新位置 → 新实例的 session 路径在 `<新目录>/.boundlaunch/sessions/` → 互不影响。
+    current_session: TokioMutex<Option<self::session::SessionInfo>>,
+    /// **v3.x 新增**：重启策略（防误触 + auto_restart 开关）
+    respawn_policy: Arc<self::respawn::RespawnPolicy>,
 
     // 依赖服务
     python_env: Arc<PythonEnvService>,
@@ -121,7 +132,19 @@ pub struct ProcessLauncherService {
     inner: Arc<Inner>,
 }
 
+/// v3.x：ProcessLauncherService 的轻量克隆
+///
+/// - 用于把 ProcessLauncher 传给 spawn_monitor，让 monitor 检测到 .reboot 时能调 self.start() respawn
+/// - ProcessLauncherService 本身已 `#[derive(Clone)]`，克隆只增加 inner Arc 引用计数
+/// - 不破坏单例语义（inner Arc 共享）
 impl ProcessLauncherService {
+    /// 克隆一个共享 `inner` 的轻量句柄（用于 spawn_monitor 等子 task）
+    ///
+    /// 返回 `ProcessLauncherService`（含 `Arc<Inner>`），可被 tokio::spawn 捕获
+    pub fn clone_for_respawn(&self) -> Self {
+        self.clone()
+    }
+
     /// 构造
     ///
     /// **路径热加载**：`comfyui_root` / `venv_path` 每次需要时从 ConfigService
@@ -134,6 +157,9 @@ impl ProcessLauncherService {
         data_dir: PathBuf,
     ) -> Self {
         let pid_file_path = data_dir.join(PID_FILE_NAME);
+        // **v3.x**：从 cfg 读取 auto_restart 决定初始策略
+        let auto_restart = config.get().launch.auto_restart;
+        let respawn_policy = self::respawn::RespawnPolicy::new(auto_restart);
         Self {
             inner: Arc::new(Inner {
                 state: PlRwLock::new(ProcessStatus::Stopped),
@@ -145,6 +171,9 @@ impl ProcessLauncherService {
                 monitor_handle: TokioMutex::new(None),
                 health_check_handle: TokioMutex::new(None::<JoinHandle<()>>),
                 cancel_token: PlRwLock::new(None),
+                // **v3.x**：session + respawn_policy 初始为空/默认
+                current_session: TokioMutex::new(None),
+                respawn_policy,
                 python_env,
                 log_store,
                 config,
@@ -366,7 +395,53 @@ impl ProcessLauncherService {
                 );
             }
         }
+        let auto_restart = gpu_cfg.launch.auto_restart;
         drop(gpu_cfg);
+
+        // **v3.x**：如果 auto_restart=true，创建 ComfyUI session 并注入 `__COMFY_CLI_SESSION__`
+        // - 失败：warn + 不注入 env（fallback 到 Manager 的 os.execv 路径，行为退化为"用户手动重启"）
+        // - 成功：session_path 存到 Inner.current_session，供 child.wait() 检测 .reboot
+        //
+        // 这里只构建 extra_env；spawn 流程不受 session 创建失败影响。
+        // spawned_session 在 spawn 成功后写入 Inner.current_session。
+        let mut spawned_session: Option<self::session::SessionInfo> = None;
+        if auto_restart {
+            // 从 env_paths::resolve() 拿权威 sessions_dir（与 v3.x 路径解析一致）
+            // - 复制目录到新位置 → ResolvedEnvPaths 自动重新解析 → sessions_dir 自动适配
+            // - 不会硬编码 `<env_root>/.boundlaunch/sessions/`，避免与 portable 逻辑漂移
+            match crate::paths::env_paths::resolve() {
+                Ok(resolved) => {
+                    // 启动时清理过期 session（24h+）
+                    self::session::cleanup_stale_sessions(&resolved.sessions_dir);
+
+                    match self::session::create_session(&resolved.sessions_dir) {
+                        Ok(si) => {
+                            tracing::info!(
+                                session = %si.session_path.display(),
+                                "v3.x: 创建 ComfyUI session + 注入 __COMFY_CLI_SESSION__"
+                            );
+                            extra_env.push((
+                                "__COMFY_CLI_SESSION__",
+                                si.session_path.to_string_lossy().to_string(),
+                            ));
+                            spawned_session = Some(si);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "v3.x: 创建 ComfyUI session 失败（auto_restart 仍开启，但 Manager 重启信号将不被处理）"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "v3.x: env_paths::resolve 失败，跳过 session 创建"
+                    );
+                }
+            }
+        }
 
         let mut child = match spawn_process_with_env(
             &venv_python,
@@ -392,6 +467,14 @@ impl ProcessLauncherService {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         report(55, &format!("ComfyUI 进程已 spawn（pid={}, port={}）", pid, port));
+
+        // **v3.x**：spawn 成功后才把 session 写入 Inner.current_session
+        // - 如果 spawn 失败，spawned_session 已被上面的 Err 分支 drop → session 文件残留
+        //   但下次启动 cleanup_stale_sessions 会清理（24h+）
+        if let Some(si) = spawned_session {
+            *self.inner.current_session.lock().await = Some(si);
+            tracing::info!("v3.x: ComfyUI session 已绑定到 PID={}", pid);
+        }
 
         // 9. write PID file
         let started_at = Utc::now();
@@ -506,7 +589,7 @@ impl ProcessLauncherService {
         //   → 0.5s 内 child 死了 monitor 立即检测到 → emit process_crashed
         //   → 之前要 5s sleep 才能检测到，现在 0.5s 即可
         // - 移除 5s 早期死亡检测的 sleep（这是阻塞！），start() 立即返回
-        let monitor_handle = spawn_monitor(self.inner.clone(), app.clone(), cancel_token);
+        let monitor_handle = spawn_monitor(self.inner.clone(), self.clone_for_respawn(), app.clone(), cancel_token);
         *self.inner.monitor_handle.lock().await = Some(monitor_handle);
 
         tracing::info!(pid, port, "ComfyUI process spawned");
@@ -842,6 +925,7 @@ async fn cleanup_after_exit(inner: &Arc<Inner>) {
 ///   停止时 abort 兜底（cancel_token 失效时）
 fn spawn_monitor(
     inner: Arc<Inner>,
+    launcher: ProcessLauncherService,
     app: AppHandle,
     cancel_token: CancellationToken,
 ) -> JoinHandle<()> {
@@ -872,6 +956,109 @@ fn spawn_monitor(
 
             if let Some(status) = exit_status {
                 tracing::info!(?status, "monitor detected process exit");
+
+                // **v3.x**：检测 .reboot 标志 + 触发自动 respawn
+                //
+                // 流程：
+                // 1. 拿 current_session（spawn 时创建，存到 Inner）
+                // 2. 调 respawn_policy.decide() 判断是否允许 respawn
+                // 3. Allow → 把 state 切到 Restarting（emit process_respawning）→ 异步 respawn
+                // 4. Deny → 走原有 stop_impl 流程
+                let session_info = inner.current_session.lock().await.clone();
+                let now = std::time::Instant::now();
+                let respawn_decision = inner.respawn_policy.decide(&session_info, now);
+                match respawn_decision {
+                    self::respawn::RespawnDecision::Allow => {
+                        let reason = self::respawn::classify_exit(status.code(), &session_info);
+                        let exit_code = status.code();
+                        tracing::info!(
+                            reason = reason.as_str(),
+                            "v3.x: 检测到 ComfyUI-Manager 重启信号，自动 respawn"
+                        );
+                        inner.respawn_policy.record_respawn(now);
+                        inner.respawn_policy.after_respawn(&session_info);
+
+                        // **v3.x**：先把 state 切到 Restarting（确保前端能显示「重启中」状态）
+                        // - port 从当前 state 的 port 字段取（重启前后不变）
+                        // - exit_code 来自 monitor 检测到的退出码
+                        // - respawn_count：1 分钟窗口内的累计次数
+                        let respawn_count =
+                            inner.respawn_policy.recent_count() as u32;
+                        let restarting_state = {
+                            let current = inner.state.read().clone();
+                            let port = match &current {
+                                ProcessStatus::Running { port, .. } => *port,
+                                ProcessStatus::Starting { port, .. } => *port,
+                                _ => 0,
+                            };
+                            ProcessStatus::Restarting {
+                                reason,
+                                exit_code,
+                                respawn_count,
+                                started_at: Utc::now(),
+                                port,
+                            }
+                        };
+                        *inner.state.write() = restarting_state.clone();
+
+                        // emit process_respawning 事件（前端可显示「重启中」状态）
+                        use tauri::Emitter;
+                        let _ = app.emit(
+                            "process_respawning",
+                            serde_json::json!({
+                                "reason": reason.as_str(),
+                                "exit_code": exit_code,
+                            }),
+                        );
+
+                        // 异步 respawn
+                        // - 用 tokio::spawn 避免阻塞 monitor
+                        // - 取最近的 launch_args（从 inner.launch_args 拿）
+                        // - 重新走 start() 流程
+                        let launcher_clone = launcher.clone();
+                        let app_clone = app.clone();
+                        tokio::spawn(async move {
+                            let args = inner.launch_args.read().clone();
+                            let Some(args) = args else {
+                                tracing::error!("v3.x: respawn failed, no launch_args in Inner");
+                                use tauri::Emitter;
+                                let _ = app_clone.emit(
+                                    "process_respawn_failed",
+                                    serde_json::json!({"reason": "no launch_args"}),
+                                );
+                                return;
+                            };
+                            match launcher_clone.start(args, app_clone.clone(), None).await {
+                                Ok(()) => {
+                                    tracing::info!("v3.x: respawn 成功");
+                                    use tauri::Emitter;
+                                    let _ = app_clone.emit(
+                                        "process_respawned",
+                                        serde_json::json!({}),
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "v3.x: respawn 失败");
+                                    use tauri::Emitter;
+                                    let _ = app_clone.emit(
+                                        "process_respawn_failed",
+                                        serde_json::json!({
+                                            "reason": format!("{}", e),
+                                        }),
+                                    );
+                                }
+                            }
+                        });
+
+                        return; // 不走 stop_impl，保持 monitor 退出
+                    }
+                    self::respawn::RespawnDecision::Deny(deny_reason) => {
+                        tracing::info!(
+                            reason = ?deny_reason,
+                            "v3.x: respawn 拒绝，走 stop 流程"
+                        );
+                    }
+                }
 
                 // v3.4 增强：emit process_crashed 事件（前端跳转 + 弹窗用）
                 // 载荷：exit_code + stderr_tail（最近 50 行来自 LogPipeline）

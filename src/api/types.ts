@@ -93,6 +93,20 @@ export interface LaunchConfig {
   preview_method: PreviewMethod;
   custom_args: string;
   advanced: AdvancedArgs;
+  /**
+   * v3.x 新增：ComfyUI-Manager 自动重启（默认 true）
+   *
+   * 实现官方 `__COMFY_CLI_SESSION__` 协议：
+   * - 启动 ComfyUI 时注入 `__COMFY_CLI_SESSION__` 环境变量
+   * - ComfyUI-Manager 点 Restart → 写 `<session>.reboot` + `exit(0)`
+   * - 客户端检测 `.reboot` → 自动 respawn
+   *
+   * 关闭后：
+   * - 不注入 `__COMFY_CLI_SESSION__` 环境变量
+   * - ComfyUI-Manager 走传统 `os.execv` 路径
+   * - 行为退化为"用户手动重启"
+   */
+  auto_restart: boolean;
   /** v3.x Phase 5：多 GPU 选择（None = 全部使用） */
   gpu_selection?: GpuSelectionConfig | null;
 }
@@ -178,7 +192,25 @@ export type ProcessStatus =
   | { kind: "starting"; started_at: string; port: number }
   | { kind: "running"; pid: number; started_at: string; port: number }
   | { kind: "stopping"; reason: StopReason }
-  | { kind: "crashed"; exit_code: number | null; error: string; at: string };
+  | { kind: "crashed"; exit_code: number | null; error: string; at: string }
+  /**
+   * v3.x 新增：ComfyUI-Manager 自动重启中
+   *
+   * - 前端显示"重启中..."spinner
+   * - 持续到 `process_started`（respawn 成功）或 `process_crashed`（respawn 失败）
+   *
+   * 与 `starting` 的区别：starting 是首次启动；restarting 是已经运行过、被 Manager 触发的重启
+   *
+   * 字段与后端 `ProcessStatus::Restarting` 一一对应：
+   * - `port` 来自原 ComfyUI 进程（重启前后不变），前端用于继续显示服务地址
+   */
+  | {
+      kind: "restarting";
+      reason: "manager_reboot" | "user_request" | "auto_recovery";
+      exit_code: number | null;
+      respawn_count: number;
+      port: number;
+    };
 
 /** 健康检查结果 */
 export interface HealthInfo {

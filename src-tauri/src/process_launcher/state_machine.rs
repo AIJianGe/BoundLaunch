@@ -18,6 +18,9 @@
 //! [Starting] -- 健康检查超时 --> [Stopping] → [Stopped]
 //! [Running]  -- 进程崩溃    --> [Crashed]
 //! [Stopping] -- SIGKILL 后仍不退出 --> [Crashed]
+//!
+//! v3.x 新增：
+//! [Running]  -- ComfyUI-Manager 重启 (.reboot 标志) --> [Restarting] → [Starting] → [Running]
 //! ```
 
 use chrono::Utc;
@@ -32,9 +35,15 @@ pub type TransitionResult = Result<ProcessStatus, ProcessError>;
 ///
 /// 仅允许在 Stopped / Crashed 状态触发。
 /// Running / Starting / Stopping 状态调用返回 `AlreadyRunning` 或 `NotRunning` 错误。
+/// **v3.x**：Restarting 状态也允许重启（respawn 走 stop+start 流程）
 pub fn transition_to_starting(current: &ProcessStatus, port: u16) -> TransitionResult {
     match current {
         ProcessStatus::Stopped | ProcessStatus::Crashed { .. } => Ok(ProcessStatus::Starting {
+            started_at: Utc::now(),
+            port,
+        }),
+        // **v3.x**：Restarting 状态下可以调 start()（继续 respawn 流程）
+        ProcessStatus::Restarting { .. } => Ok(ProcessStatus::Starting {
             started_at: Utc::now(),
             port,
         }),
@@ -48,6 +57,7 @@ pub fn transition_to_starting(current: &ProcessStatus, port: u16) -> TransitionR
 ///
 /// 仅允许在 Starting 状态触发（健康检查通过后）。
 /// 保留原 started_at，但 PID 与 port 来自子进程。
+/// **v3.x**：Restarting → Running 也允许（respawn 后健康检查通过）
 pub fn transition_to_running(
     current: &ProcessStatus,
     pid: u32,
@@ -55,6 +65,12 @@ pub fn transition_to_running(
 ) -> TransitionResult {
     match current {
         ProcessStatus::Starting { started_at, .. } => Ok(ProcessStatus::Running {
+            pid,
+            started_at: *started_at,
+            port,
+        }),
+        // **v3.x**：respawn 后 health_check 通过 → Restarting 转 Running
+        ProcessStatus::Restarting { started_at, .. } => Ok(ProcessStatus::Running {
             pid,
             started_at: *started_at,
             port,
@@ -72,14 +88,15 @@ pub fn transition_to_running(
 ///
 /// 仅允许在 Starting / Running 状态触发。
 /// 已 Stopped / Crashed 状态调用返回 `NotRunning`（幂等错误）。
+/// **v3.x**：Restarting 状态也可进入 Stopping（用户主动取消重启）
 pub fn transition_to_stopping(
     current: &ProcessStatus,
     reason: StopReason,
 ) -> TransitionResult {
     match current {
-        ProcessStatus::Starting { .. } | ProcessStatus::Running { .. } => {
-            Ok(ProcessStatus::Stopping { reason })
-        }
+        ProcessStatus::Starting { .. }
+        | ProcessStatus::Running { .. }
+        | ProcessStatus::Restarting { .. } => Ok(ProcessStatus::Stopping { reason }),
         ProcessStatus::Stopped | ProcessStatus::Crashed { .. } => Err(ProcessError::NotRunning),
         ProcessStatus::Stopping { .. } => {
             // 已在停止中：返回当前状态（幂等）
@@ -91,11 +108,15 @@ pub fn transition_to_stopping(
 /// Stopping → Stopped
 ///
 /// 仅允许在 Stopping 状态触发（子进程正常退出）。
+/// **v3.x**：Restarting 状态在 respawn 之前被 cancel_token 取消或用户主动 stop 时
+/// 也应回退到 Stopped（视为"放弃本次重启"）
 pub fn transition_to_stopped(current: &ProcessStatus) -> TransitionResult {
     match current {
         ProcessStatus::Stopping { .. } => Ok(ProcessStatus::Stopped),
         // 子进程可能在 Starting / Running 状态直接退出（崩溃前）
         ProcessStatus::Starting { .. } | ProcessStatus::Running { .. } => Ok(ProcessStatus::Stopped),
+        // **v3.x**：Restarting 状态下被 stop 取消 → 回到 Stopped
+        ProcessStatus::Restarting { .. } => Ok(ProcessStatus::Stopped),
         // 已停止：幂等返回
         ProcessStatus::Stopped => Ok(ProcessStatus::Stopped),
         // 已崩溃：保持 Crashed 状态

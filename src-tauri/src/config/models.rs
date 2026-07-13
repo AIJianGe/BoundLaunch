@@ -167,6 +167,21 @@ pub struct LaunchConfig {
     pub custom_args: String,
     /// 高级参数
     pub advanced: AdvancedArgs,
+    /// **v3.x 新增**：ComfyUI-Manager 自动重启（默认 true）
+    ///
+    /// 实现官方 `__COMFY_CLI_SESSION__` 协议：
+    /// - 启动 ComfyUI 时注入 `__COMFY_CLI_SESSION__` 环境变量
+    /// - ComfyUI-Manager 点 Restart → 写 `<session>.reboot` + `exit(0)`
+    /// - 客户端检测 `.reboot` → 自动 respawn
+    ///
+    /// 关闭后：
+    /// - 不注入 `__COMFY_CLI_SESSION__` 环境变量
+    /// - ComfyUI-Manager 走传统 `os.execv` 路径
+    /// - 行为退化为"用户手动重启"
+    ///
+    /// **多实例隔离**：session 文件在 `<exe_dir>/.boundlaunch/sessions/`
+    /// 复制目录到新位置 → 新实例用自己的 sessions/ → 互不影响。
+    pub auto_restart: bool,
     /// **v3.x Phase 5**：多 GPU 选择（仅"全部使用"和"单卡模式"）
     ///
     /// - `None` 或 `{ mode: "all" }`：所有 GPU 都参与（不设 CUDA_VISIBLE_DEVICES）
@@ -505,6 +520,8 @@ impl Default for Config {
                 preview_method: PreviewMethod::Latent2Rgb,
                 custom_args: String::new(),
                 advanced: AdvancedArgs::default(),
+                // v3.x：默认开启 ComfyUI-Manager 自动重启（__COMFY_CLI_SESSION__ 协议）
+                auto_restart: true,
                 // v3.x Phase 5：默认全部 GPU
                 gpu_selection: Some(GpuSelectionConfig::default()),
             },
@@ -581,6 +598,8 @@ pub struct LaunchConfigPatch {
     pub preview_method: Option<PreviewMethod>,
     pub custom_args: Option<String>,
     pub advanced: Option<AdvancedArgs>,
+    /// **v3.x 新增**：ComfyUI-Manager 自动重启开关
+    pub auto_restart: Option<bool>,
     /// **v3.x Phase 5**：多 GPU 选择 patch
     pub gpu_selection: Option<GpuSelectionConfig>,
 }
@@ -779,6 +798,8 @@ pub struct LaunchConfigForToml<'a> {
     pub preview_method: &'a PreviewMethod,
     pub custom_args: &'a str,
     pub advanced: &'a AdvancedArgs,
+    /// v3.x：ComfyUI-Manager 自动重启开关（默认 true）
+    pub auto_restart: bool,
     /// v3.x Phase 5：多 GPU 选择
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_selection: Option<&'a GpuSelectionConfig>,
@@ -797,6 +818,7 @@ impl<'a> From<&'a Config> for ConfigForToml<'a> {
                 preview_method: &cfg.launch.preview_method,
                 custom_args: &cfg.launch.custom_args,
                 advanced: &cfg.launch.advanced,
+                auto_restart: cfg.launch.auto_restart,
                 gpu_selection: cfg.launch.gpu_selection.as_ref(),
             },
             torch: &cfg.torch,
@@ -828,6 +850,10 @@ pub fn apply_launch_patch(cfg: &mut LaunchConfig, patch: LaunchConfigPatch) {
     }
     if let Some(v) = patch.advanced {
         cfg.advanced = v;
+    }
+    // v3.x：ComfyUI-Manager 自动重启开关
+    if let Some(v) = patch.auto_restart {
+        cfg.auto_restart = v;
     }
     // **v3.x Phase 5**：gpu_selection 接受 Some/None 两种语义
     // - `Some(config)`：使用新配置

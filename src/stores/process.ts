@@ -56,6 +56,18 @@ export interface ProcessCrashedEvent {
   reason: "early_exit" | "health_check_detected" | "monitor_detected";
 }
 
+/**
+ * v3.x 新增：ComfyUI-Manager 自动重启事件 payload
+ *
+ * - `process_respawning`：后端检测到 .reboot 标志 + 决策 Allow，状态切到 Restarting
+ * - `process_respawned`：respawn 成功（status 切到 Running）
+ * - `process_respawn_failed`：respawn 失败（start() 返回错误）
+ */
+export interface ProcessRespawningEvent {
+  reason: "manager_reboot" | "user_request" | "auto_recovery";
+  exit_code: number | null;
+}
+
 export const useProcessStore = defineStore("process", () => {
   // ========== State ==========
   const status = ref<ProcessStatus>({ kind: "stopped" });
@@ -76,6 +88,14 @@ export const useProcessStore = defineStore("process", () => {
   const crashedReason = ref<ProcessCrashedEvent | null>(null);
   /** v3.11 新增：最近一次 process_start_failed 事件详情（端口被占等启动前失败） */
   const startFailedReason = ref<ProcessStartFailedEvent | null>(null);
+  /**
+   * v3.x 新增：最近一次 process_respawning 事件详情
+   *
+   * 启动页显示「ComfyUI-Manager 触发重启中...」提示 + 原因
+   * - 重启成功（process_respawned）→ 清空
+   * - 重启失败（process_respawn_failed）→ 保留 + 切到 stopped 状态
+   */
+  const respawningReason = ref<ProcessRespawningEvent | null>(null);
 
   const unlisteners: UnlistenFn[] = [];
 
@@ -83,13 +103,21 @@ export const useProcessStore = defineStore("process", () => {
   const isRunning = computed(() => status.value.kind === "running");
   const isStarting = computed(() => status.value.kind === "starting");
   const isStopping = computed(() => status.value.kind === "stopping");
-  const isAlive = computed(() => isStarting.value || isRunning.value);
+  /** v3.x 新增：是否处于 ComfyUI-Manager 触发的自动重启中 */
+  const isRestarting = computed(() => status.value.kind === "restarting");
+  const isAlive = computed(
+    () => isStarting.value || isRunning.value || isRestarting.value,
+  );
   const isCrashed = computed(() => status.value.kind === "crashed");
   const pid = computed<number | null>(() =>
     status.value.kind === "running" ? status.value.pid : null,
   );
   const port = computed<number | null>(() => {
-    if (status.value.kind === "running" || status.value.kind === "starting") {
+    if (
+      status.value.kind === "running" ||
+      status.value.kind === "starting" ||
+      status.value.kind === "restarting"
+    ) {
       return status.value.port;
     }
     return null;
@@ -228,6 +256,13 @@ export const useProcessStore = defineStore("process", () => {
   }
 
   /**
+   * v3.x 新增：清掉 respawningReason（用户关闭重启提示 / 状态切到 Running/Stopped 后调用）
+   */
+  function dismissRespawning() {
+    respawningReason.value = null;
+  }
+
+  /**
    * F24 退出流程：设置退出中标记
    *
    * 启动页按钮据此 disabled + 显示 spinner + 「正在退出...」
@@ -260,6 +295,8 @@ export const useProcessStore = defineStore("process", () => {
         error.value = null;
         // 启动成功 → 清掉 crashedReason（如果之前失败过）
         crashedReason.value = null;
+        // v3.x：respawn 成功 → 清掉 respawningReason
+        respawningReason.value = null;
       }),
       await listen<ProcessStatus>("process_stopping", (e) => {
         status.value = e.payload;
@@ -314,6 +351,42 @@ export const useProcessStore = defineStore("process", () => {
       await listen<StaleProcessInfo>("stale_process_detected", (e) => {
         staleProcess.value = e.payload;
       }),
+      // **v3.x 新增**：process_respawning 事件
+      // - 后端 monitor 检测到 child exit(0) + .reboot 标志 → 决策 Allow → 准备 respawn
+      // - 状态机切到 Restarting，前端显示「重启中...」spinner
+      // - payload: { reason, exit_code }
+      // - port 沿用当前 state 的 port（重启前后不变）
+      await listen<ProcessRespawningEvent>("process_respawning", (e) => {
+        respawningReason.value = e.payload;
+        // 沿用 running/starting 状态的 port（重启前后不变）
+        const currentPort =
+          status.value.kind === "running" || status.value.kind === "starting"
+            ? status.value.port
+            : 0;
+        status.value = {
+          kind: "restarting",
+          reason: e.payload.reason,
+          exit_code: e.payload.exit_code,
+          respawn_count: 0,
+          port: currentPort,
+        };
+        console.info("[processStore] process_respawning", e.payload);
+      }),
+      // **v3.x 新增**：process_respawned 事件
+      // - respawn 成功（start() 返回 Ok，状态机会随后切到 Running）
+      // - 清空 respawningReason
+      await listen<void>("process_respawned", () => {
+        respawningReason.value = null;
+        console.info("[processStore] process_respawned");
+      }),
+      // **v3.x 新增**：process_respawn_failed 事件
+      // - respawn 失败（start() 返回 Err）
+      // - 状态机会随后切到 Stopped / Crashed
+      // - 保留 respawningReason 用于显示错误原因
+      await listen<{ reason: string }>("process_respawn_failed", (e) => {
+        console.error("[processStore] process_respawn_failed", e.payload);
+        // 状态机会走 process_stopped / process_crashed 事件，无需手动改
+      }),
       // F24 退出流程事件
       await listen<{ reason: ShutdownReason }>("app_exiting", (e) => {
         console.info("[processStore] app_exiting", e.payload);
@@ -351,10 +424,12 @@ export const useProcessStore = defineStore("process", () => {
     exitingReason,
     crashedReason, // v3.4
     startFailedReason, // v3.11
+    respawningReason, // v3.x
     // getters
     isRunning,
     isStarting,
     isStopping,
+    isRestarting, // v3.x
     isAlive,
     isCrashed,
     pid,
@@ -370,6 +445,7 @@ export const useProcessStore = defineStore("process", () => {
     dismissStale,
     dismissCrashed, // v3.4
     dismissStartFailed, // v3.11
+    dismissRespawning, // v3.x
     setExiting,
     subscribe,
     unsubscribe,

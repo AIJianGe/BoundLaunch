@@ -102,6 +102,23 @@ pub enum ProcessStatus {
         /// 崩溃时间
         at: DateTime<Utc>,
     },
+    /// **v3.x 新增**：ComfyUI-Manager 自动重启中
+    ///
+    /// - 触发：monitor 检测到 child exit(0) + `<session>.reboot` 标志
+    /// - 持续：到 `start()` respawn 成功（→ Running）或失败（→ Crashed）
+    /// - 与 `Starting` 的区别：Starting 是首次启动；Restarting 是 respawn 阶段
+    Restarting {
+        /// 重启原因
+        reason: RespawnReason,
+        /// 退出码（None 表示被信号杀死）
+        exit_code: Option<i32>,
+        /// 累计重启次数（1 分钟窗口内）
+        respawn_count: u32,
+        /// 重启开始时间（respawn spawn 的时间，不是原 ComfyUI 启动时间）
+        started_at: DateTime<Utc>,
+        /// 监听端口（重启前后不变，前端用于继续显示服务地址）
+        port: u16,
+    },
 }
 
 impl ProcessStatus {
@@ -112,7 +129,10 @@ impl ProcessStatus {
 
     /// 是否处于运行中或启动中
     pub fn is_alive(&self) -> bool {
-        matches!(self, Self::Starting { .. } | Self::Running { .. })
+        matches!(
+            self,
+            Self::Starting { .. } | Self::Running { .. } | Self::Restarting { .. }
+        )
     }
 
     /// 是否正在运行（健康检查已通过）
@@ -128,6 +148,7 @@ impl ProcessStatus {
             Self::Running { .. } => "running",
             Self::Stopping { .. } => "stopping",
             Self::Crashed { .. } => "crashed",
+            Self::Restarting { .. } => "restarting",
         }
     }
 }
@@ -135,6 +156,30 @@ impl ProcessStatus {
 impl Default for ProcessStatus {
     fn default() -> Self {
         Self::Stopped
+    }
+}
+
+/// **v3.x 新增**：ComfyUI 自动重启原因
+///
+/// 区分 "Manager 重启" / "用户主动重启" / "崩溃自动恢复"
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RespawnReason {
+    /// ComfyUI-Manager 点 Restart 触发（最常见）
+    ManagerReboot,
+    /// 用户主动重启（未来扩展：快捷键 / 按钮）
+    UserRequest,
+    /// 崩溃后自动恢复（v3.4 已有，未来可整合）
+    AutoRecovery,
+}
+
+impl RespawnReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ManagerReboot => "manager_reboot",
+            Self::UserRequest => "user_request",
+            Self::AutoRecovery => "auto_recovery",
+        }
     }
 }
 
