@@ -370,7 +370,7 @@ onMounted(async () => {
 
     <!-- 底部版权 -->
     <div class="footer">
-      © 2026 BoundLaunch · 开源软件 (MIT License)
+      © 2026 BoundLaunch · 开源软件 (GPLv3 License)
     </div>
   </div>
 </template>

@@ -7,7 +7,7 @@
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB?logo=tauri)](https://tauri.app)
 [![Vue](https://img.shields.io/badge/Vue-3.5-42B883?logo=vue.js)](https://vuejs.org)
 [![Rust](https://img.shields.io/badge/Rust-1.80+-DEA584?logo=rust)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)](#-支持的平台)
 
 [English](#-english-version-coming-soon) | **简体中文**
@@ -323,31 +323,29 @@ npm run package:fast     # 跳过测试快速打包
 
 ## 📜 许可证
 
-本项目基于 [MIT License](./LICENSE) 开源。
+本项目基于 [GNU General Public License v3.0](./LICENSE) 开源。
 
 ```
-MIT License
+BoundLaunch - ComfyUI 桌面启动器
+Copyright (C) 2026 BoundLaunch Contributors
 
-Copyright (c) 2026 BoundLaunch Contributors
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
 ```
+
+完整协议文本见 [LICENSE](./LICENSE) 文件。
+
+> **重要提示**：GPLv3 是 copyleft 协议。任何基于本项目源码衍生的作品，**必须**同样以 GPLv3 协议开源并保留版权声明。
 
 ---
 
