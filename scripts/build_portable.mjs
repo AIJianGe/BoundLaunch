@@ -410,11 +410,24 @@ async function main() {
   const hash = computeHash(zipPath);
   log("info", `SHA256: ${hash}`);
 
+  // v0.0.1：把 SHA256 写到 .sha256 文件（供 updater 客户端校验）
+  //
+  // 格式：纯 hex 字符串（小写），每行一个 hash，文件名匹配 `<zip_name>.sha256`
+  // GitHub Release 上传 zip + .sha256 两个 asset 即可。
+  const sha256File = `${zipPath}.sha256`;
+  writeFileSync(sha256File, hash);
+  log("info", `已写 SHA256 文件: ${sha256File}`);
+
   log("info", "===== 阶段 5/5: 报告 =====");
   log("success", "✓ 绿色版打包完成");
   log("info", `产物: ${zipPath}`);
+  log("info", `SHA256: ${sha256File}`);
   log("info", `大小: ${formatSize(statSync(zipPath).size)}`);
   log("info", `SHA256: ${hash}`);
+  log("info", "");
+  log("info", "发布到 GitHub Release 时上传两个 asset：");
+  log("info", `  - ${basename(zipPath)}`);
+  log("info", `  - ${basename(sha256File)}`);
   log("info", "");
   log("info", "解压后双击 BoundLaunch.exe 即可使用");
   log("info", "复制整个文件夹即可创建独立环境");

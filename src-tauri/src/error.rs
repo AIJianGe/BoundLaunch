@@ -172,6 +172,13 @@ pub enum ProcessError {
         stderr_tail: String,
         window_secs: u64,
     },
+    /// v0.0.1：自动更新模块使用
+    ///
+    /// 通用错误：用于"非进程类"但需要走 `ProcessError` 通道的子模块
+    /// （如 updater 的文件拷贝、zip 解压等）。
+    /// 不强制要求对应一个进程类语义，只为统一 Result 链式调用。
+    #[error("更新模块错误: {0}")]
+    Other(String),
 }
 
 impl From<std::io::Error> for ProcessError {

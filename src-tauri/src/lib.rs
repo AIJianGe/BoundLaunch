@@ -32,6 +32,7 @@ mod python_env;
 mod system;
 mod task_scheduler;
 mod tray;
+mod updater;  // v0.0.1：自动更新（GitHub Releases + 白名单替换）
 mod uv_sidecar;
 
 use crate::common::paths as common_paths;
@@ -129,6 +130,33 @@ pub fn run() {
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_process::init())
         .setup(move |app| {
+            // v0.0.1：启动期应用挂起的更新（必须先于一切）
+            //
+            // 流程：
+            // 1. 检测 `.boundlaunch/update-pending/` 目录是否存在
+            // 2. 存在 → rename .new → 标准文件名 + merge resources/uv/
+            // 3. 清空 pending
+            // 4. 不存在 → 直接跳过（正常启动）
+            //
+            // **为什么可以同步调用**：
+            // - `apply_pending_update` 是纯同步函数，不涉及 tokio 调度
+            // - 操作量极小：删除旧 exe/dll + rename .new + copy_dir_merge uv（uv 包就几 MB）
+            // - 总耗时 < 100ms（无更新时 < 1ms）
+            // - 用 sync 调用避免新建 tokio runtime 的开销（~5-20ms）
+            //
+            // **错误处理**：更新失败不阻塞启动（用户可手动重新触发）
+            let apply = updater::apply_pending_update();
+            if apply.exe_updated || apply.dll_updated || apply.uv_updated {
+                tracing::info!(
+                    exe_updated = apply.exe_updated,
+                    dll_updated = apply.dll_updated,
+                    uv_updated = apply.uv_updated,
+                    "v0.0.1: pending update applied on startup"
+                );
+            } else {
+                tracing::debug!("v0.0.1: no pending update to apply");
+            }
+
             // v3.x：动态创建主窗口
             //
             // **背景**：tauri.conf.json::app.windows 已改为 []（见配置文件），
@@ -550,6 +578,10 @@ pub fn run() {
             commands::port_diagnostics::force_kill_process,
             commands::port_diagnostics::force_kill_all_python,
             commands::port_diagnostics::force_kill_all_comfyui,
+            // v0.0.1：自动更新
+            commands::updater::updater_check,
+            commands::updater::updater_download,
+            commands::updater::updater_apply_and_restart,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

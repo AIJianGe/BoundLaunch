@@ -15,13 +15,12 @@
  * 设计模式：
  * - **Facade**：集中编排 5 个区块的展示
  * - **State**：updateState 状态机管理更新流程
- *   (idle → checking → up_to_date → available → updating → failed)
+ *   (idle → checking → up_to_date → available → downloading → ready → failed)
  *
- * 注意：实际更新检查依赖 Tauri Updater 插件或自建服务器，
- *      当前为前端占位实现，后续接入后端时只需替换 checkForUpdate 函数。
+ * v0.0.1：接入真实自动更新（GitHub Releases + 白名单替换）
  */
 
-import { ref, computed, onMounted, type Component } from "vue";
+import { ref, computed, onMounted, onUnmounted, type Component } from "vue";
 import {
   NCard,
   NButton,
@@ -33,6 +32,8 @@ import {
   NDescriptionsItem,
   NResult,
   NSpin,
+  NProgress,
+  NModal,
   useOsTheme,
 } from "naive-ui";
 import { useCoreStore } from "@/stores/core";
@@ -45,8 +46,19 @@ import {
   Bug,
   BookOpen,
   Link,
+  Download,
 } from "@/components/icons";
 import SafeIcon from "@/components/SafeIcon.vue";
+import {
+  updater as updaterApi,
+  formatBytes,
+  formatSpeed,
+  formatEta,
+  type UpdateInfo,
+  type UpdateProgress,
+  type ApplyResult,
+} from "@/api/updater";
+import { listen, type UnlistenFn } from "@/api";
 
 const coreStore = useCoreStore();
 const toast = useToast();
@@ -61,20 +73,51 @@ const comfyuiVersion = computed(() => coreStore.currentVersion ?? "未安装");
 type UpdateState =
   | { phase: "idle" }
   | { phase: "checking" }
-  | { phase: "up_to_date" }
-  | { phase: "available"; version: string; notes: string }
+  | { phase: "up_to_date"; version: string }
+  | { phase: "available"; info: UpdateInfo }
+  | {
+      phase: "downloading";
+      info: UpdateInfo;
+      progress: UpdateProgress;
+    }
+  | { phase: "ready"; info: UpdateInfo; apply: ApplyResult }
+  | { phase: "restarting" }
   | { phase: "failed"; error: string };
 
 const updateState = ref<UpdateState>({ phase: "idle" });
 
 const isChecking = computed(() => updateState.value.phase === "checking");
+const isBusy = computed(
+  () =>
+    updateState.value.phase === "checking" ||
+    updateState.value.phase === "downloading" ||
+    updateState.value.phase === "restarting",
+);
 const hasUpdate = computed(() => updateState.value.phase === "available");
-const updateVersion = computed(() =>
-  updateState.value.phase === "available" ? updateState.value.version : "",
+const isReady = computed(() => updateState.value.phase === "ready");
+const updateInfo = computed(() => {
+  switch (updateState.value.phase) {
+    case "available":
+    case "downloading":
+    case "ready":
+      return updateState.value.info;
+    default:
+      return null;
+  }
+});
+const updateVersion = computed(() => updateInfo.value?.latest_version ?? "");
+const updateNotes = computed(() => updateInfo.value?.release_notes ?? "");
+const updateSize = computed(() =>
+  updateInfo.value ? formatBytes(updateInfo.value.zip_size) : "",
 );
-const updateNotes = computed(() =>
-  updateState.value.phase === "available" ? updateState.value.notes : "",
-);
+
+// 下载进度（仅 downloading 阶段）
+const downloadProgress = computed(() => {
+  if (updateState.value.phase === "downloading") {
+    return updateState.value.progress;
+  }
+  return null;
+});
 
 // ========== 静态信息 ==========
 
@@ -86,15 +129,14 @@ interface ChangeEntry {
 
 const changelog: ChangeEntry[] = [
   {
-    version: "v0.1.0",
-    date: "2026-07-03",
+    version: "v0.0.1",
+    date: "2026-07-11",
     notes: [
-      "首次发布",
-      "ComfyUI 启动器核心功能（启动/停止/状态机）",
+      "首次发布（v0.0.1）",
+      "ComfyUI 启动器核心功能（启动/停止/状态机 + ComfyUI-Manager 自动重启）",
       "环境管理（Python 切换 / venv 重建 / torch CUDA 配置）",
       "插件管理（Git 仓库安装 / 启用 / 更新 / 卸载）",
-      "模型路径管理（v3.x 合并到设置 → 路径配置 → models 软链接）",
-      "任务调度器 + 日志持久化",
+      "自动更新（GitHub Releases + 白名单替换 + SHA256 校验）",
     ],
   },
 ];
@@ -132,7 +174,7 @@ const links: LinkEntry[] = [
   {
     label: "反馈问题",
     icon: Bug,
-    url: "https://github.com/your-org/BoundLaunch/issues",
+    url: "https://github.com/AIJianGe/BoundLaunch/issues",
     description: "提交 Bug 或功能建议",
   },
   {
@@ -160,39 +202,106 @@ const platform = computed(() => {
   return "Unknown";
 });
 
+// ========== 事件监听 ==========
+
+let unlistenProgress: UnlistenFn | null = null;
+
+async function setupListeners() {
+  unlistenProgress = await listen<UpdateProgress>(
+    "update_progress",
+    (e) => {
+      if (updateState.value.phase === "downloading") {
+        updateState.value = {
+          phase: "downloading",
+          info: updateState.value.info,
+          progress: e.payload,
+        };
+      }
+    },
+  );
+}
+
+function teardownListeners() {
+  if (unlistenProgress) {
+    unlistenProgress();
+    unlistenProgress = null;
+  }
+}
+
 // ========== Actions ==========
 
 async function onCheckUpdate() {
-  if (isChecking.value) return;
+  if (isBusy.value) return;
   updateState.value = { phase: "checking" };
 
   try {
-    // TODO: 接入 Tauri Updater 插件或自建更新服务器
-    // 当前为占位实现：模拟网络请求延迟
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-
-    // 实际接入时替换为：
-    //   const update = await check();  // @tauri-apps/plugin-updater
-    //   if (update) {
-    //     updateState.value = {
-    //       phase: "available",
-    //       version: update.version,
-    //       notes: update.body,
-    //     };
-    //   } else {
-    //     updateState.value = { phase: "up_to_date" };
-    //     toast.success("当前为最新版本");
-    //   }
-
-    // 占位：始终返回"已是最新"
-    updateState.value = { phase: "up_to_date" };
-    toast.success("当前为最新版本");
+    const info = await updaterApi.check();
+    if (info.has_update) {
+      updateState.value = { phase: "available", info };
+      toast.info(`发现新版本 v${info.latest_version}`);
+    } else {
+      updateState.value = { phase: "up_to_date", version: info.latest_version };
+      toast.success("当前为最新版本");
+    }
   } catch (e) {
     updateState.value = {
       phase: "failed",
       error: e instanceof Error ? e.message : String(e),
     };
     toast.error("检查更新失败", e);
+  }
+}
+
+async function onStartUpdate() {
+  if (updateState.value.phase !== "available") return;
+  const info = updateState.value.info;
+
+  // 初始化进度
+  updateState.value = {
+    phase: "downloading",
+    info,
+    progress: {
+      phase: "download",
+      percent: 0,
+      bytes_done: 0,
+      bytes_total: info.zip_size,
+      speed_bps: 0,
+      eta_seconds: 0,
+    },
+  };
+
+  try {
+    const apply = await updaterApi.download(info);
+    updateState.value = { phase: "ready", info, apply };
+    toast.success("更新已就绪，重启启动器后生效");
+  } catch (e) {
+    updateState.value = {
+      phase: "failed",
+      error: e instanceof Error ? e.message : String(e),
+    };
+    toast.error("下载/解压失败", e);
+  }
+}
+
+async function onRestart() {
+  if (updateState.value.phase !== "ready") return;
+  updateState.value = { phase: "restarting" };
+  try {
+    await updaterApi.applyAndRestart();
+  } catch (e) {
+    updateState.value = {
+      phase: "failed",
+      error: e instanceof Error ? e.message : String(e),
+    };
+    toast.error("重启失败", e);
+  }
+}
+
+function onCancelDownload() {
+  // 简化：直接回退到 available 状态（不调后端 cancel）
+  if (updateState.value.phase === "downloading") {
+    updateState.value = { phase: "available", info: updateState.value.info };
+    toast.warn("已取消下载");
   }
 }
 
@@ -218,6 +327,9 @@ function onCopyVersion() {
 // ========== 生命周期 ==========
 
 onMounted(async () => {
+  // 设置事件监听
+  await setupListeners();
+
   // 加载 ComfyUI 核心状态
   try {
     if (!coreStore.status) {
@@ -226,6 +338,10 @@ onMounted(async () => {
   } catch (e) {
     console.warn("core refresh:", e);
   }
+});
+
+onUnmounted(() => {
+  teardownListeners();
 });
 </script>
 
@@ -269,26 +385,86 @@ onMounted(async () => {
 
     <!-- 更新提示（如有新版本） -->
     <NCard
-      v-if="hasUpdate"
+      v-if="updateState.phase === 'available' || updateState.phase === 'downloading' || updateState.phase === 'ready' || updateState.phase === 'restarting'"
       :bordered="true"
       size="small"
       class="update-banner"
     >
       <NResult
-        status="info"
-        :title="`🎉 发现新版本 v${updateVersion}`"
+        :status="updateState.phase === 'ready' ? 'success' : 'info'"
+        :title="updateState.phase === 'ready'
+          ? `✅ 更新已就绪 v${updateVersion}`
+          : `🎉 发现新版本 v${updateVersion}`"
       >
         <template #footer>
-          <div class="update-notes">
+          <!-- changelog -->
+          <div v-if="updateNotes" class="update-notes">
             <pre>{{ updateNotes }}</pre>
           </div>
-          <NSpace justify="center">
-            <NButton type="primary" disabled>立即更新</NButton>
-            <NButton>稍后提醒</NButton>
-            <NButton quaternary>忽略此版本</NButton>
+
+          <!-- 进度条（仅 downloading 阶段） -->
+          <div v-if="downloadProgress" class="update-progress">
+            <NProgress
+              type="line"
+              :percentage="Math.round(downloadProgress.percent)"
+              :indicator-placement="'inside'"
+              :height="18"
+              :border-radius="4"
+            />
+            <div class="progress-meta">
+              <span>
+                {{ downloadProgress.bytes_done }} / {{ downloadProgress.bytes_total }} 字节
+                ({{ formatBytes(downloadProgress.bytes_done) }} / {{ updateSize }})
+              </span>
+              <span>
+                {{ formatSpeed(downloadProgress.speed_bps) }}
+                · 剩余 {{ formatEta(downloadProgress.eta_seconds) }}
+              </span>
+            </div>
+          </div>
+
+          <!-- 阶段提示 -->
+          <div v-if="downloadProgress" class="progress-phase">
+            <span v-if="downloadProgress.phase === 'download'">📥 正在下载更新包...</span>
+            <span v-else-if="downloadProgress.phase === 'verify'">🔐 正在校验 SHA256...</span>
+            <span v-else-if="downloadProgress.phase === 'extract'">📦 正在解压...</span>
+          </div>
+
+          <!-- 操作按钮 -->
+          <NSpace justify="center" style="margin-top: 16px">
+            <!-- 状态：available -->
+            <template v-if="updateState.phase === 'available'">
+              <NButton type="primary" @click="onStartUpdate">
+                <SafeIcon :component="Download" :size="14" />
+                立即更新 ({{ updateSize }})
+              </NButton>
+              <NButton @click="updateState = { phase: 'idle' }">稍后提醒</NButton>
+            </template>
+
+            <!-- 状态：downloading -->
+            <template v-else-if="updateState.phase === 'downloading'">
+              <NButton @click="onCancelDownload">取消下载</NButton>
+            </template>
+
+            <!-- 状态：ready -->
+            <template v-else-if="updateState.phase === 'ready'">
+              <NButton type="primary" @click="onRestart">
+                立即重启应用
+              </NButton>
+              <NButton @click="updateState = { phase: 'idle' }">稍后重启</NButton>
+            </template>
+
+            <!-- 状态：restarting -->
+            <template v-else>
+              <NSpin size="small" />
+              <span>正在重启启动器...</span>
+            </template>
           </NSpace>
+
+          <!-- 数据保护提示 -->
           <div class="update-tip">
-            ℹ 更新功能将在后续版本接入 Tauri Updater 插件后启用
+            ℹ 更新只会替换启动器本体和内置 uv 工具<br>
+            你的 ComfyUI / 模型 / 插件 / 配置 / venv 等数据完全保留
           </div>
         </template>
       </NResult>
@@ -455,6 +631,26 @@ onMounted(async () => {
   margin-top: 8px;
   font-size: 12px;
   color: var(--app-text-muted, #999);
+}
+
+.update-progress {
+  margin: 12px 0;
+}
+
+.progress-meta {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--app-text-muted, #999);
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+}
+
+.progress-phase {
+  margin: 8px 0;
+  font-size: 13px;
+  color: var(--app-text, #333);
+  text-align: center;
 }
 
 .section-card {

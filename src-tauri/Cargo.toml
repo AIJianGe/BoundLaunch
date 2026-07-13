@@ -1,6 +1,6 @@
 [package]
 name = "bound-launch"
-version = "0.1.0"
+version = "0.0.1"
 description = "无界启动器 (BoundLaunch) - ComfyUI 启动器"
 authors = ["BoundLaunch"]
 edition = "2021"
@@ -25,6 +25,7 @@ tokio = { version = "1.40", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 futures = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # 序列化
 serde = { version = "1.0", features = ["derive"] }
@@ -52,7 +53,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "chro
 git2 = { version = "0.19", features = ["ssh_key_from_memory"] }
 
 # HTTP
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 
 # 时间 / UUID
 chrono = { version = "0.4", features = ["serde"] }
@@ -77,6 +78,13 @@ encoding_rs = "0.8"
 # 伪终端（portable-pty 跨平台：Windows ConPTY / Unix pty）
 portable-pty = "0.4"
 base64 = "0.22"
+
+# v0.0.1：自动更新
+# - semver：版本号解析与比较（比对当前版本与 GitHub release tag）
+# - zip：解压 release zip（白名单文件拷贝到 pending）
+# - sha2：SHA256 校验（已在上面，download.rs 复用）
+semver = "1.0"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 # v3.10：LoadLibraryW + MessageBoxW 用于启动期 DLL 缺失检测
