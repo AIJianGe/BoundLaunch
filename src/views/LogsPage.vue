@@ -7,7 +7,6 @@
  * 结构：
  * ┌──────────────────────────────────────────────┐
  * │ [StartProgressCard]   ← 启动中时显示           │
- * │ [ErrorPanelCard]      ← 有错误时显示           │
  * ├──────────────────────────────────────────────┤
  * │ ┌─[日志]─[终端]─[安装日志]─────────────────┐ │
  * │ │                                         │ │
@@ -37,7 +36,10 @@ import RunningLogsTab from "@/components/launch/RunningLogsTab.vue";
 import TerminalTab from "@/components/launch/TerminalTab.vue";
 import InstallLogsTab from "@/components/launch/InstallLogsTab.vue";
 import StartProgressCard from "@/components/launch/StartProgressCard.vue";
-import ErrorPanelCard from "@/components/launch/ErrorPanelCard.vue";
+// v3.13：ErrorPanelCard 已移至 InstallLogsTab 内部（用户偏好"不要放顶部"）
+// - 顶部跨 Tab 仅保留启动进度条
+// - 错误面板随"安装日志"tab 出现，进入该 tab 即可看到
+// - useErrorLog store / 菜单红点 / markAllRead 逻辑不变
 import PortConflictModal from "@/components/launch/PortConflictModal.vue";
 
 const processStore = useProcessStore();
@@ -103,9 +105,9 @@ watch(
 
 <template>
   <div class="logs-page">
-    <!-- 顶部跨 Tab 状态卡（启动中 + 业务错误） -->
+    <!-- 顶部跨 Tab 状态卡（启动中） -->
+    <!-- v3.13：ErrorPanelCard 已移至 InstallLogsTab 内部 -->
     <StartProgressCard />
-    <ErrorPanelCard />
 
     <!-- Tab 容器 -->
     <div class="tabs-wrapper">

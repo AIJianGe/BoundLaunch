@@ -1,16 +1,18 @@
 <script setup lang="ts">
 /**
- * ErrorPanelCard.vue — 业务错误面板（顶部跨 Tab 显示）
+ * ErrorPanelCard.vue — 业务错误面板（v3.13 移入"安装日志"tab 内部）
  *
  * 设计目的：
- * - 把所有 useToast.error / warn 调用的错误以"面板"形式置顶显示
+ * - 把所有 useToast.error / warn 调用的错误以"面板"形式集中显示
  * - 永远不消失（用户可主动清空显示）
- * - LogsPage 任何 Tab 都能看到
+ * - v3.13：从 LogsPage 顶部移到 InstallLogsTab 内部，节省首页空间
+ *   - 菜单红点未读数仍然有效（进入 LogsPage 即"已读"）
+ *   - 用户切到"安装日志" tab 即可看到面板
  *
  * 数据源：
  * - useErrorLog composable（pinia store）
  *   - recentErrors：最近 50 条（应用启动后累积）
- *   - displayErrors：最近 10 条（用于面板显示）
+ *   - 面板内显示最近 20 条（tab 内部空间更大）
  *   - 订阅 business_log 事件自动更新
  *
  * 与 install-logs 的区别：
@@ -33,6 +35,9 @@ import { useErrorLog } from "@/composables/useErrorLog";
 
 const errorLog = useErrorLog();
 
+/** v3.13：tab 内部空间更大，扩大到 20 条（displayErrors 仍保留 10 条给其他场景用） */
+const PANEL_DISPLAY_LIMIT = 20;
+
 function formatErrorTime(ts: string): string {
   return ts.split("T")[1]?.split(".")[0] || ts;
 }
@@ -54,12 +59,11 @@ async function onRefreshErrors() {
         <span class="error-panel-title">
           ⚠ 最近错误（{{ errorLog.recentErrors.length }}）
         </span>
-        <NTag size="small" type="error">置顶</NTag>
       </div>
     </template>
     <NSpace vertical size="small">
       <div
-        v-for="(err, idx) in errorLog.displayErrors"
+        v-for="(err, idx) in errorLog.recentErrors.slice(0, PANEL_DISPLAY_LIMIT)"
         :key="err.ts + idx"
         class="error-item"
       >
@@ -77,10 +81,10 @@ async function onRefreshErrors() {
         </details>
       </div>
       <div
-        v-if="errorLog.recentErrors.length > 10"
+        v-if="errorLog.recentErrors.length > PANEL_DISPLAY_LIMIT"
         class="error-panel-hint"
       >
-        仅显示前 10 条，完整历史见下方日志流（已持久化到 LogStore）
+        仅显示前 {{ PANEL_DISPLAY_LIMIT }} 条，完整历史见下方日志流（已持久化到 LogStore）
       </div>
       <NSpace size="small">
         <NButton size="tiny" @click="onRefreshErrors">刷新历史</NButton>
@@ -102,6 +106,7 @@ async function onRefreshErrors() {
 <style scoped>
 .error-panel {
   flex-shrink: 0;
+  /* v3.13：现在在 tab 内部，底部留 12px 与下方工具栏隔开 */
   margin-bottom: 12px;
   border-color: #d03050;
   background: linear-gradient(135deg, #fef0f0 0%, #ffffff 100%);

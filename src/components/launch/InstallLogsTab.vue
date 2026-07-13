@@ -44,6 +44,8 @@ import { useErrorLog } from "@/composables/useErrorLog";
 import { logQuery, logClear } from "@/api/log";
 import { listen, type UnlistenFn } from "@/api";
 import type { LogEntry, LogLevel, BusinessLogEvent } from "@/api/types";
+// v3.13：错误面板移入"安装日志" tab 顶部（用户偏好"不要放 LogsPage 顶部"）
+import ErrorPanelCard from "@/components/launch/ErrorPanelCard.vue";
 
 const toast = useToast();
 const errorLog = useErrorLog();
@@ -279,6 +281,11 @@ onUnmounted(() => {
 
 <template>
   <div class="install-logs-tab">
+    <!-- v3.13：业务错误面板（之前在 LogsPage 顶部，用户偏好移到"安装日志" tab 内） -->
+    <!-- - v-if="errorLog.hasErrors"：没错误时完全不渲染，节省 DOM -->
+    <!-- - 面板只显示 error/warn，详细日志看下方工具栏 + 日志流 -->
+    <ErrorPanelCard />
+
     <!-- 工具栏 -->
     <NCard class="toolbar" :bordered="true" size="small">
       <div class="toolbar-row">
