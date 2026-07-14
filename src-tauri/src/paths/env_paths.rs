@@ -352,13 +352,46 @@ pub fn portable_config_path() -> Result<PathBuf, EnvPathsError> {
 /// - 不存在 → 写默认配置并返回（首次启动）
 /// - 存在 → 解析
 /// - 解析失败 → 返回错误（不自动修复，避免掩盖用户配置问题）
+///
+/// **v0.0.2.1**：解析后**强制归一化** `cfg.paths.*` 为平台原生分隔符，
+/// 并立即写回磁盘修正可能存在的 mixed-separator 历史数据。
+/// 理由：portable.dat 是跨平台约定（用 `/`），但 Windows API 走 `\`，
+/// 不归一化会导致 `env_paths::resolve()` 算出 `D:\debug\data/venv` 这种
+/// mixed 路径，UI 显示与真实文件位置不一致。
 pub fn load_or_create() -> Result<(PortableConfig, PathBuf), EnvPathsError> {
     let path = portable_config_path()?;
     if path.exists() {
         let content = std::fs::read_to_string(&path)
             .map_err(|e| EnvPathsError::ParseError(e.to_string()))?;
-        let cfg: PortableConfig = toml::from_str(&content)
+        let mut cfg: PortableConfig = toml::from_str(&content)
             .map_err(|e| EnvPathsError::ParseError(e.to_string()))?;
+
+        // 归一化 relative 路径字段
+        let before = (
+            cfg.paths.comfyui.clone(),
+            cfg.paths.venv.clone(),
+            cfg.paths.custom_nodes.clone(),
+            cfg.paths.models.clone(),
+        );
+        normalize_portable_paths(&mut cfg);
+        let after = (
+            &cfg.paths.comfyui,
+            &cfg.paths.venv,
+            &cfg.paths.custom_nodes,
+            &cfg.paths.models,
+        );
+        if before.0 != *after.0 || before.1 != *after.1 || before.2 != *after.2 || before.3 != *after.3 {
+            // 修正了历史数据 → 立即写回
+            let new_content = toml::to_string_pretty(&cfg)
+                .map_err(|e| EnvPathsError::WriteError(e.to_string()))?;
+            std::fs::write(&path, new_content)
+                .map_err(|e| EnvPathsError::WriteError(e.to_string()))?;
+            tracing::info!(
+                "[env_paths] 修正 portable.dat 里的 mixed-separator 路径: {}",
+                path.display()
+            );
+        }
+
         Ok((cfg, path))
     } else {
         // 首次启动：写默认配置
@@ -371,6 +404,8 @@ pub fn load_or_create() -> Result<(PortableConfig, PathBuf), EnvPathsError> {
                 .unwrap_or("default")
                 .to_string();
         }
+        // 归一化默认路径为 native separator（写盘后下次读也是 native）
+        normalize_portable_paths(&mut cfg);
         let content = toml::to_string_pretty(&cfg)
             .map_err(|e| EnvPathsError::WriteError(e.to_string()))?;
         std::fs::write(&path, content)
@@ -385,15 +420,50 @@ pub fn load_or_create() -> Result<(PortableConfig, PathBuf), EnvPathsError> {
 
 /// 把相对路径解析为绝对路径
 ///
+/// **v0.0.2.1 修复**：在 Windows 上，把 child 里的所有 `/` 替换为 `\`
+/// 避免 portable.dat 写的 `data/venv`（TOML 跨平台约定用正斜杠）跟
+/// `env_root`（Windows API 用反斜杠）join 出 `D:\debug\data/venv` 这种
+/// mixed separator 路径，UI 显示不一致、用户复制到资源管理器打不开。
+///
 /// **规则**：
 /// - 绝对路径 → 原样返回
 /// - 相对路径 → 相对 <base>
 fn resolve_relative(base: &Path, rel: &str) -> PathBuf {
-    let p = Path::new(rel);
+    // **平台原生分隔符归一化**：把 child 里所有"错方向"的斜杠替换为平台原生
+    // 理由：portable.dat 跨平台约定用 `/`，但 Windows API 走 `\`，
+    //       必须显式归一化才能 join 出纯 native 路径
+    #[cfg(windows)]
+    let rel_native = rel.replace('/', "\\");
+    #[cfg(not(windows))]
+    let rel_native = rel.replace('\\', "/");
+
+    let p = Path::new(&rel_native);
     if p.is_absolute() {
         p.to_path_buf()
     } else {
-        base.join(rel)
+        base.join(p)
+    }
+}
+
+/// 归一化 portable.dat 里的相对路径字符串（按平台原生分隔符）
+///
+/// **v0.0.2.1**：在 `load_or_create` 末尾对 cfg.paths.* 调一次，
+/// 保证内存里的 `cfg.paths.comfyui` 等字段都是 native separator。
+/// 写盘时也用归一化后的值，旧 mixed 数据一次性修正。
+fn normalize_portable_paths(cfg: &mut PortableConfig) {
+    #[cfg(windows)]
+    {
+        cfg.paths.comfyui = cfg.paths.comfyui.replace('/', "\\");
+        cfg.paths.venv = cfg.paths.venv.replace('/', "\\");
+        cfg.paths.custom_nodes = cfg.paths.custom_nodes.replace('/', "\\");
+        cfg.paths.models = cfg.paths.models.replace('/', "\\");
+    }
+    #[cfg(not(windows))]
+    {
+        cfg.paths.comfyui = cfg.paths.comfyui.replace('\\', "/");
+        cfg.paths.venv = cfg.paths.venv.replace('\\', "/");
+        cfg.paths.custom_nodes = cfg.paths.custom_nodes.replace('\\', "/");
+        cfg.paths.models = cfg.paths.models.replace('\\', "/");
     }
 }
 
@@ -524,27 +594,87 @@ mod tests {
         assert_eq!(cfg.version, 1);
         assert_eq!(cfg.port, DEFAULT_PORT);
         assert_eq!(cfg.paths.comfyui, "ComfyUI");
+        // v0.0.2.1：默认字段保留正斜杠（TOML 跨平台约定），归一化在 load_or_create 时再做
         assert_eq!(cfg.paths.venv, "data/venv");
         assert_eq!(cfg.paths.custom_nodes, "ComfyUI/custom_nodes");
         assert_eq!(cfg.paths.models, "ComfyUI/models");
         assert!(!cfg.override_base_directory);
     }
 
+    /// v0.0.2.1：归一化后 portable.dat 路径字段全部变平台原生分隔符
+    #[test]
+    fn test_normalize_portable_paths_windows() {
+        #[cfg(windows)]
+        {
+            let mut cfg = PortableConfig {
+                version: 1,
+                name: "test".into(),
+                port: 8188,
+                override_base_directory: false,
+                paths: PortablePaths {
+                    comfyui: "ComfyUI".into(),
+                    venv: "data/venv".into(),
+                    custom_nodes: "ComfyUI/custom_nodes".into(),
+                    models: "ComfyUI/models".into(),
+                },
+            };
+            normalize_portable_paths(&mut cfg);
+            assert_eq!(cfg.paths.comfyui, "ComfyUI");
+            assert_eq!(cfg.paths.venv, "data\\venv");
+            assert_eq!(cfg.paths.custom_nodes, "ComfyUI\\custom_nodes");
+            assert_eq!(cfg.paths.models, "ComfyUI\\models");
+        }
+        #[cfg(not(windows))]
+        {
+            // Unix 平台：保持正斜杠
+            let mut cfg = PortableConfig {
+                version: 1,
+                name: "test".into(),
+                port: 8188,
+                override_base_directory: false,
+                paths: PortablePaths {
+                    comfyui: "ComfyUI".into(),
+                    venv: "data\\venv".into(),  // Windows-style 写盘
+                    custom_nodes: "ComfyUI\\custom_nodes".into(),
+                    models: "ComfyUI\\models".into(),
+                },
+            };
+            normalize_portable_paths(&mut cfg);
+            assert_eq!(cfg.paths.venv, "data/venv");
+        }
+    }
+
+    /// v0.0.2.1：resolve_relative 在 Windows 上把 child 里的 `/` 替换为 `\`
+    /// 避免 join 出来 mixed separator
+    #[test]
+    fn test_resolve_relative_native_separator() {
+        let base = PathBuf::from(if cfg!(windows) { r"D:\test\base" } else { "/test/base" });
+        let resolved = resolve_relative(&base, "data/venv");
+        if cfg!(windows) {
+            // Windows：全部反斜杠
+            assert_eq!(resolved, PathBuf::from(r"D:\test\base\data\venv"));
+        } else {
+            // Unix：全部正斜杠
+            assert_eq!(resolved, PathBuf::from("/test/base/data/venv"));
+        }
+    }
+
     #[test]
     fn test_resolve_relative_path() {
-        let base = PathBuf::from("/test/base");
-        assert_eq!(
-            resolve_relative(&base, "ComfyUI"),
-            PathBuf::from("/test/base/ComfyUI")
-        );
-        assert_eq!(
-            resolve_relative(&base, "/abs/path"),
-            PathBuf::from("/abs/path")
-        );
-        assert_eq!(
-            resolve_relative(&base, "data/venv"),
-            PathBuf::from("/test/base/data/venv")
-        );
+        // Unix 平台的简单断言（Windows 上 child 会被转成反斜杠）
+        #[cfg(not(windows))]
+        {
+            let base = PathBuf::from("/test/base");
+            assert_eq!(
+                resolve_relative(&base, "ComfyUI"),
+                PathBuf::from("/test/base/ComfyUI")
+            );
+            assert_eq!(
+                resolve_relative(&base, "/abs/path"),
+                PathBuf::from("/abs/path")
+            );
+        }
+        // Windows 平台独立测试在 test_resolve_relative_native_separator
     }
 
     #[test]
