@@ -12,7 +12,7 @@ pub mod schema;
 
 pub use repository::{LogEntry, LogLevel, LogRepository, TaskRepository, TaskHistoryRecord};
 
-use crate::common::paths;
+use crate::paths::env_paths;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -49,12 +49,20 @@ impl LogStoreService {
     /// - 自动创建数据库文件
     /// - 自动建表（IF NOT EXISTS）
     /// - 启动后台 7 天清理任务
+    ///
+    /// **v0.0.2.1**：DB 路径从 `env_paths::resolve().database_path` 取，
+    /// 固定在 `<env_root>/.boundlaunch/launcher.db`。
     pub async fn new(db_path: Option<PathBuf>) -> Result<Self, LogStoreError> {
-        let path = db_path.unwrap_or_else(paths::log_db_path);
+        let path = match db_path {
+            Some(p) => p,
+            None => env_paths::resolve()
+                .map(|p| p.database_path.clone())
+                .map_err(|e| LogStoreError::InitFailed(format!("env_paths resolve failed: {}", e)))?,
+        };
 
         // 确保父目录存在
         if let Some(parent) = path.parent() {
-            paths::ensure_dir(parent)
+            env_paths::ensure_dir(parent)
                 .await
                 .map_err(|e| LogStoreError::InitFailed(e.to_string()))?;
         }

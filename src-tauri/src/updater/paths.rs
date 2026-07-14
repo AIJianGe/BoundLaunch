@@ -32,13 +32,13 @@ use crate::paths::env_paths;
 /// staging 根目录：下载的 zip 解压到这里
 pub fn staging_dir(version: &str) -> PathBuf {
     let env = env_paths::resolve().expect("env_paths::resolve failed");
-    env.boundlaunch_data.join("update-staging").join(version)
+    env.boundlaunch_data_dir.join("update-staging").join(version)
 }
 
 /// pending 目录：staging 处理后（白名单拷贝）放到这里，等下次启动 rename
 pub fn pending_dir() -> PathBuf {
     let env = env_paths::resolve().expect("env_paths::resolve failed");
-    env.boundlaunch_data.join("update-pending")
+    env.boundlaunch_data_dir.join("update-pending")
 }
 
 /// 当前应用的 exe 同级目录
@@ -50,7 +50,7 @@ pub fn env_root() -> PathBuf {
 /// 用于清理 staging 目录的辅助函数
 pub fn cleanup_staging() {
     let env = env_paths::resolve().expect("env_paths::resolve failed");
-    let staging_root = env.boundlaunch_data.join("update-staging");
+    let staging_root = env.boundlaunch_data_dir.join("update-staging");
     if staging_root.exists() {
         if let Err(e) = std::fs::remove_dir_all(&staging_root) {
             tracing::warn!(error = %e, "failed to cleanup update-staging");

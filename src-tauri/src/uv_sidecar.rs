@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use tauri::{AppHandle, Manager};
 
-use crate::common::paths;
+use crate::paths::env_paths;
 
 /// 本 sidecar 版本（应与 `scripts/fetch-uv.ps1` 的 `$Version` 一致）
 ///
@@ -56,14 +56,18 @@ fn bundled_binary_name() -> &'static str {
 
 /// launcher 用户数据目录中 sidecar 的存放位置
 ///
-/// v1.8 / F38：跟随 portable 模式
-/// - dev 模式：`<project_root>/data/uv/uv.exe`
-/// - prod 模式：`<exe_dir>/data/uv/uv.exe`
-/// - legacy fallback：`<%APPDATA%>/boundlaunch/uv/uv.exe`（1.0 前老用户）
+/// v0.0.2.1：固定在 `<env_root>/data/uv/uv.exe`（env_paths 唯一来源）
 pub fn deployed_uv_path() -> PathBuf {
-    paths::app_data_dir()
-        .join("uv")
-        .join(if cfg!(windows) { "uv.exe" } else { "uv" })
+    env_paths::resolve()
+        .map(|p| p.uv_binary_path.clone())
+        .unwrap_or_else(|_| {
+            // 解析失败兜底：用 find_exe_dir
+            env_paths::find_exe_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("data")
+                .join("uv")
+                .join(if cfg!(windows) { "uv.exe" } else { "uv" })
+        })
 }
 
 /// 当前 target 的 host triple（资源文件名后缀）
@@ -270,7 +274,11 @@ mod tests {
     #[test]
     fn test_deployed_path_under_app_data() {
         let p = deployed_uv_path();
-        assert!(p.starts_with(paths::app_data_dir()));
+        // v0.0.2.1：固定在 <env_root>/data/uv/
+        let env_paths_root = env_paths::resolve()
+            .map(|p| p.app_data_dir.clone())
+            .unwrap_or_else(|_| env_paths::find_exe_dir().unwrap_or_default().join("data"));
+        assert!(p.starts_with(env_paths_root), "uv 应在 app_data_dir 下");
         assert!(p.ends_with("uv") || p.ends_with("uv.exe"));
     }
 }

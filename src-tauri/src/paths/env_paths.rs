@@ -1,25 +1,59 @@
-//! 绿色版（portable）模式路径解析
+//! **统一路径解析**（v0.0.2 重构，v0.0.2.1 进一步收紧）
 //!
-//! ## 设计目标
-//!
-//! 让 BoundLaunch.exe **完全独立运行**，不依赖任何外部配置：
-//!
-//! - 所有路径相对 `<exe_dir>` 解析（即 portable.dat 所在目录）
-//! - 启动时自动写默认 `launcher-portable.dat`
-//! - 支持 custom_nodes 在 ComfyUI 内（默认）或外（高级）
+//! 之前有两套并存的路径系统（`common/paths.rs` + 本模块），dev 模式下解析出的根
+//! 不同（项目根 vs `target/debug/`），导致 UI 显示不一致。本模块把两套合并为
+//! **唯一** 的路径解析入口。
 //!
 //! ## 核心原则
 //!
-//! - BoundLaunch.exe 不知道自己是不是"绿色版"
-//! - 它只读自己目录的 `launcher-portable.dat`
-//! - 找不到 → 自动创建默认配置（首次启动）
-//! - 找到 → 解析为绝对路径
+//! - **唯一根**：所有路径相对 `<exe_dir>` 解析（`current_exe().parent()`）
+//! - **dev / prod 一致**：`tauri dev` 编译到 `target/debug/`，prod 编译到 `target/release/`
+//!   → 两条路径都解析为各自的 `<exe_dir>`，**不**做"dev 用项目根"的特殊化
+//! - **多实例隔离**：复制整个目录到新位置 → 新实例自动用新 `<exe_dir>` → 互不影响 ✅
+//! - **缓存紧贴 exe**：所有用户可见目录（`data/`、`cache/`、`ComfyUI/`）都在 `<exe_dir>` 旁边
+//!   → 复制目录就等于整体复制一份绿色版环境
 //!
-//! ## 路径优先级
+//! ## 目录布局
 //!
-//! 1. **硬规则**：所有路径相对 `<exe_dir>` 解析（除了显式绝对路径）
-//! 2. **可覆盖**：launcher-portable.dat 里的 [paths] 节可以覆盖
-//! 3. **不可覆盖**：launcher 自己（BoundLaunch.exe）必须在 <exe_dir>
+//! ```text
+//! <exe_dir>/                              ← launcher.exe 所在目录
+//! ├── BoundLaunch.exe / .dll              # launcher 自身
+//! ├── launcher-portable.dat               # 配置（v3.x）
+//! ├── resources/uv/                       # 打包时自带（v3.x）
+//! ├── ComfyUI/                            # ComfyUI 核心（onboarding 时拉取）
+//! │   ├── main.py
+//! │   ├── models/                         # 默认模型目录
+//! │   └── custom_nodes/                   # 默认插件目录
+//! ├── data/                               # 用户持久数据（可见）
+//! │   ├── venv/                           # Python venv
+//! │   │   ├── pyvenv.cfg
+//! │   │   └── Lib/...
+//! │   └── uv/                             # uv sidecar 部署
+//! │       └── uv.exe
+//! ├── cache/                              # 用户缓存（可见）
+//! │   └── transformers_versions.json      # PyPI transformers 版本索引
+//! └── .boundlaunch/                       # launcher 私有数据（隐藏）
+//!     ├── launcher.db                     # SQLite（日志 / 任务历史）
+//!     ├── config.toml                     # 用户配置
+//!     ├── launcher.pid                    # launcher PID（崩溃恢复）
+//!     ├── logs/                           # launcher 日志
+//!     │   ├── launcher.log
+//!     │   └── launch-2026-07-13.log
+//!     └── sessions/                       # ComfyUI session（多实例隔离）
+//!         ├── 1234567890-abc.session
+//!         └── ...
+//! ```
+//!
+//! ## 配置：launcher-portable.dat
+//!
+//! 所有相对路径都在这个文件里配置（详见 `PortableConfig` / `PortablePaths`）。
+//! 找不到 → 自动写默认配置（首次启动）。
+//!
+//! ## 多实例隔离
+//!
+//! - **路径层**：每个实例 `<exe_dir>` 独立，session 文件路径自然隔离
+//! - **端口层**：每个实例的 `port` 字段独立，避免冲突
+//! - **数据库层**：每个实例的 `.boundlaunch/launcher.db` 独立
 //!
 //! ## custom_nodes 路径机制（关键！）
 //!
@@ -35,6 +69,15 @@
 //! - custom_nodes 自动从 `<新目录>/custom_nodes/` 找
 //!
 //! 详见 `PR/03-模块设计/04-PluginManager.md §custom_nodes 路径机制`
+//!
+//! ## 历史
+//!
+//! - **v1.8 / F38**：引入 `common/paths.rs`，dev 模式用 `CARGO_MANIFEST_DIR` 父目录
+//! - **v3.x**：引入 `env_paths.rs`，绿色版用 `current_exe().parent()`
+//! - **v0.0.2**：两套系统合并，统一用 `current_exe().parent()`，dev/prod 行为一致
+//! - **v0.0.2.1**：彻底删除 `BOUND_LAUNCH_DATA_DIR` 兼容分支、删除 `maybe_migrate_to_portable`、
+//!   删掉 `portable_base_dir` / `legacy_data_dir` / `launcher_working_dir` 等所有旧 API；
+//!   缓存目录固定在 `<exe_dir>/cache/`
 
 use std::path::{Path, PathBuf};
 
@@ -43,6 +86,25 @@ use thiserror::Error;
 
 /// portable.dat 文件名（必须和 BoundLaunch.exe 在同一目录）
 pub const PORTABLE_CONFIG_FILENAME: &str = "launcher-portable.dat";
+
+/// launcher 私有数据目录（隐藏在 `<exe_dir>` 下）
+pub const BOUNDLAUNCH_DATA_SUBDIR: &str = ".boundlaunch";
+
+/// 用户持久数据目录（可见）
+pub const DATA_SUBDIR: &str = "data";
+
+/// 用户缓存目录（可见）
+pub const CACHE_SUBDIR: &str = "cache";
+
+/// ComfyUI 子目录名
+pub const COMFYUI_SUBDIR: &str = "ComfyUI";
+
+/// 默认端口（解析失败时兜底用）
+pub const DEFAULT_PORT: u16 = 8188;
+
+// =============================================================================
+// portable.dat 数据结构
+// =============================================================================
 
 /// launcher-portable.dat 数据结构
 ///
@@ -58,7 +120,6 @@ pub const PORTABLE_CONFIG_FILENAME: &str = "launcher-portable.dat";
 /// venv = "data/venv"
 /// custom_nodes = "ComfyUI/custom_nodes"
 /// models = "ComfyUI/models"
-/// boundlaunch_data = ".boundlaunch"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PortableConfig {
@@ -98,9 +159,12 @@ pub struct PortableConfig {
 }
 
 fn default_version() -> u32 { 1 }
-fn default_port() -> u16 { 8188 }
+fn default_port() -> u16 { DEFAULT_PORT }
 
 /// 路径配置（相对 <exe_dir>）
+///
+/// **v0.0.2**：移除 `boundlaunch_data` 字段——`.boundlaunch/` 固定写死，
+/// 不允许配置（避免误把数据库/日志放到用户可见目录）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PortablePaths {
     /// ComfyUI 核心目录
@@ -123,17 +187,12 @@ pub struct PortablePaths {
     /// 模型目录
     #[serde(default = "default_models")]
     pub models: String,
-
-    /// launcher 私有数据（SQLite、日志、配置）
-    #[serde(default = "default_boundlaunch_data")]
-    pub boundlaunch_data: String,
 }
 
-fn default_comfyui() -> String { "ComfyUI".to_string() }
-fn default_venv() -> String { "data/venv".to_string() }
-fn default_custom_nodes() -> String { "ComfyUI/custom_nodes".to_string() }
-fn default_models() -> String { "ComfyUI/models".to_string() }
-fn default_boundlaunch_data() -> String { ".boundlaunch".to_string() }
+fn default_comfyui() -> String { COMFYUI_SUBDIR.to_string() }
+fn default_venv() -> String { format!("{}/venv", DATA_SUBDIR) }
+fn default_custom_nodes() -> String { format!("{}/custom_nodes", COMFYUI_SUBDIR) }
+fn default_models() -> String { format!("{}/models", COMFYUI_SUBDIR) }
 
 impl Default for PortablePaths {
     fn default() -> Self {
@@ -142,7 +201,6 @@ impl Default for PortablePaths {
             venv: default_venv(),
             custom_nodes: default_custom_nodes(),
             models: default_models(),
-            boundlaunch_data: default_boundlaunch_data(),
         }
     }
 }
@@ -151,7 +209,7 @@ impl Default for PortableConfig {
     fn default() -> Self {
         Self {
             version: default_version(),
-            name: String::new(),  // 空 = 用目录名兜底
+            name: String::new(),
             port: default_port(),
             override_base_directory: false,
             paths: PortablePaths::default(),
@@ -159,50 +217,90 @@ impl Default for PortableConfig {
     }
 }
 
+// =============================================================================
+// 解析后的路径（绝对路径）
+// =============================================================================
+
 /// 解析后的环境路径（绝对路径）
 ///
-/// 这是 launcher 启动时实际使用的路径集合，所有路径都是绝对路径。
+/// **v0.0.2**：这是 launcher 启动时唯一应该使用的路径集合。
+/// 所有路径都是绝对路径，全部以 `<exe_dir>` 为根。
 #[derive(Debug, Clone)]
 pub struct ResolvedEnvPaths {
-    /// 环境根目录（= exe 所在目录 = portable.dat 所在目录）
+    // ===== 根标识 =====
+
+    /// 环境根目录（= `current_exe().parent()`，绝对路径）
+    ///
+    /// 复制目录到新位置 → 新实例 env_root 自动指向新位置 → 多实例完全隔离
     pub env_root: PathBuf,
-    /// 环境名
+
+    /// 环境名（来自 portable.dat `name`，空则用 env_root 的目录名）
     pub env_name: String,
-    /// ComfyUI 启动端口
+
+    /// ComfyUI 启动端口（来自 portable.dat `port`，解析失败时 = DEFAULT_PORT）
     pub port: u16,
-    /// ComfyUI 核心目录
+
+    // ===== 用户可见目录（绿色版结构） =====
+
+    /// ComfyUI 核心目录（= `<env_root>/<cfg.paths.comfyui>`）
     pub comfyui_root: PathBuf,
-    /// venv
+
+    /// venv 绝对路径（= `<env_root>/<cfg.paths.venv>`）
     pub venv_path: PathBuf,
-    /// custom_nodes 绝对路径
+
+    /// custom_nodes 绝对路径（= `<env_root>/<cfg.paths.custom_nodes>`）
     pub custom_nodes: PathBuf,
+
     /// custom_nodes 是否在 ComfyUI 内
     pub custom_nodes_in_comfyui: bool,
-    /// 模型目录
+
+    /// 模型目录（= `<env_root>/<cfg.paths.models>`）
     pub models_dir: PathBuf,
-    /// launcher 私有数据目录
-    pub boundlaunch_data: PathBuf,
-    /// launcher 配置
-    pub config_path: PathBuf,
-    /// SQLite 数据库
-    pub database_path: PathBuf,
-    /// logs 目录
-    pub logs_dir: PathBuf,
-    /// **v3.x 新增**：ComfyUI session 目录（每个实例独立，多实例隔离）
-    ///
-    /// 用于 `__COMFY_CLI_SESSION__` 协议：
-    /// - 每个 ComfyUI 进程生成一个 `<sessions_dir>/<random>.session` 文件
-    /// - ComfyUI-Manager 检测到 `__COMFY_CLI_SESSION__` 环境变量后
-    ///   → 写 `<session_path>.reboot` 标志 + `exit(0)`
-    /// - 客户端检测 `.reboot` → 自动 respawn（无缝重启）
-    ///
-    /// **多实例隔离保证**：
-    /// - 路径 = `<exe_dir>/.boundlaunch/sessions/`
-    /// - 复制目录到新位置 → 新实例用自己的 sessions/ → 互不影响 ✅
-    /// - 同一实例多 ComfyUI 进程：文件名带随机后缀 → 不冲突 ✅
-    pub sessions_dir: PathBuf,
-    /// ComfyUI 启动时是否要传 --base-directory
+
+    /// ComfyUI 启动时是否要传 `--base-directory`
     pub override_base_directory: bool,
+
+    // ===== 用户持久数据目录（`<env_root>/data/`，可见） =====
+
+    /// 用户数据目录（= `<env_root>/data/`）
+    pub app_data_dir: PathBuf,
+
+    /// uv sidecar 部署目录（= `<app_data_dir>/uv/`）
+    pub uv_deploy_dir: PathBuf,
+
+    /// uv sidecar 二进制路径（= `<uv_deploy_dir>/uv[.exe]`）
+    pub uv_binary_path: PathBuf,
+
+    // ===== 用户缓存目录（`<env_root>/cache/`，可见） =====
+
+    /// 用户缓存目录（= `<env_root>/cache/`）
+    pub cache_dir: PathBuf,
+
+    /// transformers 版本缓存文件
+    pub transformers_cache_path: PathBuf,
+
+    // ===== launcher 私有数据（`<env_root>/.boundlaunch/`，隐藏） =====
+
+    /// launcher 私有数据目录（= `<env_root>/.boundlaunch/`）
+    pub boundlaunch_data_dir: PathBuf,
+
+    /// 用户配置（= `<boundlaunch_data_dir>/config.toml`）
+    pub config_path: PathBuf,
+
+    /// SQLite 数据库（= `<boundlaunch_data_dir>/launcher.db`）
+    pub database_path: PathBuf,
+
+    /// launcher PID 文件（崩溃恢复用）
+    pub pid_file_path: PathBuf,
+
+    /// launcher 日志目录
+    pub logs_dir: PathBuf,
+
+    /// ComfyUI session 目录（多实例隔离）
+    pub sessions_dir: PathBuf,
+
+    // ===== portable 配置 =====
+
     /// portable.dat 路径
     pub portable_config_path: PathBuf,
 }
@@ -222,9 +320,16 @@ pub enum EnvPathsError {
     WriteError(String),
 }
 
+// =============================================================================
+// 核心 API
+// =============================================================================
+
 /// 找到 BoundLaunch.exe 所在目录
 ///
-/// **重要**：必须能拿到 exe 路径，**否则启动失败**
+/// **v0.0.2**：统一用 `current_exe().parent()`（不再区分 dev/prod）
+///
+/// **历史**：v1.8 / F38 dev 模式用 `CARGO_MANIFEST_DIR` 的父目录，
+/// prod 模式用 `current_exe().parent()`。v0.0.2 合并为唯一行为。
 pub fn find_exe_dir() -> Result<PathBuf, EnvPathsError> {
     let exe = std::env::current_exe()
         .map_err(|e| EnvPathsError::ExePathNotFound(e.to_string()))?;
@@ -294,7 +399,8 @@ fn resolve_relative(base: &Path, rel: &str) -> PathBuf {
 
 /// 解析为完整路径集
 ///
-/// **这是 launcher 启动时唯一应该调用的函数**
+/// **v0.0.2**：这是 launcher 启动时唯一应该调用的函数。
+/// 返回的 `ResolvedEnvPaths` 包含所有路径，前端 / 后端都从这里取。
 pub fn resolve() -> Result<ResolvedEnvPaths, EnvPathsError> {
     let (cfg, portable_path) = load_or_create()?;
     let env_root = find_exe_dir()?;
@@ -302,23 +408,32 @@ pub fn resolve() -> Result<ResolvedEnvPaths, EnvPathsError> {
         return Err(EnvPathsError::EnvRootNotFound(env_root));
     }
 
+    // ----- 解析用户可见目录 -----
     let comfyui_root = resolve_relative(&env_root, &cfg.paths.comfyui);
     let custom_nodes = resolve_relative(&env_root, &cfg.paths.custom_nodes);
-    let boundlaunch_data = resolve_relative(&env_root, &cfg.paths.boundlaunch_data);
-
-    // 关键判断：custom_nodes 是否在 ComfyUI 内
-    // 用 canonicalize 处理 "ComfyUI/custom_nodes" vs "<env>/ComfyUI/custom_nodes" 的等价性
     let custom_nodes_in_comfyui = is_under(&custom_nodes, &comfyui_root);
 
-    // 自动推断 override_base_directory：
-    //   - 用户显式设置 → 用用户的
-    //   - 用户没设置（false）+ custom_nodes 在 ComfyUI 外 → 自动设为 true
+    // 自动推断 override_base_directory
     let override_base_directory = if cfg.override_base_directory {
         true
     } else {
         !custom_nodes_in_comfyui
     };
 
+    // ----- 用户持久数据目录 -----
+    // 固定在 `<env_root>/data/`。v0.0.2 彻底删除 `BOUND_LAUNCH_DATA_DIR` 兼容分支
+    // （用户要求缓存目录全放 exe 旁边，APP DATA_DIR 兼容是历史包袱）。
+    let app_data_dir = env_root.join(DATA_SUBDIR);
+
+    // ----- 用户缓存目录 -----
+    // 固定在 `<env_root>/cache/`，紧贴 exe。
+    let cache_dir = env_root.join(CACHE_SUBDIR);
+
+    // ----- launcher 私有数据（`.boundlaunch/`） -----
+    // 固定在 `<env_root>/.boundlaunch/`，**不**支持任何覆盖
+    let boundlaunch_data_dir = env_root.join(BOUNDLAUNCH_DATA_SUBDIR);
+
+    // ----- 解析 env_name -----
     let env_name = if cfg.name.is_empty() {
         env_root
             .file_name()
@@ -329,6 +444,18 @@ pub fn resolve() -> Result<ResolvedEnvPaths, EnvPathsError> {
         cfg.name
     };
 
+    // ----- 派生子路径 -----
+    let uv_deploy_dir = app_data_dir.join("uv");
+    let uv_binary_name = if cfg!(windows) { "uv.exe" } else { "uv" };
+    let uv_binary_path = uv_deploy_dir.join(uv_binary_name);
+
+    let transformers_cache_path = cache_dir.join("transformers_versions.json");
+
+    let database_path = boundlaunch_data_dir.join("launcher.db");
+    let pid_file_path = boundlaunch_data_dir.join("launcher.pid");
+    let logs_dir = boundlaunch_data_dir.join("logs");
+    let sessions_dir = boundlaunch_data_dir.join("sessions");
+
     Ok(ResolvedEnvPaths {
         env_root: env_root.clone(),
         env_name,
@@ -338,36 +465,52 @@ pub fn resolve() -> Result<ResolvedEnvPaths, EnvPathsError> {
         custom_nodes,
         custom_nodes_in_comfyui,
         models_dir: resolve_relative(&env_root, &cfg.paths.models),
-        boundlaunch_data: boundlaunch_data.clone(),
-        config_path: boundlaunch_data.join("config.toml"),
-        database_path: boundlaunch_data.join("launcher.db"),
-        logs_dir: boundlaunch_data.join("logs"),
-        // **v3.x 新增**：ComfyUI session 目录
-        // 放在 `<exe_dir>/.boundlaunch/sessions/`，与 WebView2 UserData 平行
-        // 复制目录时整个 .boundlaunch/ 一起被复制 → 多实例完全隔离
-        sessions_dir: env_root.join(".boundlaunch").join("sessions"),
         override_base_directory,
+        app_data_dir,
+        uv_deploy_dir,
+        uv_binary_path,
+        cache_dir,
+        transformers_cache_path,
+        boundlaunch_data_dir: boundlaunch_data_dir.clone(),
+        config_path: boundlaunch_data_dir.join("config.toml"),
+        database_path,
+        pid_file_path,
+        logs_dir,
+        sessions_dir,
         portable_config_path: portable_path,
     })
 }
 
 /// 判断 child 是否在 parent 下（路径前缀关系）
-///
-/// **实现**：
-/// - 都 canonicalize（如果存在）再比较
-/// - 都不存在时直接字符串比较（处理"还没创建"的情况）
 fn is_under(child: &Path, parent: &Path) -> bool {
     let child_canon = child.canonicalize().unwrap_or_else(|_| child.to_path_buf());
     let parent_canon = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
     child_canon.starts_with(&parent_canon)
 }
 
+// =============================================================================
+// 工具函数
+// =============================================================================
+
+/// 确保目录存在（递归创建）
+///
+/// 替代 `common::paths::ensure_dir`（v0.0.2.1 已删除）
+pub async fn ensure_dir(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        tokio::fs::create_dir_all(path).await?;
+    }
+    Ok(())
+}
+
+// =============================================================================
+// 单元测试
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
-    /// 创建一个临时目录，测试用
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("env_paths_test_{}", name));
         let _ = fs::remove_dir_all(&dir);
@@ -379,29 +522,25 @@ mod tests {
     fn test_default_config() {
         let cfg = PortableConfig::default();
         assert_eq!(cfg.version, 1);
-        assert_eq!(cfg.port, 8188);
+        assert_eq!(cfg.port, DEFAULT_PORT);
         assert_eq!(cfg.paths.comfyui, "ComfyUI");
         assert_eq!(cfg.paths.venv, "data/venv");
         assert_eq!(cfg.paths.custom_nodes, "ComfyUI/custom_nodes");
         assert_eq!(cfg.paths.models, "ComfyUI/models");
-        assert_eq!(cfg.paths.boundlaunch_data, ".boundlaunch");
         assert!(!cfg.override_base_directory);
     }
 
     #[test]
     fn test_resolve_relative_path() {
         let base = PathBuf::from("/test/base");
-        // 相对路径 → 拼接
         assert_eq!(
             resolve_relative(&base, "ComfyUI"),
             PathBuf::from("/test/base/ComfyUI")
         );
-        // 绝对路径 → 原样
         assert_eq!(
             resolve_relative(&base, "/abs/path"),
             PathBuf::from("/abs/path")
         );
-        // 相对路径含子目录
         assert_eq!(
             resolve_relative(&base, "data/venv"),
             PathBuf::from("/test/base/data/venv")
@@ -425,10 +564,9 @@ mod tests {
             override_base_directory: true,
             paths: PortablePaths {
                 comfyui: "ComfyUI".to_string(),
-                venv: "venv".to_string(),
+                venv: "data/venv".to_string(),
                 custom_nodes: "D:/SharedCustomNodes".to_string(),
                 models: "ComfyUI/models".to_string(),
-                boundlaunch_data: ".data".to_string(),
             },
         };
         let s = toml::to_string_pretty(&cfg).unwrap();
@@ -451,9 +589,11 @@ mod tests {
     }
 
     #[test]
-    fn test_temp_dir_creation() {
-        let dir = temp_dir("basic");
-        assert!(dir.exists());
-        let _ = fs::remove_dir_all(&dir);
+    fn test_default_paths_relative_to_env_root() {
+        // 默认配置的所有路径都是相对 <env_root> 的
+        let cfg = PortableConfig::default();
+        // 关键断言：cache 子目录和 data 子目录都是相对路径
+        assert!(!cfg.paths.venv.starts_with('/'));
+        assert!(!cfg.paths.venv.starts_with('\\'));
     }
 }

@@ -35,11 +35,11 @@ mod tray;
 mod updater;  // v0.0.1：自动更新（GitHub Releases + 白名单替换）
 mod uv_sidecar;
 
-use crate::common::paths as common_paths;
 use crate::config::ConfigService;
 use crate::core_manager::CoreManagerService;
 use crate::env_inspector::EnvironmentInspectorService;
 use crate::log_store::LogStoreService;
+use crate::paths::env_paths;
 use crate::plugin_manager::PluginManagerService;
 use crate::process_launcher::ProcessLauncherService;
 use crate::process_launcher::ShutdownCoordinator;
@@ -75,7 +75,7 @@ pub fn run() {
     // 用空 PathBuf 标记"不重定向"，走 Tauri 默认路径——不阻塞启动。
     let (webview2_data_dir, env_name_for_window) = match crate::paths::env_paths::resolve() {
         Ok(env_paths) => {
-            let dir = env_paths.boundlaunch_data.join("webview2");
+            let dir = env_paths.boundlaunch_data_dir.join("webview2");
             let env_name = env_paths.env_name.clone();
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 tracing::warn!(
@@ -214,30 +214,18 @@ pub fn run() {
             let app_state = rt.block_on(async {
                 let event_bus = std::sync::Arc::new(event_bus::EventBus::new());
 
-                // **v1.8 / F38**：Portable 数据迁移
-                // 1.0 前老用户的 config / venv / sqlite 还在 <%APPDATA%>/boundlaunch/，
-                // 启动时探测并复制到新的 portable 位置（dev → <project_root>/data/，
-                // prod → <exe_dir>/data/）。详见 paths::maybe_migrate_to_portable。
-                // 注意：必须在 Config 初始化之前，否则 Config 会读到老位置而不是新位置
-                match common_paths::maybe_migrate_to_portable().await {
-                    Ok(common_paths::MigrationOutcome::Migrated { from, to }) => {
-                        tracing::info!(
-                            from = %from.display(),
-                            to = %to.display(),
-                            "F38: legacy data migrated to portable location"
-                        );
-                    }
-                    Ok(common_paths::MigrationOutcome::Noop) => {
-                        tracing::debug!("F38: no portable migration needed");
-                    }
-                    Err(e) => {
-                        // 迁移失败不阻塞启动，只记录警告（用户可能手动处理）
-                        tracing::warn!(error = %e, "F38: portable migration failed");
-                    }
-                }
+                // v0.0.2.1：**唯一**路径解析入口（替代原来的 common::paths）
+                //
+                // 启动时一次解析，之后所有路径都从这里取：
+                // - config 路径
+                // - SQLite 数据库
+                // - app data 目录（comfyui.pid 等）
+                // - transformers 缓存文件
+                let resolved_paths = env_paths::resolve()
+                    .expect("fatal: env_paths::resolve failed at startup");
 
                 // Config 初始化
-                let config_path = common_paths::config_path();
+                let config_path = resolved_paths.config_path.clone();
                 tracing::info!(?config_path, "loading config");
                 let config = std::sync::Arc::new(
                     ConfigService::load(config_path, (*event_bus).clone())
@@ -246,7 +234,7 @@ pub fn run() {
                 );
 
                 // LogStore 初始化（WAL 模式 + 启动 7 天清理后台 task）
-                let log_db = common_paths::log_db_path();
+                let log_db = resolved_paths.database_path.clone();
                 tracing::info!(?log_db, "initializing logstore");
                 let log_store = std::sync::Arc::new(
                     LogStoreService::new(Some(log_db))
@@ -337,8 +325,8 @@ pub fn run() {
                 // ProcessLauncher 初始化
                 // - comfyui_root / venv_path 由 config 运行时提供（路径热加载）
                 // - data_dir 用于存放 comfyui.pid（崩溃恢复用），属于 app 状态不通过 config 改
-                let data_dir = common_paths::app_data_dir();
-                if let Err(e) = common_paths::ensure_dir(&data_dir).await {
+                let data_dir = resolved_paths.app_data_dir.clone();
+                if let Err(e) = env_paths::ensure_dir(&data_dir).await {
                     tracing::warn!(?data_dir, error = %e, "failed to ensure data_dir");
                 }
                 let python_env_arc = std::sync::Arc::new(python_env);
@@ -370,10 +358,10 @@ pub fn run() {
                 ));
 
                 // v3.7：transformers 版本索引（PyPI 拉取 + 三层缓存）
-                // 缓存文件位于 <app_data_dir>/transformers_versions.json
-                // v1.8 / F38：跟随 portable 模式
+                // 缓存文件位于 <env_root>/cache/transformers_versions.json
+                // v0.0.2.1：统一从 env_paths::resolve() 拿
                 // 注：此处仅构造，spawn_refresh 在 manage 之后调用（避免 manage 前 spawn 访问 State 失败）
-                let transformers_cache_file = common_paths::transformers_cache_path();
+                let transformers_cache_file = resolved_paths.transformers_cache_path.clone();
                 let transformers_index = std::sync::Arc::new(TransformersVersionIndex::new(
                     transformers_cache_file,
                     (*event_bus).clone(),

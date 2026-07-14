@@ -7,9 +7,9 @@
 //!
 //! 详见 `PR/03-模块设计/01-Config.md`
 
-use crate::common::paths;
 use crate::error::{AppError, ConfigError};
 use crate::event_bus::{EventBus, SystemEvent};
+use crate::paths::env_paths;
 use crate::python_env::torch_variant::TorchVariant;
 use crate::system::gpu_cache::get_or_detect;
 use crate::system::recommend::recommend_torch_variant_with_gpus;
@@ -43,7 +43,7 @@ impl ConfigService {
     pub async fn load(path: PathBuf, event_bus: EventBus) -> Result<Self, ConfigError> {
         // 确保父目录存在（v3.x：保留，让 SQLite 之类能找到 data/）
         if let Some(parent) = path.parent() {
-            paths::ensure_dir(parent).await.map_err(io_err)?;
+            env_paths::ensure_dir(parent).await.map_err(io_err)?;
         }
 
         let config = if path.exists() {
@@ -83,7 +83,10 @@ impl ConfigService {
                             "F36: venv 在 src-tauri/ 下，自动迁移到 app_data_dir"
                         );
                         let old_venv = cfg.paths.venv_path.clone();
-                        let new_venv = paths::app_data_dir().join("data").join("venv");
+                        // v0.0.2：env_paths 是唯一路径来源，<exe_dir>/data/venv
+                        let new_venv = env_paths::resolve()
+                            .map(|p| p.venv_path.clone())
+                            .unwrap_or_else(|_| old_venv.clone());
                         // 若旧 venv 存在且新 venv 不存在 → 移动过去（保留用户的依赖）
                         if old_venv.exists() && !new_venv.exists() {
                             if let Err(e) = migrate_venv_dir(&old_venv, &new_venv).await {
@@ -232,7 +235,7 @@ async fn save_to_disk(path: &Path, config: &Config) -> Result<(), ConfigError> {
 /// 行为：使用 tokio::fs::rename（如果同盘）或递归复制（跨盘）
 async fn migrate_venv_dir(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
     if let Some(parent) = to.parent() {
-        paths::ensure_dir(parent)
+        env_paths::ensure_dir(parent)
             .await
             .map_err(|e| format!("创建父目录失败: {}", e))?;
     }
@@ -297,10 +300,15 @@ async fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> Res
 
 /// 构造默认 Config，并将空路径字段填充为 launcher 工作目录
 ///
-/// 与 `Config::default()` 区别：
-/// - `Config::default()` 是无内存访问的纯默认值（空 PathBuf）
-/// - `build_default_config()` 额外调用 `paths::launcher_working_dir()` 填充 comfyui_root，
-///   并把 venv_path 设置为 `${comfyui_root}/venv`
+/// **v0.0.2 重构**：直接调 `env_paths::resolve()`，无 try/fallback。
+/// `env_paths::resolve()` 是 launcher 启动时唯一应该使用的路径解析入口。
+///
+/// **规则**：
+/// - `comfyui_root` 为空 → 设置为 `<env_root>/ComfyUI`
+/// - `venv_path` 为空 → 设置为 `<env_root>/data/venv`
+/// - `models_path` 不在此处设置（保持 `None`，由用户在设置页显式配置）
+///
+/// 已配置的路径不会被覆盖（保证老用户的 config.toml 不会被打乱）。
 fn build_default_config() -> Config {
     let mut cfg = Config::default();
     apply_default_paths(&mut cfg);
@@ -309,104 +317,82 @@ fn build_default_config() -> Config {
 
 /// 将空路径字段填充为 launcher 工作目录
 ///
-/// 规则（v1.8 / F38 Portable 模式重写）：
-/// - `comfyui_root` 为空 → 设置为 `<portable_base_dir>/ComfyUI`（dev 时是项目根，prod 时是 exe 旁）
-/// - `venv_path` 为空 → 设置为 `<app_data_dir>/venv`（v3.1 / F26 决策 1：venv 独立于 ComfyUI 仓库）
-/// - `models_path` 不在此处设置（保持 `None`，由用户在设置页显式配置）
+/// **v0.0.2 重构**：直接调 `env_paths::resolve()`，不再有 try/fallback。
+/// 因为现在 `env_paths` 是唯一路径解析入口，所有路径都来自它。
 ///
-/// **v3.x 增强**：启动时调 `env_paths::resolve()`：
-/// - 如果 `launcher-portable.dat` 存在（绿色版模式）→ 用它定义的路径
-/// - 否则（传统安装模式）→ 走原有的 v1.8 逻辑
+/// **规则**：
+/// - `comfyui_root` 为空 → 设置为 `<env_root>/ComfyUI`
+/// - `venv_path` 为空 → 设置为 `<env_root>/data/venv`
+/// - `models_path` 不在此处设置（保持 `None`，由用户在设置页显式配置）
 ///
 /// 已配置的路径不会被覆盖（保证老用户的 config.toml 不会被打乱）。
 fn apply_default_paths(cfg: &mut Config) {
-    // v3.x：先尝试 portable 模式（launcher-portable.dat 存在时）
-    match crate::paths::env_paths::resolve() {
-        Ok(resolved) => {
-            tracing::info!(
-                "[env_paths] portable mode active: env_root={} env_name={} port={}",
-                resolved.env_root.display(),
-                resolved.env_name,
-                resolved.port
-            );
-            tracing::info!(
-                "[env_paths] comfyui={} venv={} custom_nodes={} (in_comfyui={})",
-                resolved.comfyui_root.display(),
-                resolved.venv_path.display(),
-                resolved.custom_nodes.display(),
-                resolved.custom_nodes_in_comfyui
-            );
-
-            // comfyui_root 必填（绿色版用 resolved 覆盖）
-            if cfg.paths.comfyui_root.as_os_str().is_empty() {
-                cfg.paths.comfyui_root = resolved.comfyui_root.clone();
-            }
-            // venv 必填
-            if cfg.paths.venv_path.as_os_str().is_empty() {
-                cfg.paths.venv_path = resolved.venv_path.clone();
-            }
-            // v3.x：custom_nodes 路径
-            if cfg.paths.custom_nodes_path.is_none() {
-                cfg.paths.custom_nodes_path = Some(resolved.custom_nodes.clone());
-            }
-            // v3.x：ComfyUI base_directory
-            if cfg.paths.comfyui_base_directory.is_none() && resolved.override_base_directory {
-                // custom_nodes 在 ComfyUI 外 → 传 custom_nodes 父目录作为 base
-                let base = resolved.custom_nodes.parent()
-                    .unwrap_or(&resolved.comfyui_root)
-                    .to_path_buf();
-                cfg.paths.comfyui_base_directory = Some(base);
-            }
-            // v3.x：环境名
-            if cfg.env_name.is_none() {
-                cfg.env_name = Some(resolved.env_name.clone());
-            }
-            // v3.x：端口（来自 portable.dat）
-            // **v3.x 关键修复**：总是用 resolved.port 覆盖 cfg.launch.listen_port
-            // - 旧版判断 `if resolved.port != 8188` → 复制的目录如果 port=8188 不会更新，导致端口冲突
-            // - 现在 portable 模式下 listen_port 总是按目录级配置，**不保留**用户自定义
-            // - 传统模式（无 launcher-portable.dat）走 fallback 分支，**保留**用户自定义
-            // - 副作用：绿色版用户改 listen_port 不会持久化（这是"目录级配置"约定的代价）
-            cfg.launch.listen_port = resolved.port;
-            tracing::info!(
-                "[env_paths] portable mode: listen_port overridden to {} (from launcher-portable.dat)",
-                resolved.port
-            );
-            return;
-        }
+    let resolved = match env_paths::resolve() {
+        Ok(p) => p,
         Err(e) => {
-            tracing::debug!(
-                error = %e,
-                "env_paths::resolve 失败，回退到 v1.8 默认逻辑"
+            // **v0.0.2.1 行为变更**：
+            // 不再做 fallback，直接 panic with 详细错误信息。
+            // 理由：`current_exe().parent()` 拿不到 = 系统级问题，强行 fallback 到
+            // 当前目录只会让所有路径都错位、问题更隐蔽。早期失败更安全。
+            panic!(
+                "[env_paths] 致命：无法解析 launcher 工作目录（{}）。\
+                 这通常是系统问题（无法读取 /proc/self/exe 或当前进程已无权限）。",
+                e
             );
         }
-    }
+    };
 
-    // 关键：comfyui_root 必须是 portable_base_dir 的**子目录**（如 "ComfyUI"），
-    // 不能直接等于 portable_base_dir 本身。原因：
-    //   - portable_base_dir 通常已包含 launcher 自己的 .git、node_modules、src/ 等
-    //   - 若直接用 portable_base_dir，CoreManager::is_cloned() 会返回 false（没有 ComfyUI 标记）
-    //   - clone_repo 会检测到目录非空但无 .git → 抛 NotEmptyDir
-    // 设为子目录后：目录不存在 → clone_repo 走"目录不存在"分支，正常 clone
-    //
-    // v1.8 / F38：使用 portable_base_dir 替代 launcher_working_dir
-    //   - dev 模式：项目根（避免数据跑到 target/debug/）
-    //   - prod 模式：exe 所在目录
+    tracing::info!(
+        "[env_paths] resolved: env_root={} env_name={} port={}",
+        resolved.env_root.display(),
+        resolved.env_name,
+        resolved.port
+    );
+    tracing::info!(
+        "[env_paths] comfyui={} venv={} custom_nodes={} (in_comfyui={})",
+        resolved.comfyui_root.display(),
+        resolved.venv_path.display(),
+        resolved.custom_nodes.display(),
+        resolved.custom_nodes_in_comfyui
+    );
+
+    // comfyui_root 必填
     if cfg.paths.comfyui_root.as_os_str().is_empty() {
-        cfg.paths.comfyui_root = paths::default_comfyui_root();
+        cfg.paths.comfyui_root = resolved.comfyui_root.clone();
     }
-    // v3.1 / F26 决策 1：venv 独立于 ComfyUI 仓库
-    //   - 旧版默认 `<comfyui_root>/venv` 切版本时会被 git 操作影响
-    //   - v1.8 起默认 `<app_data_dir>/venv`（即 `<portable_base>/data/venv`），
-    //     跨版本切换 ComfyUI 不影响 venv，且和 launcher 一起走 portable 模式
-    //   - 用户已配置的路径保留不动（向后兼容）
+    // venv 必填
     if cfg.paths.venv_path.as_os_str().is_empty() {
-        cfg.paths.venv_path = paths::app_data_dir().join("venv");
+        cfg.paths.venv_path = resolved.venv_path.clone();
     }
-    // v3.x：传统模式下默认 custom_nodes = `<comfyui_root>/custom_nodes`
+    // custom_nodes
     if cfg.paths.custom_nodes_path.is_none() {
-        cfg.paths.custom_nodes_path = Some(cfg.paths.comfyui_root.join("custom_nodes"));
+        cfg.paths.custom_nodes_path = Some(resolved.custom_nodes.clone());
     }
+    // base_directory
+    if cfg.paths.comfyui_base_directory.is_none() && resolved.override_base_directory {
+        let base = resolved
+            .custom_nodes
+            .parent()
+            .unwrap_or(&resolved.comfyui_root)
+            .to_path_buf();
+        cfg.paths.comfyui_base_directory = Some(base);
+    }
+    // 环境名
+    if cfg.env_name.is_none() {
+        cfg.env_name = Some(resolved.env_name.clone());
+    }
+    // 端口（**总是**用 resolved.port 覆盖 cfg.launch.listen_port）
+    //
+    // 为什么不保留 cfg.launch.listen_port？
+    // - 旧版判断 `if resolved.port != 8188` → 复制的目录如果 port=8188 不会更新
+    //   → 多实例场景下端口冲突
+    // - 现在 portable 模式下 listen_port 总是按目录级配置（launcher-portable.dat）
+    // - 副作用：绿色版用户改 listen_port 不会持久化（这是"目录级配置"约定的代价）
+    cfg.launch.listen_port = resolved.port;
+    tracing::info!(
+        "[env_paths] listen_port overridden to {} (from launcher-portable.dat)",
+        resolved.port
+    );
 }
 
 /// 内部：字段验证

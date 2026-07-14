@@ -3,12 +3,12 @@
 //! 设计模式：门面 (Facade) - 前端通过 invoke 调用，不直接接触 ConfigService
 
 use crate::app_state::AppState;
-use crate::common::paths;
 use crate::config::{
     apply_launch_patch, apply_models_patch, apply_paths_patch, apply_torch_patch,
     apply_ui_patch, Config, ConfigPatch,
 };
 use crate::error::AppError;
+use crate::paths::env_paths;
 use serde_json::Value;
 use tauri::State;
 
@@ -19,42 +19,45 @@ pub async fn config_get(state: State<'_, AppState>) -> Result<Config, String> {
     Ok((**guard).clone())
 }
 
-/// 获取 launcher 工作目录
+/// **v0.0.2.1**：获取 launcher 工作目录（即 `<exe_dir>`，绑定 portable 模式）
 ///
-/// 当前进程的工作目录，作为 ComfyUI 根目录的默认值。
-/// 前端在初始化向导时调用，把此值作为 comfyui_root 的 placeholder / 初始值。
+/// 前端「设置 → 数据位置」展示用，也是初始化向导的 placeholder。
+/// 一律用 `env_paths::resolve().env_root`，**不**再返回 `current_dir()`
+/// （dev 模式下 current_dir 是 `target/debug`，会误导用户）。
 #[tauri::command]
 pub async fn config_launcher_working_dir() -> Result<String, String> {
-    Ok(paths::launcher_working_dir().to_string_lossy().to_string())
+    match env_paths::resolve() {
+        Ok(p) => Ok(p.env_root.to_string_lossy().to_string()),
+        Err(e) => Err(format!("解析 launcher 工作目录失败: {}", e)),
+    }
 }
 
-/// **v1.8 / F38**：获取 portable 模式下的数据位置信息
+/// **v0.0.2.1**：数据位置信息（统一从 `env_paths::resolve()` 拿）
 ///
 /// 前端「设置 → 数据位置」展示用，便于用户排查：
 /// - 数据存在哪
-/// - 走的哪种模式（env / portable / legacy）
-/// - 可执行文件位置（prod 模式）
-/// - ComfyUI / venv / models 实际配置的位置（vs 默认推导位置）
+/// - 实际配置的 ComfyUI / venv / models 位置（vs 默认推导位置）
+/// - 可执行文件位置
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DataLocationInfo {
-    /// 当前生效的数据目录（v1.8 / F38：跟随 portable 模式）
+    /// 当前生效的数据目录（= `<env_root>/data/`）
     pub data_dir: String,
-    /// 当前生效的 cache 目录（v1.8 / F38：与 data/ 分离）
+    /// 当前生效的 cache 目录（= `<env_root>/cache/`）
     pub cache_dir: String,
-    /// portable 模式下 ComfyUI 根目录的**默认值**（推导）
+    /// ComfyUI 根目录的**默认值**（从 launcher-portable.dat 推导）
     pub comfyui_root_default: String,
-    /// portable 模式下 venv 路径的**默认值**（推导）
+    /// venv 路径的**默认值**（从 launcher-portable.dat 推导）
     pub venv_path_default: String,
-    /// portable 模式基础目录（dev → 项目根 / prod → exe 旁 / None = 不可解析）
-    pub portable_base_dir: Option<String>,
-    /// 模式来源：`env` / `portable` / `legacy`
-    pub mode: String,
     /// 模式说明（人类可读，给 `?` tooltip 用）
     pub mode_description: String,
-    /// 可执行文件绝对路径（仅 prod 模式有效）
+    /// 可执行文件绝对路径
     pub executable_path: Option<String>,
+    /// 模式来源：固定 `portable`（v0.0.2.1 删除 env / legacy 兼容分支）
+    pub mode: String,
+    /// launcher 私有数据目录（= `<env_root>/.boundlaunch/`）
+    pub boundlaunch_data_dir: String,
 
-    // ===== v1.8 / F38：Config 里的实际值（用户可能改过） =====
+    // ===== Config 里的实际值（用户可能改过） =====
     /// Config.paths.comfyui_root 实际值
     pub comfyui_root_actual: Option<String>,
     /// Config.paths.venv_path 实际值
@@ -71,37 +74,9 @@ pub struct DataLocationInfo {
 pub async fn config_data_location(
     state: State<'_, AppState>,
 ) -> Result<DataLocationInfo, String> {
-    // 判断 mode：env 变量 → portable → legacy
-    let mode = if std::env::var(paths::ENV_DATA_DIR)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .is_some()
-    {
-        "env"
-    } else if paths::portable_base_dir().is_some() {
-        "portable"
-    } else {
-        "legacy"
-    };
-
-    let mode_description = match mode {
-        "env" => "由环境变量 BOUND_LAUNCH_DATA_DIR 强制指定",
-        "portable" => "Portable 模式：数据存放在 launcher 所在目录的 data/ 子目录下",
-        "legacy" => "Legacy 模式：数据存放在系统 APPDATA 目录（仅在 portable 解析失败时降级）",
-        _ => "未知",
-    }
-    .to_string();
-
-    let data_dir = paths::app_data_dir();
-    let cache_dir = paths::cache_dir();
-    let portable_base = paths::portable_base_dir();
-    let executable = std::env::current_exe()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
-
-    // 默认推导值（用户没改过 Config.paths 时的位置）
-    let default_comfyui = paths::default_comfyui_root();
-    let default_venv = data_dir.join("venv");
+    // v0.0.2.1：统一从 env_paths::resolve() 拿所有路径
+    let resolved = env_paths::resolve()
+        .map_err(|e| format!("解析路径失败: {}", e))?;
 
     // 读取 Config 实际值
     let cfg = state.config.get();
@@ -112,19 +87,28 @@ pub async fn config_data_location(
     // 字符串归一化比较（Windows 路径不区分大小写）
     let normalize = |p: &std::path::Path| p.to_string_lossy().to_lowercase();
 
-    let comfyui_is_default = normalize(&actual_comfyui) == normalize(&default_comfyui);
-    let venv_is_default = normalize(&actual_venv) == normalize(&default_venv);
+    let comfyui_is_default = normalize(&actual_comfyui) == normalize(&resolved.comfyui_root);
+    let venv_is_default = normalize(&actual_venv) == normalize(&resolved.venv_path);
+
+    let mode_description = format!(
+        "Portable 模式：所有数据存放在 launcher 所在目录（{}）的子目录下",
+        resolved.env_root.display()
+    );
+
+    let executable = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
 
     Ok(DataLocationInfo {
         // 推导值
-        data_dir: data_dir.to_string_lossy().to_string(),
-        cache_dir: cache_dir.to_string_lossy().to_string(),
-        comfyui_root_default: default_comfyui.to_string_lossy().to_string(),
-        venv_path_default: default_venv.to_string_lossy().to_string(),
-        portable_base_dir: portable_base.as_ref().map(|p| p.to_string_lossy().to_string()),
-        mode: mode.to_string(),
+        data_dir: resolved.app_data_dir.to_string_lossy().to_string(),
+        cache_dir: resolved.cache_dir.to_string_lossy().to_string(),
+        comfyui_root_default: resolved.comfyui_root.to_string_lossy().to_string(),
+        venv_path_default: resolved.venv_path.to_string_lossy().to_string(),
+        boundlaunch_data_dir: resolved.boundlaunch_data_dir.to_string_lossy().to_string(),
         mode_description,
         executable_path: executable,
+        mode: "portable".to_string(),
         // Config 实际值
         comfyui_root_actual: Some(actual_comfyui.to_string_lossy().to_string()),
         venv_path_actual: Some(actual_venv.to_string_lossy().to_string()),

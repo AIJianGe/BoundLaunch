@@ -4,11 +4,21 @@
 //! ComfyUI 默认不会扫描 `.trash` 隐藏目录。
 //!
 //! 详见 `PR/03-模块设计/04-PluginManager.md §10 卸载回收站设计`
+//!
+//! **v0.0.2.1**：`trash_dir` 改为本文件内部辅助函数（不再从 `common::paths` 引用）。
+//! 理由：`.trash` 路径是参数化的（依赖调用方传入的 `custom_nodes_dir`），
+//! 跟路径解析系统无关，留在本模块更内聚。
 
 use std::path::{Path, PathBuf};
 
-use crate::common::paths;
 use crate::plugin_manager::models::{PluginError, UninstallResult};
+
+/// `.trash` 子目录路径（参数化：基于调用方传入的 custom_nodes_dir）
+///
+/// v0.0.2.1：从 `common::paths::trash_dir` 迁入本模块
+fn trash_dir(custom_nodes_dir: &Path) -> PathBuf {
+    custom_nodes_dir.join(".trash")
+}
 
 /// 把插件目录移到回收站
 ///
@@ -23,7 +33,7 @@ pub fn move_to_trash(
     plugin_path: &Path,
     custom_nodes_dir: &Path,
 ) -> Result<UninstallResult, PluginError> {
-    let trash_root = paths::trash_dir(custom_nodes_dir);
+    let trash_root = trash_dir(custom_nodes_dir);
     if !trash_root.exists() {
         std::fs::create_dir_all(&trash_root)
             .map_err(|_| PluginError::TrashCreateFailed(trash_root.clone()))?;
@@ -67,7 +77,7 @@ pub fn restore_from_trash(
 
 /// 列出回收站中的所有插件备份
 pub fn list_trash(custom_nodes_dir: &Path) -> Vec<PathBuf> {
-    let trash_root = paths::trash_dir(custom_nodes_dir);
+    let trash_root = trash_dir(custom_nodes_dir);
     let entries = match std::fs::read_dir(&trash_root) {
         Ok(e) => e,
         Err(_) => return vec![],
@@ -83,7 +93,7 @@ pub fn list_trash(custom_nodes_dir: &Path) -> Vec<PathBuf> {
 
 /// 清空回收站
 pub fn clear_trash(custom_nodes_dir: &Path) -> Result<usize, PluginError> {
-    let trash_root = paths::trash_dir(custom_nodes_dir);
+    let trash_root = trash_dir(custom_nodes_dir);
     if !trash_root.exists() {
         return Ok(0);
     }
