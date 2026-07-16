@@ -48,7 +48,27 @@ use crate::python_env::PythonEnvService;
 use crate::python_env::TransformersVersionIndex;
 use crate::task_scheduler::TaskSchedulerService;
 
-pub fn run() {
+// v0.0.2.2 关键修复：把 `tauri::generate_context!()` 宏从 lib.rs 移到 main.rs
+//
+// **问题根因**：
+// `tauri::generate_context!()` 在编译时展开成大量代码（读 tauri.conf.json、
+// 嵌入所有静态资源、生成所有 command 注册代码等）。当它位于 lib.rs 时，
+// 整个 bound_launch_lib crate 的 rlib 体积膨胀到 12GB+，rustc 1.96.1
+// 在写 rlib metadata 时触发 E0786 (corrupt metadata) 错误，链接 bin 阶段报
+// "found invalid metadata files for crate bound_launch_lib"。
+//
+// **方案**：
+// 1. lib.rs::run_with_context 接收一个已经构造好的 tauri::Context
+// 2. main.rs 调用 `tauri::generate_context!()` 宏，宏展开在 bin 编译阶段
+// 3. bound_launch_lib 的 rlib 不再包含宏生成的代码 → 体积大幅缩小 → 不再触发 E0786
+//
+// **取舍**：
+// - 优点：彻底解决 E0786，不再依赖 LTO/incremental 调参
+// - 缺点：main.rs 需要 `use tauri::generate_context;` 显式声明
+//   （这点对 Tauri 2.x 模板来说是标准做法，并不破坏可读性）
+pub fn run_with_context(
+    context: tauri::Context,
+) {
     // 日志初始化
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
@@ -571,7 +591,7 @@ pub fn run() {
             commands::updater::updater_download,
             commands::updater::updater_apply_and_restart,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
 
